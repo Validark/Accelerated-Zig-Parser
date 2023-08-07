@@ -8,7 +8,7 @@ The mainline Zig parser uses a deterministic finite state machine. Those are pre
 
 The test bench fully reads in all of the Zig files under the folders in the `src` folder. In my test I installed the Zig compiler, ZLS, and a few other Zig projects in my `src` folder. The test bench iterates over the source bytes from each Zig file (with added sentinels) and calls the tokenization function on each.
 
-To tokenize 3276 Zig files with 59,307,924 bytes and 1,303,536 newlines, the original tokenizer requires ~43.44MiB allocated for its tokens and took about 192ms in the test bench included here. My new tokenizer requires ~18.36MiB and takes about 85ms. That's over twice as fast and less than half the memory!
+To tokenize 3,276 Zig files with 59,307,924 bytes and 1,303,536 newlines, the original tokenizer requires ~43.44MiB allocated for its tokens and took about 192ms in the test bench included here. My new tokenizer requires ~18.36MiB and takes about 85ms. That's over twice as fast and less than half the memory!
 
 # Designing for high performance
 
