@@ -1,8 +1,8 @@
 # [<sub><sub><img src="https://raw.githubusercontent.com/Validark/Validark/master/zig-z.svg" alt="Lua" height="40"></sub></sub>](https://ziglang.org/) Accelerated Zig Parser
 
-A high-throughput parser for the Zig programming language.
+A high-throughput tokenizer and parser (soon™️) for the Zig programming language.
 
-The mainline Zig parser uses a deterministic finite state machine. Those are pretty good for some applications, but tokenizing can often employ the use of other techniques for added speed.
+So far, a tokenizer replacement implementation is provided. The mainline Zig tokenizer uses a deterministic finite state machine. Those are pretty good for some applications, but tokenizing can often employ the use of other techniques for added speed.
 
 # Results
 
