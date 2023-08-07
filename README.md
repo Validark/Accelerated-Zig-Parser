@@ -61,7 +61,7 @@ My ultimate goal is that this repository will be integrated with the Zig compile
 # How to use
 
 ```
-git clone https://github.com/Validark/Zig-Parser-Experiment.git
+git clone https://github.com/Validark/Accelerated-Zig-Parser.git
 ```
 
 Next, install one or more Zig projects under the `src` folder.
