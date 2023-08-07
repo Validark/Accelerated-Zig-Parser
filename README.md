@@ -2,7 +2,7 @@
 
 A high-throughput tokenizer and parser (soon™️) for the Zig programming language.
 
-So far, a tokenizer replacement implementation is provided. The mainline Zig tokenizer uses a deterministic finite state machine. Those are pretty good for some applications, but tokenizing can often employ the use of other techniques for added speed.
+So far, a tokenizer implementation is provided. The mainline Zig tokenizer uses a deterministic finite state machine. Those are pretty good for some applications, but tokenizing can often employ the use of other techniques for added speed.
 
 # Results
 
