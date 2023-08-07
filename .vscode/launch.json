@@ -1,0 +1,17 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "DynSDT test",
+            "program": "./zig-out/bin/exe",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "FORCE_COLOR": "1"
+            },
+            "console": "internalConsole",
+        }
+    ]
+}
