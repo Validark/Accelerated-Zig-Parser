@@ -8,7 +8,16 @@ The mainline Zig parser uses a deterministic finite state machine. Those are pre
 
 The test bench fully reads in all of the Zig files under the folders in the `src` folder. In my test I installed the Zig compiler, ZLS, and a few other Zig projects in my `src` folder. The test bench iterates over the source bytes from each Zig file (with added sentinels) and calls the tokenization function on each.
 
-To tokenize 3,276 Zig files with 59,307,924 bytes and 1,303,536 newlines, the original tokenizer requires ~43.44MiB allocated for its tokens and took about 192ms in the test bench included here. My new tokenizer requires ~18.36MiB and took about 85ms on my machine. That's over twice as fast and less than half the memory!
+To tokenize 3,276 Zig files with 59,307,924 bytes and 1,303,536 newlines, the original tokenizer and my new tokenizer have the following characteristics:
+
+|  |size| time |
+|:-:|:-:|:-:|
+| original | 43.44MiB | 192ms  |
+| this | **18.36MiB** | **85ms** |
+
+That's over twice as fast and less than half the memory! I am using a Zen 3 desktop and I would be interested in hearing from arm64 users who could share some performance numbers.
+
+Oddly enough, I think this code is generally more maintainable too, as adding an operator or keyword to the tokenizer is literally just adding another string into the relevant array. All of the assumptions and tricks I use are explicitly checked for in compile-time assertions (`grep` for `comptime assert`), so violating any of those invariants will result in compile errors that tell you why you can't change certain things.
 
 # Designing for high performance
 
@@ -33,6 +42,7 @@ I try to achieve each of these in the following ways:
     - Using SIMD. Using a conventional while loop to capture a completely unpredictable number of characters in the aforementioned categories all but guarantees a branch mispredict on exit every time, and possibly multiple throughout the loop if the branch predictor is having a bad day. With SIMD, we can produce a bitstring with 0's marked in the place we want to go, shift the bitstring according to our cursor's position, and count the trailing ones (the reason the bits are the inverse of what you might expect is because when we shift the bitstring it will be filled with 0's). In most cases, a single "count trailing one's" operation is all we need to find the position we are supposed to go to next. No need for a totally unpredictable while loop that goes character-by-character!
 
     - Using perfect hash functions. Specifically, keywords like `var` and `const` are mapped into a 7 bit address space by a perfect hash function. Identifiers can be checked against the list of keywords by applying the perfect hash function to each identifier and doing a table lookup to find what keyword it may match, then doing a single 16-byte vs 16-byte comparison to see if the identifier matches that keyword. The keywords are padded in memory to be 16 bytes and have a `len` stored in the final byte so we can check that the incoming identifier has the same length as the prospective keyword. We also use Phil Bagwell's array-mapped trie compression technique, meaning we have a 128-bit bitmap and find which position to check using the bitmap, thereby enabling us to have a packed buffer that need not have 128 slots. We do a similar trick for operators.
+      - One cool thing I can do because of Zig's comptime execution feature is tell Zig that a dummy operator/keyword is needed when we do not have an operator or keyword which hashes to the maximum 7 bit value, i.e. 127 (because I am hashing these to 7 bits of address space). If an operator or keyword is added or removed which hashed to 127, the comptime logic will automatically remove or add the dummy operator/keyword. Very nifty! At the moment, one of the perfect hash schemes needs a dummy element and the other does not. It's nice knowing that if we make a change like changing the hash function or adding/removing an operator or keyword, it will automatically figure out the right thing to do. These kinds of tricks are not good in conventional programming languages. We either have to do this work at start-up time or, even worse, someone bakes all the assumptions into the code and then changing it becomes a game of Jenga, except harder because the pieces are not all in one place. In Zig, we write it once and compile-time execution takes care of the rest.
 
     - I use a trick where I just allocate the upper-bound amount of memory for tokens per-file, and use the `resize` facility of the allocator to reclaim the space I did not fill. The nice thing about this trick is I can always assume there is sufficient space, which eliminates the need to check that such a thing is safe.
 
