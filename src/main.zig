@@ -302,40 +302,17 @@ const Tag = blk: {
 const Token = struct { len: u8, kind: Tag };
 
 const Parser = struct {
-    const CHUNK_PRINT_DEBUGGING = false;
-
     const Bitmaps = packed struct {
         whitespace: VEC_INT,
         non_linebreaks: VEC_INT,
         identifiers_or_numbers: VEC_INT,
         non_unescaped_quotes: VEC_INT,
-        // operators: VEC_INT,
-        // empty: VEC_INT = 0,
         prev_escaped: VEC_INT = 0,
-        // non_unescaped_apostrophes: VEC_INT,
     };
 
     fn nextChunk(utf8_checker: *Utf8Checker, source: [*]align(VEC_SIZE) const u8, prev_escaped: VEC_INT) Bitmaps {
         const input_vec: VEC = source[0..VEC_SIZE].*;
-        if (CHUNK_PRINT_DEBUGGING) {
-            for (@as([VEC_SIZE]u8, @bitCast(input_vec))) |c| std.debug.print("{c}", .{switch (c) {
-                '\r' => '$',
-                '\n' => '#',
-                0 => '0',
-                else => c,
-            }});
-            std.debug.print("\n", .{});
-            // if (CHUNK_PRINT_DEBUGGING) {
-            //     inline for (comptime std.meta.fieldNames(Bitmaps)) |field| {
-            //         std.debug.print("{b:0>VEC_SIZE} | {s}\n", .{ @field(p.bitmaps, field), field });
-            //     }
-            // }
-        }
         // zig fmt: off
-        // var operators    : VEC_INT = 0;
-        // inline for ("%*+./<=>|?") |c| operators |= @bitCast(input_vec == @as(VEC, @splat(@as(u8, c))));
-        // inline for ("!%&()*+,-./:;<=>?[]^{|}~") |c| operators |= @bitCast(input_vec == @as(VEC, @splat(@as(u8, c))));
-        // inline for ("!%&(*+-./<=>?[^{|~") |c| operators |= @bitCast(input_vec == @as(VEC, @splat(@as(u8, c))));
         const quotes     : VEC_INT = @bitCast(input_vec == @as(VEC, @splat(@as(u8, '"'))));
         // const apostrophes: VEC_INT = @bitCast(input_vec == @as(VEC, @splat(@as(u8, '\''))));
         const backslashes: VEC_INT = @bitCast(input_vec == @as(VEC, @splat(@as(u8, '\\'))));
@@ -348,6 +325,10 @@ const Parser = struct {
         const lower_alpha: VEC_INT = @as(VEC_INT, @bitCast(@as(VEC, @splat(@as(u8, 'a'))) <= input_vec)) & @as(VEC_INT, @bitCast(input_vec <= @as(VEC, @splat(@as(u8, 'z')))));
         const digits     : VEC_INT = @as(VEC_INT, @bitCast(@as(VEC, @splat(@as(u8, '0'))) <= input_vec)) & @as(VEC_INT, @bitCast(input_vec <= @as(VEC, @splat(@as(u8, '9')))));
         // zig fmt: on
+
+        // ----------------------------------------------------------------------------
+        // This code is brought to you courtesy of simdjson and simdjzon, both licensed
+        // under the Apache 2.0 license which is included at the bottom of this file
 
         // If there was overflow, pretend the first character isn't a backslash
         const backslash: VEC_INT = backslashes & ~prev_escaped;
@@ -364,6 +345,7 @@ const Parser = struct {
         const escaped = (even_bits ^ invert_mask) & follows_escape;
 
         utf8_checker.check_next_input(input_vec);
+        // ----------------------------------------------------------------------------
 
         return .{
             .whitespace = tabs | newlines | carriages | spaces,
@@ -381,11 +363,8 @@ const Parser = struct {
         // zig fmt: off
         start_of_file         = 123, // TODO: probe for something less than 128, doesn't matter what
         whitespace            = 128 | @as(u8, 0),
-        // op_then_whitespace    = 128 | @as(u8, 4),
 
         unknown               = 128 | @as(u8,  1), // is_quoted
-        // comment            = 128 | @as(u8,  9), // is_quoted
-        // line_quote         = 128 | @as(u8, 17), // is_quoted
 
         identifier            = 128 | @as(u8,  2),
         builtin               = 128 | @as(u8,  6),
@@ -398,7 +377,6 @@ const Parser = struct {
 
         eof                   = 128 | @as(u8,  4),
 
-        // operators             = 128 | @as(u8,  8),
         // zig fmt: on
     };
 
