@@ -4,6 +4,14 @@ A high-throughput parser for the Zig programming language.
 
 The mainline Zig parser uses a deterministic finite state machine. Those are pretty good for some applications, but tokenizing can often employ the use of other techniques for added speed.
 
+# Results
+
+The test bench fully reads in all of the Zig files under the folders in the `src` folder. In my test I installed the Zig compiler, ZLS, and a few other Zig projects in my `src` folder. The test bench iterates over the source bytes from each Zig file (with added sentinels) and calls the tokenization function on each.
+
+To tokenize 3276 Zig files with 59,307,924 bytes and 1,303,536 newlines, the original tokenizer requires ~43.44MiB allocated for its tokens and took about 192ms in the test bench included here. My new tokenizer requires ~18.36MiB and takes about 85ms. That's over twice as fast and less than half the memory!
+
+# Designing for high performance
+
 In the delicate balancing act that is performance optimization, you generally want:
 
   1. The ability to process more than one thing at once
@@ -11,14 +19,14 @@ In the delicate balancing act that is performance optimization, you generally wa
   3. A linear traversal over a smaller amount of contiguous memory
 
 
-I address these concerns in a few ways.
+I try to achieve each of these in the following ways:
 
 1. SIMD, i.e. single-instruction, multiple data. Instead of operating on a single element at a time, you can operate on 16, 32, or 64 elements simultaneously. Instead of going character-by-character, we use SIMD to check for the length of identifiers/keywords, the length of quotes, the length of whitespace, and the length of comments or single-line quotes. This allows us to move quicker than one byte at a time. We also use a SIMD technique to validate proper utf8 conformance, ported from [simdjson](https://github.com/simdjson/simdjson) by [travisstaloch](https://github.com/travisstaloch/) for use in [simdjzon](https://github.com/travisstaloch/simdjzon/). Please note that that particular code is licensed under the Apache license, included at the bottom of the `main.zig` file.
     - I do not actually use SIMD to find "character literals" of the form `'a'` because these are generally extremely short and did not actually give much benefit in tests.
 
     - We can't and don't want to use SIMD for absolutely everything because:
       - Comments can be inside of quotes and quotes can be inside of comments
-        - Selecting which bitstring to match in next is (probably?) not that efficient. You'd have to multiply each vector and then OR all the vectors together, get the next position, then repeat. I might try out this approach, but I doubt it will be that practical. I also note when I look at the arm64 output that it takes *much* more vector instructions than an x86_64, and doing everything in SIMD generates several hundred instructions on arm64. It might still be worth it though, especially on x86_64, but I doubt it.
+        - Selecting which bitstring to match in next is (probably?) not that efficient. You'd have to multiply each vector and then OR all the vectors together, get the next position, then repeat. I might try out this approach, but I doubt it will be that practical. I also note when I look at the arm64 output that it takes *much* more vector instructions than on x86_64, and doing everything in SIMD generates several hundred instructions on arm64. It might still be worth it though, especially on x86_64, but I doubt it.
       - Operators are all over the place and doing everything in SIMD would require a lot of work that's not that bad for scalar code to do.
 
 2. Fewer unpredictable branches can be achieved through:
@@ -33,12 +41,6 @@ I address these concerns in a few ways.
     - Some things we do unconditionally that could be hidden behind a branch, but are very inexpensive so there is no point. Other things we hide behind a branch when it's expensive and generally predictable. E.g. utf8 validation is typically just making sure all bytes are less than 128, i.e. 0x80. Once we see some non-ascii sequences, then we have to do the more computationally expensive work of making sure the byte sequence is valid.
 
 3. We reduce memory consumption by not storing start indices explicitly, which typically need to match the address space of the source length. In the case of Zig, where source files are constrained to be at most ~4GiB, only 32 bits of address space is needed for any given file. Thus the goal becomes reducing 32-bit start indices to something smaller. Quasi-succinct schemes for reducing the space consumption of monotonically increasing integer sequences immediately spring to mind, such as [Elias-Fano encoding](https://www.antoniomallia.it/sorted-integers-compression-with-elias-fano-encoding.html). However, we can achieve good space compression by simply storing the length of each token rather than the start index. Because tokens almost always have a length that can fit in a byte, we try to store all lengths in a byte. In the event that the length is too large to be stored in a byte, we store a `0` instead and make the next 4 bytes the true length. This works because tokens cannot have a length of 0, else they would not exist, therefore we can use lengths of `0` to trigger special behavior. We also know that this idea does not affect the upper bound on the number of Token elements we need to allocate because in order for a token to take up 3 times as much space as a typical token, it needs to have a length of at least 256, which the astute reader may note is significantly larger than 3.
-
-# Results
-
-The test bench fully reads in all of the Zig files under the folders in the `src` folder. In my test I installed the Zig compiler, ZLS, and a few other Zig projects in my `src` folder. Then it iterates over the source bytes from each Zig file (with added sentinels) and calls the tokenization function on each.
-
-To tokenize 3276 Zig files with 59,307,924 bytes and 1303536 newlines, the original tokenizer requires ~43.44MiB allocated for its tokens and took about 192ms in the test bench included here. My new tokenizer requires ~18.36MiB and takes about 85ms. That's over twice as fast and less than half the memory!
 
 # Still to-do
 
