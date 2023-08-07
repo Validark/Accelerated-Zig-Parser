@@ -626,9 +626,10 @@ pub fn main() !void {
     }
 
     std.debug.print("Tokenized in {} ({})\n", .{ std.fmt.fmtDuration(duration), std.fmt.fmtIntSizeBin(num_tokens * 2) });
-    std.debug.print("\t{: >20} bytes\n", .{total_len});
-    std.debug.print("\t{: >20} lines\n", .{lines});
-    std.debug.print("\t{: >20} num_tokens\n", .{num_tokens});
+    std.debug.print("Totals:\n", .{});
+    std.debug.print("{: >20} bytes\n", .{total_len});
+    std.debug.print("{: >20} lines\n", .{lines});
+    std.debug.print("{: >20} num_tokens\n", .{num_tokens});
 
     // for (source_tokens.items) |tokens| {
     // for (tokens, 0..) |token, i| {
