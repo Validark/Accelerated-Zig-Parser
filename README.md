@@ -10,12 +10,12 @@ The test bench fully reads in all of the Zig files under the folders in the `src
 
 To tokenize 3,276 Zig files with 59,307,924 bytes and 1,303,536 newlines, the original tokenizer and my new tokenizer have the following characteristics:
 
-|  |size| time |
-|:-:|:-:|:-:|
-| original | 43.44MiB | 192ms  |
-| this | **18.36MiB** | **85ms** |
+|  |size (mebibytes)| time (milliseconds) |throughput (gigabytes per second) |throughput (lines of code per second) |
+|:-:|:-:|:-:|:-:|:-:|
+| original | 43.44MiB | 192ms  |0.31 GB/s | 6.8M loc/s |
+| this | **18.36MiB** | **85ms** | **0.70 GB/s** | **15.3M loc/s** |
 
-That's over twice as fast and less than half the memory! I am using a Zen 3 desktop and I would be interested in hearing from arm64 users who could share some performance numbers.
+That's over twice as fast and less than half the memory! For context, I am using a Zen 3 desktop and I would be interested in hearing from arm64 users who could share some performance numbers. If you continue reading you will see I designed this code with the hope it would be fast on arm64 platforms too.
 
 Oddly enough, I think this code is generally more maintainable too, as adding an operator or keyword to the tokenizer is literally just adding another string into the relevant array. All of the assumptions and tricks I use are explicitly checked for in compile-time assertions (`grep` for `comptime assert`), so violating any of those invariants will result in compile errors that tell you why you can't change certain things.
 
