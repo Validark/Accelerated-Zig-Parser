@@ -8,7 +8,7 @@ So far, a tokenizer implementation is provided. The mainline Zig tokenizer uses 
 
 The test bench fully reads in all of the Zig files under the folders in the `src` folder. In my test I installed the Zig compiler, ZLS, and a few other Zig projects in my `src` folder. The test bench iterates over the source bytes from each Zig file (with added sentinels) and calls the tokenization function on each.
 
-To tokenize 3,276 Zig files with 59,307,924 bytes and 1,303,536 newlines, the original tokenizer and my new tokenizer have the following characteristics:
+To tokenize 3,276 Zig files with 59,307,924 bytes, including 1,303,536 newlines, the original tokenizer and my new tokenizer have the following characteristics:
 
 |  | token memory (mebibytes)| run-time (milliseconds) | throughput (gigabytes per second) |throughput (lines of code per second) |
 |:-:|:-:|:-:|:-:|:-:|
