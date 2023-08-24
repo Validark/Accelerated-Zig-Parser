@@ -63,7 +63,7 @@ fn readFiles(gpa: Allocator) !std.ArrayListUnmanaged([:0]const u8) {
                     num_files += 1;
                     const source = try readFileIntoAlignedBuffer(gpa, file, VEC_SIZE);
                     // const source = try file.readToEndAllocOptions(gpa, std.math.maxInt(u32), null, 1, 0);
-                    num_bytes += source.len;
+                    num_bytes += source.len - 2;
                     // std.debug.print("{} {s}\n", .{ sources.items.len, dir.path });
                     (try sources.addOne(gpa)).* = source;
                 },
@@ -73,7 +73,16 @@ fn readFiles(gpa: Allocator) !std.ArrayListUnmanaged([:0]const u8) {
         }
 
         const t2 = std.time.nanoTimestamp();
-        std.debug.print("Read {} files in {} ({})\n", .{ num_files, std.fmt.fmtDuration(@intCast(t2 - t1)), std.fmt.fmtIntSizeBin(num_bytes) });
+        var lines: u64 = 0;
+        for (sources.items) |source| {
+            for (source[1 .. source.len - 1]) |c| {
+                lines += @intFromBool(c == '\n');
+            }
+        }
+        const duration: u64 = @intCast(t2 - t1);
+        const @"GB/s" = @as(f64, @floatFromInt(num_bytes)) / @as(f64, @floatFromInt(duration));
+
+        std.debug.print("       Read in files in {} ({d:.2} GB/s) and used {} memory with {} lines across {} files\n", .{ std.fmt.fmtDuration(duration), @"GB/s", std.fmt.fmtIntSizeDec(num_bytes), lines, sources.items.len });
     }
     return sources;
 }
@@ -250,7 +259,7 @@ const Keywords = struct {
     pub fn lookup(kw: [*]const u8, len: u32) ?Tag {
         const hash = mapToIndex(hashKw(kw, len));
         const val = sorted_padded_kws[hash];
-        const val_len = val[PADDING_RIGHT - 1];
+        const val_len = val[PADDING_RIGHT - 1]; // [min_kw_len, max_kw_len]
         if (len != val_len) return null;
         const vec1: @Vector(PADDING_RIGHT, u8) = val;
         const tag: Tag = @enumFromInt(~hash);
@@ -589,9 +598,82 @@ const Parser = struct {
     }
 };
 
+fn combineFiles(gpa: Allocator, sources: std.ArrayListUnmanaged([:0]const u8)) !std.ArrayListUnmanaged([:0]const u8) {
+    var bytes: u64 = 0;
+    for (sources.items) |source| {
+        bytes += source.len - 1;
+    }
+    const all_files = try gpa.alignedAlloc(u8, VEC_SIZE, std.mem.alignBackward(u64, bytes + (FRONT_SENTINELS.len + BACK_SENTINELS.len + (VEC_SIZE - 1)), VEC_SIZE));
+    all_files[0..FRONT_SENTINELS.len].* = FRONT_SENTINELS.*;
+    var cur = all_files[FRONT_SENTINELS.len..];
+
+    for (sources.items) |source| {
+        @memcpy(cur[0 .. source.len - 1], source[1..]);
+        cur = cur[source.len - 1 ..];
+    }
+    gpa.free(sources.allocatedSlice());
+    cur[0..BACK_SENTINELS.len].* = BACK_SENTINELS.*;
+    cur = cur[BACK_SENTINELS.len..];
+    @memset(cur, 0);
+    var new_sources = try std.ArrayListUnmanaged([:0]const u8).initCapacity(gpa, 1);
+    new_sources.addOneAssumeCapacity().* = all_files[0 .. bytes + FRONT_SENTINELS.len + 1 :0];
+    return new_sources;
+}
+
 pub fn main() !void {
     const gpa = std.heap.c_allocator;
     const sources = try readFiles(gpa);
+    var bytes: u64 = 0;
+    var lines: u64 = 0;
+
+    for (sources.items) |source| {
+        bytes += source.len - 2;
+        for (source[1 .. source.len - 1]) |c| {
+            lines += @intFromBool(c == '\n');
+        }
+    }
+
+    // std.debug.print("-" ** 72 ++ "\n", .{});
+    // const sources = try combineFiles(gpa, try readFiles(gpa));
+
+    const legacy_tokens = try gpa.alloc(Ast.TokenList.Slice, sources.items.len);
+    var legacy_token_cur = legacy_tokens;
+
+    const t3 = std.time.nanoTimestamp();
+    for (sources.items) |sourcey| {
+        const source = sourcey[1..];
+        var tokens = Ast.TokenList{};
+        defer tokens.deinit(gpa);
+
+        // Empirically, the zig std lib has an 8:1 ratio of source bytes to token count.
+        const estimated_token_count = source.len / 8;
+        try tokens.ensureTotalCapacity(gpa, estimated_token_count);
+
+        var tokenizer = std.zig.Tokenizer.init(source);
+        while (true) {
+            const token = tokenizer.next();
+            try tokens.append(gpa, .{
+                .tag = token.tag,
+                .start = @as(u32, @intCast(token.loc.start)),
+            });
+            if (token.tag == .eof) break;
+        }
+
+        legacy_token_cur[0] = tokens.toOwnedSlice();
+        legacy_token_cur = legacy_token_cur[1..];
+    }
+    const t4 = std.time.nanoTimestamp();
+
+    var num_tokens2: usize = 0;
+    for (legacy_tokens) |tokens| {
+        num_tokens2 += tokens.len;
+    }
+
+    const duration2: u64 = @intCast(t4 - t3);
+
+    const @"GB/s 2" = @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(duration2));
+    std.debug.print("Legacy Tokenizing took {: >9} ({d:.2} GB/s, {d: >5.2}M loc/s) and used {} memory\n", .{ std.fmt.fmtDuration(duration2), @"GB/s 2", @as(f64, @floatFromInt(lines)) / @as(f64, @floatFromInt(duration2)) * 1000, std.fmt.fmtIntSizeDec(num_tokens2 * 5) });
+
     var t1 = std.time.nanoTimestamp();
 
     // mine:                85ms
@@ -601,42 +683,27 @@ pub fn main() !void {
 
     // mine:
     // original ast: 332ms
-
-    var num_tokens: usize = 0;
-    var source_tokens = try std.ArrayListUnmanaged([]Token).initCapacity(gpa, sources.items.len);
-
+    const source_tokens = try gpa.alloc([]Token, sources.items.len);
+    var source_token_cur = source_tokens;
     for (sources.items) |source| {
-        const tokens = try Parser.tokenize(gpa, source);
-        num_tokens += tokens.len;
-        source_tokens.addOneAssumeCapacity().* = tokens;
+        source_token_cur[0] = try Parser.tokenize(gpa, source);
+        source_token_cur = source_token_cur[1..];
     }
 
     const t2 = std.time.nanoTimestamp();
-
     const duration: u64 = @intCast(t2 - t1);
 
-    var total_len: u64 = 0;
-    var lines: u64 = 0;
-    for (sources.items) |source| {
-        total_len += source.len;
-        for (source) |c| {
-            lines += @intFromBool(c == '\n');
-        }
-        lines -= 1;
+    var num_tokens: usize = 0;
+    for (source_tokens) |tokens| {
+        num_tokens += tokens.len;
     }
 
-    std.debug.print("Tokenized in {} ({})\n", .{ std.fmt.fmtDuration(duration), std.fmt.fmtIntSizeBin(num_tokens * 2) });
-    std.debug.print("Totals:\n", .{});
-    std.debug.print("{: >20} bytes\n", .{total_len});
-    std.debug.print("{: >20} lines\n", .{lines});
-    std.debug.print("{: >20} num_tokens\n", .{num_tokens});
+    const @"GB/s" = @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(duration));
+    std.debug.print("       Tokenizing took {: >9} ({d:.2} GB/s, {d: >5.2}M loc/s) and used {} memory\n", .{ std.fmt.fmtDuration(duration), @"GB/s", @as(f64, @floatFromInt(lines)) / @as(f64, @floatFromInt(duration)) * 1000, std.fmt.fmtIntSizeDec(num_tokens * 2) });
 
-    // for (source_tokens.items) |tokens| {
-    // for (tokens, 0..) |token, i| {
-    // if (1870 <= i or i < 5) std.debug.print("{} {}\n", .{ i, token });
-    // }
-    // break;
-    // }
+    std.debug.print("       That's {d:.2}x faster!\n", .{@as(f64, @floatFromInt(duration2)) / @as(f64, @floatFromInt(duration))});
+
+    // std.debug.print("-" ** 72 ++ "\n", .{});
 }
 
 // switch (op_type) {
@@ -658,99 +725,118 @@ pub fn main() !void {
 //
 // ---------------------------------------------------------------
 
-pub const Chunk = @Vector(32, u8);
-pub const IChunk = @Vector(32, i8);
-pub const chunk_len = @sizeOf(Chunk);
-const half_chunk_len = chunk_len / 2;
-pub const ChunkArr = [chunk_len]u8;
-
-const u3x32 = @Vector(32, u3);
-const u8x32 = @Vector(32, u8);
-const u8x64 = @Vector(64, u8);
-const u64x4 = @Vector(4, u64);
-const u32x4 = @Vector(4, u32);
-const u8x16 = @Vector(16, u8);
-
-// ---
-// from https://gist.github.com/sharpobject/80dc1b6f3aaeeada8c0e3a04ebc4b60a
-// ---
-// thanks to sharpobject for these implementations which make it possible to get
-// rid of old utils.c and stop linking libc.
-// ---
-fn __mm256_permute2x128_si256_0x21(comptime V: type, a: V, b: V) V {
-    var ret: V = undefined;
-    ret[0] = a[2];
-    ret[1] = a[3];
-    ret[2] = b[0];
-    ret[3] = b[1];
-    return ret;
-}
-
-fn _mm256_permute2x128_si256_0x21(a: Chunk, b: Chunk) Chunk {
-    const V = if (chunk_len == 32) u64x4 else u32x4;
-    return @bitCast(__mm256_permute2x128_si256_0x21(V, @as(V, @bitCast(a)), @as(V, @bitCast(b))));
-}
-
-fn _mm256_alignr_epi8(a: Chunk, b: Chunk, comptime imm8: comptime_int) Chunk {
-    var ret: Chunk = undefined;
-    var i: usize = 0;
-    while (i + imm8 < half_chunk_len) : (i += 1) {
-        ret[i] = b[i + imm8];
-    }
-    while (i < half_chunk_len) : (i += 1) {
-        ret[i] = a[i + imm8 - half_chunk_len];
-    }
-    while (i + imm8 < chunk_len) : (i += 1) {
-        ret[i] = b[i + imm8];
-    }
-    while (i < chunk_len) : (i += 1) {
-        ret[i] = a[i + imm8 - half_chunk_len];
-    }
-    return ret;
-}
-
-// ---
-// --- end from https://gist.github.com/sharpobject/80dc1b6f3aaeeada8c0e3a04ebc4b60a
-// ---
-
-pub fn mm256_shuffle_epi8(x: u8x32, mask: u8x32) u8x32 {
-    return asm (
-        \\ vpshufb %[mask], %[x], %[out]
-        : [out] "=x" (-> u8x32),
-        : [x] "+x" (x),
-          [mask] "x" (mask),
-    );
-}
-
-// https://developer.arm.com/architectures/instruction-sets/intrinsics/vqtbl1q_s8
-pub fn lookup_16_aarch64(x: u8x16, mask: u8x16) u8x16 {
-    // tbl     v0.16b, { v0.16b }, v1.16b
-    return asm (
-        \\tbl  %[out].16b, {%[mask].16b}, %[x].16b
-        : [out] "=&x" (-> u8x16),
-        : [x] "x" (x),
-          [mask] "x" (mask),
-    );
-}
-
 const Utf8Checker = struct {
+    const u8x32 = @Vector(32, u8);
+    const u8x64 = @Vector(64, u8);
+    const u64x4 = @Vector(4, u64);
+    const u32x4 = @Vector(4, u32);
+    const u8x16 = @Vector(16, u8);
+    const u8x8 = @Vector(8, u8);
+
+    pub const chunk_len = switch (builtin.cpu.arch) {
+        .x86_64 => 32,
+        .aarch64 => 16,
+        else => 16,
+    };
+    pub const Chunk = @Vector(chunk_len, u8);
+    pub const IChunk = @Vector(chunk_len, i8);
+    const half_chunk_len = chunk_len / 2;
+    pub const ChunkArr = [chunk_len]u8;
+
     err: Chunk = zeros,
     prev_input_block: Chunk = zeros,
     prev_incomplete: Chunk = zeros,
 
-    const zeros: ChunkArr = [1]u8{0} ** chunk_len;
+    const zeros: ChunkArr = [_]u8{0} ** chunk_len;
 
-    fn prev(comptime N: u8, a: Chunk, b: Chunk) Chunk {
+    // ---
+    // from https://gist.github.com/sharpobject/80dc1b6f3aaeeada8c0e3a04ebc4b60a
+    // ---
+    // thanks to sharpobject for these implementations which make it possible to get
+    // rid of old utils.c and stop linking libc.
+    // ---
+    fn _mm256_permute2x128_si256_0x21(a: Chunk, b: Chunk) Chunk {
+        const uint = std.meta.Int(.unsigned, @bitSizeOf(Chunk) / 4);
+        const V = @Vector(4, uint);
+        return @bitCast(@shuffle(
+            uint,
+            @as(V, @bitCast(a)),
+            @as(V, @bitCast(b)),
+            [_]i32{ 2, 3, -1, -2 },
+        ));
+    }
+
+    fn _mm256_alignr_epi8(a: Chunk, b: Chunk, comptime imm8: comptime_int) Chunk {
+        var ret: Chunk = undefined;
+        var i: usize = 0;
+        while (i + imm8 < half_chunk_len) : (i += 1) {
+            ret[i] = b[i + imm8];
+        }
+        while (i < half_chunk_len) : (i += 1) {
+            ret[i] = a[i + imm8 - half_chunk_len];
+        }
+        while (i + imm8 < chunk_len) : (i += 1) {
+            ret[i] = b[i + imm8];
+        }
+        while (i < chunk_len) : (i += 1) {
+            ret[i] = a[i + imm8 - half_chunk_len];
+        }
+        return ret;
+    }
+
+    fn prev(comptime N: comptime_int, a: Chunk, b: Chunk) Chunk {
         assert(0 < N and N <= 3);
         return _mm256_alignr_epi8(a, _mm256_permute2x128_si256_0x21(b, a), half_chunk_len - N);
     }
-    const check_special_cases = switch (builtin.cpu.arch) {
-        .aarch64 => check_special_cases_arm64,
-        .x86_64 => check_special_cases_x86,
-        else => unreachable,
-    };
+
+    // end from https://gist.github.com/sharpobject/80dc1b6f3aaeeada8c0e3a04ebc4b60a
+    pub fn mm256_shuffle_epi8(x: u8x32, mask: u8x32) u8x32 {
+        return asm (
+            \\ vpshufb %[mask], %[x], %[out]
+            : [out] "=x" (-> u8x32),
+            : [x] "+x" (x),
+              [mask] "x" (mask),
+        );
+    }
+
+    // https://developer.arm.com/architectures/instruction-sets/intrinsics/vqtbl1q_s8
+    pub fn lookup_16_aarch64(x: u8x16, mask: u8x16) u8x16 {
+        return asm (
+            \\tbl  %[out].16b, {%[mask].16b}, %[x].16b
+            : [out] "=&x" (-> u8x16),
+            : [x] "x" (x),
+              [mask] "x" (mask),
+        );
+    }
+
+    fn lookup_chunk(a: Chunk, b: Chunk) Chunk {
+        switch (builtin.cpu.arch) {
+            .x86_64 => return mm256_shuffle_epi8(a, b),
+            .aarch64 => return lookup_16_aarch64(b, a),
+            else => {
+                var r: Chunk = @splat(0);
+                for (0..chunk_len) |i| {
+                    const c = b[i];
+                    assert(c <= 0x0F);
+                    r[i] = a[c];
+                }
+                return r;
+
+                // var r: Chunk = @splat(0);
+                // for (0..16) |i| {
+                //     inline for ([2]comptime_int{ 0, 16 }) |o| {
+                //         if ((b[o + i] & 0x80) == 0) {
+                //             r[o + i] = a[o + b[o + i] & 0x0F];
+                //         }
+                //     }
+                // }
+                // return r;
+            },
+        }
+    }
+
     // zig fmt: off
-    fn check_special_cases_x86(input: Chunk, prev1: Chunk) Chunk {
+    fn check_special_cases(input: Chunk, prev1: Chunk) Chunk {
         // Bit 0 = Too Short (lead byte/ASCII followed by lead byte/ASCII)
         // Bit 1 = Too Long (ASCII followed by continuation)
         // Bit 2 = Overlong 3-byte
@@ -778,104 +864,7 @@ const Utf8Checker = struct {
                                         // 11111___ 1000____
         const OVERLONG_4: u8 = 1 << 6;  // 11110000 1000____
 
-        const byte_1_high_0 = prev1 >> @as(u3x32, @splat(4));
-        const tbl1 = [16]u8{
-            // 0_______ ________ <ASCII in byte 1>
-            TOO_LONG,               TOO_LONG,  TOO_LONG,                           TOO_LONG,
-            TOO_LONG,               TOO_LONG,  TOO_LONG,                           TOO_LONG,
-            // 10______ ________ <continuation in byte 1>
-            TWO_CONTS,              TWO_CONTS, TWO_CONTS,                          TWO_CONTS,
-            // 1100____ ________ <two byte lead in byte 1>
-            TOO_SHORT | OVERLONG_2,
-            // 1101____ ________ <two byte lead in byte 1>
-            TOO_SHORT,
-            // 1110____ ________ <three byte lead in byte 1>
-            TOO_SHORT | OVERLONG_3 | SURROGATE,
-            // 1111____ ________ <four+ byte lead in byte 1>
-            TOO_SHORT | TOO_LARGE | TOO_LARGE_1000 | OVERLONG_4,
-        } ** 2;
-        const byte_1_high = mm256_shuffle_epi8(tbl1, byte_1_high_0);
-        const CARRY: u8 = TOO_SHORT | TOO_LONG | TWO_CONTS; // These all have ____ in byte 1 .
-        const byte_1_low0 = prev1 & @as(u8x32, @splat(0x0F));
-
-        const tbl2 = [16]u8{
-            // ____0000 ________
-            CARRY | OVERLONG_3 | OVERLONG_2 | OVERLONG_4,
-            // ____0001 ________
-            CARRY | OVERLONG_2,
-            // ____001_ ________
-            CARRY,
-            CARRY,
-
-            // ____0100 ________
-            CARRY | TOO_LARGE,
-            // ____0101 ________
-            CARRY | TOO_LARGE | TOO_LARGE_1000,
-            // ____011_ ________
-            CARRY | TOO_LARGE | TOO_LARGE_1000,
-            CARRY | TOO_LARGE | TOO_LARGE_1000,
-
-            // ____1___ ________
-            CARRY | TOO_LARGE | TOO_LARGE_1000,
-            CARRY | TOO_LARGE | TOO_LARGE_1000,
-            CARRY | TOO_LARGE | TOO_LARGE_1000,
-            CARRY | TOO_LARGE | TOO_LARGE_1000,
-            CARRY | TOO_LARGE | TOO_LARGE_1000,
-            // ____1101 ________
-            CARRY | TOO_LARGE | TOO_LARGE_1000 | SURROGATE,
-            CARRY | TOO_LARGE | TOO_LARGE_1000,
-            CARRY | TOO_LARGE | TOO_LARGE_1000,
-        } ** 2;
-        const byte_1_low = mm256_shuffle_epi8(tbl2, byte_1_low0);
-
-        const byte_2_high_0 = input >> @as(u3x32, @splat(4));
-        const tbl3 = [16]u8{
-            // ________ 0_______ <ASCII in byte 2>
-            TOO_SHORT, TOO_SHORT, TOO_SHORT, TOO_SHORT,
-            TOO_SHORT, TOO_SHORT, TOO_SHORT, TOO_SHORT,
-            // ________ 1000____
-            TOO_LONG | OVERLONG_2 | TWO_CONTS | OVERLONG_3 | TOO_LARGE_1000 | OVERLONG_4,
-            // ________ 1001____
-            TOO_LONG | OVERLONG_2 | TWO_CONTS | OVERLONG_3 | TOO_LARGE,
-            // ________ 101_____
-            TOO_LONG | OVERLONG_2 | TWO_CONTS | SURROGATE | TOO_LARGE, TOO_LONG | OVERLONG_2 | TWO_CONTS | SURROGATE | TOO_LARGE,
-            // ________ 11______
-            TOO_SHORT, TOO_SHORT, TOO_SHORT, TOO_SHORT,
-        } ** 2;
-        const byte_2_high = mm256_shuffle_epi8(tbl3, byte_2_high_0);
-        return (byte_1_high & byte_1_low & byte_2_high);
-    }
-
-    fn check_special_cases_arm64(input: Chunk, prev1: Chunk) Chunk {
-        // Bit 0 = Too Short (lead byte/ASCII followed by lead byte/ASCII)
-        // Bit 1 = Too Long (ASCII followed by continuation)
-        // Bit 2 = Overlong 3-byte
-        // Bit 4 = Surrogate
-        // Bit 5 = Overlong 2-byte
-        // Bit 7 = Two Continuations
-
-        const TOO_SHORT: u8 = 1 << 0;   // 11______ 0_______
-                                        // 11______ 11______
-        const TOO_LONG: u8 = 1 << 1;    // 0_______ 10______
-        const OVERLONG_3: u8 = 1 << 2;  // 11100000 100_____
-        const SURROGATE: u8 = 1 << 4;   // 11101101 101_____
-        const OVERLONG_2: u8 = 1 << 5;  // 1100000_ 10______
-        const TWO_CONTS: u8 = 1 << 7;   // 10______ 10______
-        const TOO_LARGE: u8 = 1 << 3;   // 11110100 1001____
-                                        // 11110100 101_____
-                                        // 11110101 1001____
-                                        // 11110101 101_____
-                                        // 1111011_ 1001____
-                                        // 1111011_ 101_____
-                                        // 11111___ 1001____
-                                        // 11111___ 101_____
-        const TOO_LARGE_1000: u8 = 1 << 6;
-                                        // 11110101 1000____
-                                        // 1111011_ 1000____
-                                        // 11111___ 1000____
-        const OVERLONG_4: u8 = 1 << 6;  // 11110000 1000____
-
-        const u3xchunk_len = @Vector(u3, chunk_len);
+        const u3xchunk_len = @Vector(chunk_len, u3);
         const byte_1_high_0 = prev1 >> @as(u3xchunk_len, @splat(4));
         const tbl1 = [16]u8{
             // 0_______ ________ <ASCII in byte 1>
@@ -891,9 +880,9 @@ const Utf8Checker = struct {
             TOO_SHORT | OVERLONG_3 | SURROGATE,
             // 1111____ ________ <four+ byte lead in byte 1>
             TOO_SHORT | TOO_LARGE | TOO_LARGE_1000 | OVERLONG_4,
-        };
+        } ** (chunk_len / 16);
 
-        const byte_1_high = lookup_16_aarch64(byte_1_high_0, tbl1);
+        const byte_1_high = lookup_chunk(tbl1, byte_1_high_0);
         const CARRY: u8 = TOO_SHORT | TOO_LONG | TWO_CONTS; // These all have ____ in byte 1 .
         const byte_1_low0 = prev1 & @as(Chunk, @splat(0x0F));
 
@@ -924,8 +913,8 @@ const Utf8Checker = struct {
             CARRY | TOO_LARGE | TOO_LARGE_1000 | SURROGATE,
             CARRY | TOO_LARGE | TOO_LARGE_1000,
             CARRY | TOO_LARGE | TOO_LARGE_1000,
-        };
-        const byte_1_low = lookup_16_aarch64(byte_1_low0, tbl2);
+        } ** (chunk_len / 16);
+        const byte_1_low = lookup_chunk(tbl2, byte_1_low0);
 
         const byte_2_high_0 = input >> @as(u3xchunk_len, @splat(4));
         const tbl3 = [16]u8{
@@ -940,9 +929,9 @@ const Utf8Checker = struct {
             TOO_LONG | OVERLONG_2 | TWO_CONTS | SURROGATE | TOO_LARGE, TOO_LONG | OVERLONG_2 | TWO_CONTS | SURROGATE | TOO_LARGE,
             // ________ 11______
             TOO_SHORT, TOO_SHORT, TOO_SHORT, TOO_SHORT,
-        };
-        const byte_2_high = lookup_16_aarch64(byte_2_high_0, tbl3);
-        return (byte_1_high & byte_1_low & byte_2_high);
+        } ** (chunk_len / 16);
+        const byte_2_high = lookup_chunk(tbl3, byte_2_high_0);
+        return byte_1_high & byte_1_low & byte_2_high;
     }
     // zig fmt: on
 
@@ -988,46 +977,26 @@ const Utf8Checker = struct {
     }
 
     fn is_ascii(input: u8x64) bool {
-        const bytes: [64]u8 = input;
-        const a: u8x32 = bytes[0..32].*;
-        const b: u8x32 = bytes[32..64].*;
-        const non_ascii_mask: u8x32 = @splat(0x80);
-        const mask: u32 = @bitCast((a | b) >= non_ascii_mask);
-        return mask == 0;
+        return 0 == @as(u64, @bitCast(input >= @as(u8x64, @splat(0x80))));
     }
 
     fn check_next_input(checker: *Utf8Checker, input: u8x64) void {
-        // const NUM_CHUNKS = cmn.STEP_SIZE / 32;
-
         if (is_ascii(input)) {
             checker.err |= checker.prev_incomplete;
-        } else {
-            // you might think that a for-loop would work, but under Visual Studio, it is not good enough.
-            // static_assert((simd8x64<uint8_t>::NUM_CHUNKS == 2) || (simd8x64<uint8_t>::NUM_CHUNKS == 4),
-            // "We support either two or four chunks per 64-byte block.");
-            switch (builtin.cpu.arch) {
-                .x86_64 => {
-                    const NUM_CHUNKS = 2;
-                    const chunks = @as([NUM_CHUNKS][32]u8, @bitCast(input));
-                    checker.check_utf8_bytes(chunks[0], checker.prev_input_block);
-                    checker.check_utf8_bytes(chunks[1], chunks[0]);
-                    checker.prev_incomplete = is_incomplete(chunks[NUM_CHUNKS - 1]);
-                    checker.prev_input_block = chunks[NUM_CHUNKS - 1];
-                },
-                .aarch64 => {
-                    const NUM_CHUNKS = 4;
-                    const chunks = @as([NUM_CHUNKS][16]u8, @bitCast(input));
-                    checker.check_utf8_bytes(chunks[0], checker.prev_input_block);
-                    checker.check_utf8_bytes(chunks[1], chunks[0]);
-                    checker.check_utf8_bytes(chunks[2], chunks[1]);
-                    checker.check_utf8_bytes(chunks[3], chunks[2]);
-                    checker.prev_incomplete = is_incomplete(chunks[NUM_CHUNKS - 1]);
-                    checker.prev_input_block = chunks[NUM_CHUNKS - 1];
-                },
-                else => unreachable,
-            }
+            return;
         }
+
+        assert(chunk_len <= 64);
+        const NUM_CHUNKS = 64 / chunk_len;
+        const chunks = @as([NUM_CHUNKS][chunk_len]u8, @bitCast(input));
+        checker.check_utf8_bytes(chunks[0], checker.prev_input_block);
+        inline for (1..NUM_CHUNKS) |i| {
+            checker.check_utf8_bytes(chunks[i], chunks[i - 1]);
+        }
+        checker.prev_incomplete = is_incomplete(chunks[NUM_CHUNKS - 1]);
+        checker.prev_input_block = chunks[NUM_CHUNKS - 1];
     }
+
     // do not forget to call check_eof!
     fn errors(checker: Utf8Checker) !void {
         const err = @reduce(.Or, checker.err);
@@ -1041,13 +1010,14 @@ const Utf8Checker = struct {
     fn is_incomplete(input: Chunk) Chunk {
         // If the previous input's last 3 bytes match this, they're too short (they ended at EOF):
         // ... 1111____ 111_____ 11______
-        const max_array: [32]u8 = .{
-            255, 255, 255, 255, 255, 255,            255,            255,
-            255, 255, 255, 255, 255, 255,            255,            255,
-            255, 255, 255, 255, 255, 255,            255,            255,
-            255, 255, 255, 255, 255, 0b11110000 - 1, 0b11100000 - 1, 0b11000000 - 1,
+
+        const max_value = comptime max_value: {
+            var max_array: Chunk = @splat(255);
+            max_array[chunk_len - 3] = 0b11110000 - 1;
+            max_array[chunk_len - 2] = 0b11100000 - 1;
+            max_array[chunk_len - 1] = 0b11000000 - 1;
+            break :max_value max_array;
         };
-        const max_value = @as(Chunk, @splat(max_array[@sizeOf(@TypeOf(max_array)) - @sizeOf(u8x32)]));
         return input -| max_value;
     }
 };
