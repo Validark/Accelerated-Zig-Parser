@@ -8,11 +8,6 @@ So far, a tokenizer implementation is provided. The mainline Zig tokenizer uses 
 
 The test bench fully reads in all of the Zig files under the folders in the `src` folder. In my test I installed the Zig compiler, ZLS, and a few other Zig projects in my `src` folder. The test bench iterates over the source bytes from each Zig file (with added sentinels) and calls the tokenization function on each.
 
-       Read in files in 37.399ms (1.58 GB/s) and used 59.124871MB memory with 1296390 lines across 3185 files
-Legacy Tokenizing took 228.805ms (0.26 GB/s,  5.67M loc/s) and used 46.045775MB memory
-       Tokenizing took  84.928ms (0.70 GB/s, 15.26M loc/s) and used 18.376734MB memory
-       That's 2.69x faster with 2.51x less memory!
-
 To tokenize 3,185 Zig files with 59,124,871 bytes, including 1,296,390 newlines, the original tokenizer and my new tokenizer have the following characteristics:
 
 |  | token memory (mebibytes)| run-time (milliseconds) | throughput (gigabytes per second) |throughput (lines of code per second) |
