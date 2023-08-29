@@ -79,10 +79,10 @@ fn readFiles(gpa: Allocator) !std.ArrayListUnmanaged([:0]const u8) {
                 lines += @intFromBool(c == '\n');
             }
         }
-        const duration: u64 = @intCast(t2 - t1);
-        const @"GB/s" = @as(f64, @floatFromInt(num_bytes)) / @as(f64, @floatFromInt(duration));
+        const elapsedNanos: u64 = @intCast(t2 - t1);
+        const @"GB/s" = @as(f64, @floatFromInt(num_bytes)) / @as(f64, @floatFromInt(elapsedNanos));
 
-        std.debug.print("       Read in files in {} ({d:.2} GB/s) and used {} memory with {} lines across {} files\n", .{ std.fmt.fmtDuration(duration), @"GB/s", std.fmt.fmtIntSizeDec(num_bytes), lines, sources.items.len });
+        std.debug.print("       Read in files in {} ({d:.2} GB/s) and used {} memory with {} lines across {} files\n", .{ std.fmt.fmtDuration(elapsedNanos), @"GB/s", std.fmt.fmtIntSizeDec(num_bytes), lines, sources.items.len });
     }
     return sources;
 }
@@ -174,6 +174,21 @@ const Operators = struct {
 
     fn isSingleCharOp(c: u8) bool {
         inline for (single_char_ops) |op| if (c == op) return true;
+        return false;
+    }
+
+    fn isSingleCharOpNewlineLikely(c: u8) bool {
+        return switch (c) {
+            ';', '{', '}', ',' => true,
+            else => false,
+        };
+    }
+
+    fn isSingleCharOpNewlineUnlikely(c: u8) bool {
+        inline for (single_char_ops) |op| {
+            comptime if (isSingleCharOpNewlineLikely(op)) continue;
+            if (c == op) return true;
+        }
         return false;
     }
 
@@ -370,7 +385,7 @@ const Parser = struct {
 
     const BitmapKind = enum(u8) {
         // zig fmt: off
-        start_of_file         = 123, // TODO: probe for something less than 128, doesn't matter what
+        // start_of_file         = 123, // TODO: probe for something less than 128, doesn't matter what
         whitespace            = 128 | @as(u8, 0),
 
         unknown               = 128 | @as(u8,  1), // is_quoted
@@ -389,6 +404,19 @@ const Parser = struct {
         // zig fmt: on
     };
 
+    pub fn isOperand(op_type: Tag) bool {
+        comptime var min_bitmap_value = 129;
+        comptime var max_bitmap_value = std.math.minInt(@typeInfo(BitmapKind).Enum.tag_type);
+
+        comptime for (std.meta.fields(BitmapKind)) |field| {
+            max_bitmap_value = @max(field.value, max_bitmap_value);
+        };
+        return switch (@intFromEnum(op_type)) {
+            min_bitmap_value...max_bitmap_value => true,
+            else => false,
+        };
+    }
+
     // TODO: recover from parse_errors by switching to BitmapKind.unknown? Report errors?
     // TODO: audit usages of u32's to make sure it's impossible to ever overflow.
     // TODO: make it so quotes and character literals cannot have newlines in them.
@@ -404,15 +432,16 @@ const Parser = struct {
         var tokens = try gpa.alloc(Token, extended_source_len);
         errdefer gpa.free(tokens);
 
-        var cur_token = tokens;
-        cur_token[0] = .{ .len = 0, .kind = .start_of_file };
-        cur_token[1..][0..2].* = @bitCast(@as(u32, 0));
-
         comptime assert(FRONT_SENTINELS.len == 1 and FRONT_SENTINELS[0] == '\n');
         comptime assert(BACK_SENTINELS.len >= 3);
 
-        var cur = extended_source[@as(u3, @intFromBool(std.mem.readIntSliceNative(u32, extended_source) == std.mem.readIntSliceNative(u32, "\n\xEF\xBB\xBF"))) << 2 ..];
+        const start_len: u8 = if (std.mem.readIntSliceNative(u32, extended_source) == std.mem.readIntSliceNative(u32, "\n\xEF\xBB\xBF")) 4 else 1;
+        var cur = extended_source[start_len..];
         var prev = cur;
+
+        var cur_token = tokens;
+        cur_token[0] = .{ .len = start_len, .kind = .whitespace };
+        cur_token[1..][0..2].* = @bitCast(@as(u32, start_len));
 
         var bitmaps = std.mem.zeroes(Bitmaps);
         const bitmaps_len = @divExact(@bitSizeOf(Bitmaps), @bitSizeOf(VEC_INT));
@@ -449,17 +478,20 @@ const Parser = struct {
                 switch (prev[0]) {
                     'a'...'z' => if (Keywords.lookup(prev.ptr, len)) |op_kind| {
                         op_type = op_kind;
+                        const is_space = @intFromBool(cur[0] == ' ');
+                        cur = cur[is_space..];
+                        len += is_space;
                     },
                     else => {},
                 }
 
-                {
-                    const is_collapsible = switch (op_type) {
-                        .@"//", .@"//!", .@"///", .whitespace => true,
-                        else => false,
-                    };
+                var advance_amt: u2 = switch (cur_token[0].len) {
+                    0 => 3,
+                    else => 1,
+                };
 
-                    comptime var min_bitmap_value = 128;
+                blk: {
+                    comptime var min_bitmap_value = 129;
                     comptime var max_bitmap_value = std.math.minInt(@typeInfo(BitmapKind).Enum.tag_type);
 
                     comptime for (std.meta.fields(BitmapKind)) |field| {
@@ -475,29 +507,39 @@ const Parser = struct {
                     // with later if we don't know the exact length. If it turns out that we don't really
                     // need this information anyway, we can simplify this codepath and collapse comments
                     // and whitespace into those tokens too.
-                    const prev_is_collapse_amenable = switch (@intFromEnum(cur_token[0].kind)) {
-                        min_bitmap_value...max_bitmap_value => false,
-                        else => true,
+
+                    const prev_op_type = cur_token[0].kind;
+
+                    const op_type_c = switch (@intFromEnum(op_type)) {
+                        min_bitmap_value...max_bitmap_value => break :blk, // identifiers, quotes, etc
+                        @intFromEnum(Tag.@"//"),
+                        @intFromEnum(Tag.@"//!"),
+                        @intFromEnum(Tag.@"///"),
+                        @intFromEnum(Tag.whitespace),
+                        => true,
+                        else => false, // operators, keywords, etc
                     };
 
-                    var advance_amt: u2 = switch (cur_token[0].len) {
-                        0 => 3,
-                        else => 1,
+                    const prev_op_type_c = switch (@intFromEnum(prev_op_type)) {
+                        min_bitmap_value...max_bitmap_value => break :blk, // identifiers, quotes, etc
+                        @intFromEnum(Tag.@"//"),
+                        @intFromEnum(Tag.@"//!"),
+                        @intFromEnum(Tag.@"///"),
+                        @intFromEnum(Tag.whitespace),
+                        => true,
+                        else => false, // operators, keywords, etc
                     };
 
-                    if (is_collapsible and prev_is_collapse_amenable) {
+                    if (op_type_c or prev_op_type_c) {
                         advance_amt = 0;
-                        op_type = cur_token[0].kind;
-                        len += switch (cur_token[0].len) {
-                            0 => @bitCast(cur_token[1..][0..2].*),
-                            else => |l| l,
-                        };
+                        if (op_type_c) op_type = prev_op_type;
+                        len += @bitCast(cur_token[1..][0..2].*);
                     }
-
-                    cur_token = cur_token[advance_amt..];
-                    cur_token[0] = .{ .len = if (len >= 256) 0 else @intCast(len), .kind = op_type };
-                    cur_token[1..][0..2].* = @bitCast(len);
                 }
+
+                cur_token = cur_token[advance_amt..];
+                cur_token[0] = .{ .len = if (len >= 256) 0 else @intCast(len), .kind = op_type };
+                cur_token[1..][0..2].* = @bitCast(len);
 
                 prev = cur;
 
@@ -620,6 +662,8 @@ fn combineFiles(gpa: Allocator, sources: std.ArrayListUnmanaged([:0]const u8)) !
     return new_sources;
 }
 
+const RUN_LEGACY = true;
+
 pub fn main() !void {
     const gpa = std.heap.c_allocator;
     const sources = try readFiles(gpa);
@@ -635,45 +679,47 @@ pub fn main() !void {
 
     // std.debug.print("-" ** 72 ++ "\n", .{});
     // const sources = try combineFiles(gpa, try readFiles(gpa));
+    var num_tokens2: usize = 0;
 
-    const legacy_tokens = try gpa.alloc(Ast.TokenList.Slice, sources.items.len);
-    var legacy_token_cur = legacy_tokens;
+    const elapsedNanos2: u64 = if (!RUN_LEGACY) 0 else blk: {
+        const legacy_tokens = try gpa.alloc(Ast.TokenList.Slice, sources.items.len);
+        var legacy_token_cur = legacy_tokens;
 
-    const t3 = std.time.nanoTimestamp();
-    for (sources.items) |sourcey| {
-        const source = sourcey[1..];
-        var tokens = Ast.TokenList{};
-        defer tokens.deinit(gpa);
+        const t3 = std.time.nanoTimestamp();
+        for (sources.items) |sourcey| {
+            const source = sourcey[1..];
+            var tokens = Ast.TokenList{};
+            defer tokens.deinit(gpa);
 
-        // Empirically, the zig std lib has an 8:1 ratio of source bytes to token count.
-        const estimated_token_count = source.len / 8;
-        try tokens.ensureTotalCapacity(gpa, estimated_token_count);
+            // Empirically, the zig std lib has an 8:1 ratio of source bytes to token count.
+            const estimated_token_count = source.len / 8;
+            try tokens.ensureTotalCapacity(gpa, estimated_token_count);
 
-        var tokenizer = std.zig.Tokenizer.init(source);
-        while (true) {
-            const token = tokenizer.next();
-            try tokens.append(gpa, .{
-                .tag = token.tag,
-                .start = @as(u32, @intCast(token.loc.start)),
-            });
-            if (token.tag == .eof) break;
+            var tokenizer = std.zig.Tokenizer.init(source);
+            while (true) {
+                const token = tokenizer.next();
+                try tokens.append(gpa, .{
+                    .tag = token.tag,
+                    .start = @as(u32, @intCast(token.loc.start)),
+                });
+                if (token.tag == .eof) break;
+            }
+
+            legacy_token_cur[0] = tokens.toOwnedSlice();
+            legacy_token_cur = legacy_token_cur[1..];
+        }
+        const t4 = std.time.nanoTimestamp();
+
+        for (legacy_tokens) |tokens| {
+            num_tokens2 += tokens.len;
         }
 
-        legacy_token_cur[0] = tokens.toOwnedSlice();
-        legacy_token_cur = legacy_token_cur[1..];
-    }
-    const t4 = std.time.nanoTimestamp();
+        const elapsedNanos2: u64 = @intCast(t4 - t3);
 
-    var num_tokens2: usize = 0;
-    for (legacy_tokens) |tokens| {
-        num_tokens2 += tokens.len;
-    }
-
-    const duration2: u64 = @intCast(t4 - t3);
-
-    const @"GB/s 2" = @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(duration2));
-    std.debug.print("Legacy Tokenizing took {: >9} ({d:.2} GB/s, {d: >5.2}M loc/s) and used {} memory\n", .{ std.fmt.fmtDuration(duration2), @"GB/s 2", @as(f64, @floatFromInt(lines)) / @as(f64, @floatFromInt(duration2)) * 1000, std.fmt.fmtIntSizeDec(num_tokens2 * 5) });
-
+        const @"GB/s 2" = @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(elapsedNanos2));
+        std.debug.print("Legacy Tokenizing took {: >9} ({d:.2} GB/s, {d: >5.2}M loc/s) and used {} memory\n", .{ std.fmt.fmtDuration(elapsedNanos2), @"GB/s 2", @as(f64, @floatFromInt(lines)) / @as(f64, @floatFromInt(elapsedNanos2)) * 1000, std.fmt.fmtIntSizeDec(num_tokens2 * 5) });
+        break :blk elapsedNanos2;
+    };
     var t1 = std.time.nanoTimestamp();
 
     // mine:                85ms
@@ -691,17 +737,20 @@ pub fn main() !void {
     }
 
     const t2 = std.time.nanoTimestamp();
-    const duration: u64 = @intCast(t2 - t1);
+    const elapsedNanos: u64 = @intCast(t2 - t1);
 
     var num_tokens: usize = 0;
     for (source_tokens) |tokens| {
         num_tokens += tokens.len;
     }
 
-    const @"GB/s" = @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(duration));
-    std.debug.print("       Tokenizing took {: >9} ({d:.2} GB/s, {d: >5.2}M loc/s) and used {} memory\n", .{ std.fmt.fmtDuration(duration), @"GB/s", @as(f64, @floatFromInt(lines)) / @as(f64, @floatFromInt(duration)) * 1000, std.fmt.fmtIntSizeDec(num_tokens * 2) });
+    // Fun fact: bytes per nanosecond is the same ratio as GB/s
+    const @"GB/s" = @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(elapsedNanos));
+    std.debug.print("       Tokenizing took {: >9} ({d:.2} GB/s, {d: >5.2}M loc/s) and used {} memory\n", .{ std.fmt.fmtDuration(elapsedNanos), @"GB/s", @as(f64, @floatFromInt(lines)) / @as(f64, @floatFromInt(elapsedNanos)) * 1000, std.fmt.fmtIntSizeDec(num_tokens * 2) });
 
-    std.debug.print("       That's {d:.2}x faster!\n", .{@as(f64, @floatFromInt(duration2)) / @as(f64, @floatFromInt(duration))});
+    if (elapsedNanos2 > 0) {
+        std.debug.print("       That's {d:.2}x faster and {d:.2}x less memory!\n", .{ @as(f64, @floatFromInt(elapsedNanos2)) / @as(f64, @floatFromInt(elapsedNanos)), @as(f64, @floatFromInt(num_tokens2 * 5)) / @as(f64, @floatFromInt(num_tokens * 2)) });
+    }
 
     // std.debug.print("-" ** 72 ++ "\n", .{});
 }

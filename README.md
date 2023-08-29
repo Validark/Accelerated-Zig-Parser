@@ -8,14 +8,20 @@ So far, a tokenizer implementation is provided. The mainline Zig tokenizer uses 
 
 The test bench fully reads in all of the Zig files under the folders in the `src` folder. In my test I installed the Zig compiler, ZLS, and a few other Zig projects in my `src` folder. The test bench iterates over the source bytes from each Zig file (with added sentinels) and calls the tokenization function on each.
 
-To tokenize 3,276 Zig files with 59,307,924 bytes, including 1,303,536 newlines, the original tokenizer and my new tokenizer have the following characteristics:
+       Read in files in 37.399ms (1.58 GB/s) and used 59.124871MB memory with 1296390 lines across 3185 files
+Legacy Tokenizing took 228.805ms (0.26 GB/s,  5.67M loc/s) and used 46.045775MB memory
+       Tokenizing took  84.928ms (0.70 GB/s, 15.26M loc/s) and used 18.376734MB memory
+       That's 2.69x faster with 2.51x less memory!
+
+To tokenize 3,185 Zig files with 59,124,871 bytes, including 1,296,390 newlines, the original tokenizer and my new tokenizer have the following characteristics:
 
 |  | token memory (mebibytes)| run-time (milliseconds) | throughput (gigabytes per second) |throughput (lines of code per second) |
 |:-:|:-:|:-:|:-:|:-:|
-| original | 43.44MiB | 192ms  |0.31 GB/s | 6.8M loc/s |
-| this | **18.36MiB** | **85ms** | **0.70 GB/s** | **15.3M loc/s** |
+| original | 46.045775MB | 228.805ms  |0.26 GB/s | 5.67M loc/s |
+| this | **18.376734MB** | **84.928ms** | **0.70 GB/s** | **15.26M loc/s** |
 
-That's over twice as fast and less than half the memory! For context, I am using a Zen 3 desktop and I would be interested in hearing from arm64 users who could share some performance numbers. If you continue reading you will see I designed this code with the hope it would be fast on arm64 platforms too.
+That's 2.69x faster and 2.51x less memory! Thus far, I have measured only on a Zen 3 desktop. However, this is meant to be fast on other architectures too, especially arm64.
+<!-- and I would be interested in hearing from arm64 users who could share some performance numbers. If you continue reading you will see I designed this code with the hope it would be fast on arm64 platforms too. -->
 
 Oddly enough, I think this code is generally more maintainable too, as adding an operator or keyword to the tokenizer is literally just adding another string into the relevant array. All of the assumptions and tricks I use are explicitly checked for in compile-time assertions (`grep` for `comptime assert`), so violating any of those invariants will result in compile errors that tell you why you can't change certain things.
 
