@@ -10,7 +10,7 @@ The test bench fully reads in all of the Zig files under the folders in the `src
 
 To tokenize 3,185 Zig files with 59,124,871 bytes, including 1,296,390 newlines, the original tokenizer and my new tokenizer have the following characteristics:
 
-|  | token memory (mebibytes)| run-time (milliseconds) | throughput (gigabytes per second) |throughput (lines of code per second) |
+|  | token memory (megabytes)| run-time (milliseconds) | throughput (gigabytes per second) |throughput (lines of code per second) |
 |:-:|:-:|:-:|:-:|:-:|
 | original | 46.045775MB | 228.805ms  |0.26 GB/s | 5.67M loc/s |
 | this | **18.376734MB** | **84.928ms** | **0.70 GB/s** | **15.26M loc/s** |
