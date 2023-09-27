@@ -1,30 +1,3 @@
-// TODO: mask_for_op_cont should probably be renamed.
-// I need to decide what to do with the handwritten optimizations there.
-// I think the function could use a more thoughtful design, or I could potentially write a tool
-// or work on the compiler so that optimal code gets generated automatically. This project made me realize
-// that compilers could probably be smarter about SWAR transformations.
-
-// Also it would be nicer if assembly were a little easier to read. I don't know why people decided that
-// assembly syntax should be `add eax eax` rather than `eax += eax;` It would be also be nice if assembly
-// was more consistent in being clear about where it came from, or if variable names appeared in the
-// comments.
-
-// There are a lot of pieces of code that could do with more compile-time assertions to make it more robust.
-
-// Zig also is missing a few features:
-
-// 0. Not being able to dump a comptime array into a switch statement is a bit frustrating.
-//  In order to make my code robust and extensible, I want my conditional statements to automatically update
-//  if an operator gets added. However, the only way to do this currently is to manually if-convert. Not fun.
-// 1. Zig slices should also be a start pointer and an end pointer 99% of the time, in my opinion.
-// 2. More sentinel support. At the front of a slice, at the back, etc. The ability to expand the slice to include the sentinels.
-// 3. Allow ranges as compile-time values?
-// 4. Vectorized table lookups (already planned)
-// 5. Aligned length slices, including the sentinels when desired. We should be able to eliminate "trust me bro" semantics. backaligned? overalign? Something.
-// 6. Labeled tuple slots/array slots if they don't already exist? TypeScript has them and they are nice.
-
-// I could probably reorganize the `Tag` address space and see if I can squeeze more perf out.
-
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
@@ -36,8 +9,12 @@ const Allocator = std.mem.Allocator;
 // std.simd.suggestVectorSize(comptime T: type) == null => SWAR
 
 const USE_SWAR = false;
+
+// zig fmt: off
 const SKIP_OUTLIERS: u1 = 1;
-const RUN_LEGACY: u1 = 1;
+const RUN_LEGACY   : u1 = 0;
+const REPORT_SPEED : u1 = 0;
+// zig fmt: on
 
 // On some machines, `clz` is more efficient than `ctz`.
 // We can speculatively perform 4 bit reverses in nextChunk so that the main loop can use `@clz` instead.
@@ -494,7 +471,7 @@ const Tag = blk: {
 };
 
 /// If we see a len of 0, go look in the next extra_long_lens slot for the true length.
-const Token = struct { len: u8, kind: Tag };
+const Token = extern struct { len: u8, kind: Tag };
 
 fn printu(v: anytype) void {
     comptime var shift = @bitSizeOf(v);
@@ -734,85 +711,12 @@ const Parser = struct {
         }
     }
 
-    fn vpadd2(a: @Vector(16, u8), b: @Vector(16, u8)) @Vector(16, u8) {
-        const vecs = std.simd.deinterlace(2, std.simd.join(a, b));
-        return vecs[0] + vecs[1];
-    }
-
-    fn vpadd(a: @Vector(16, u8), b: @Vector(16, u8)) @Vector(16, u8) {
-        const shuf = comptime std.simd.join(std.simd.iota(i5, 8), ~std.simd.iota(i5, 8));
-        const a_vecs = std.simd.deinterlace(2, a);
-        const b_vecs = std.simd.deinterlace(2, b);
-        return @shuffle(u8, a_vecs[0] + a_vecs[1], b_vecs[0] + b_vecs[1], shuf);
-    }
-
     fn maskForChar(input_vec: VEC, comptime char: u8) VEC_INT {
-        switch (builtin.cpu.arch) {
-            // .aarch64, .aarch64_be => {
-            //     // const bitmask = comptime std.simd.repeat(64, @as(@Vector(8, u8), @splat(1)) << std.simd.iota(u8, 8));
-            //     // const mother = input_vec == @as(VEC, @splat(@as(u8, char)));
-            //     // const fee = @select(u8, mother, bitmask, @as(VEC, @splat(0)));
-            //     // const a = std.simd.deinterlace(2, fee);
-            //     // const c = std.simd.deinterlace(2, a[0] + a[1]);
-            //     // const e = std.simd.deinterlace(2, c[0] + c[1]);
-            //     // return @bitCast(e[0] + e[1]);
-
-            //     const char_mask = @as(@Vector(16, u8), @splat(char));
-            //     const bitmask = comptime std.simd.repeat(16, @as(@Vector(8, u8), @splat(1)) << std.simd.iota(u8, 8));
-            //     const zeroes: @Vector(16, u8) = @splat(0);
-            //     const bytes: [64]u8 = input_vec;
-            //     const a = @select(u8, @as(@Vector(16, u8), bytes[0..16].*) == char_mask, bitmask, zeroes);
-            //     const b = @select(u8, @as(@Vector(16, u8), bytes[16..32].*) == char_mask, bitmask, zeroes);
-            //     const c = @select(u8, @as(@Vector(16, u8), bytes[32..48].*) == char_mask, bitmask, zeroes);
-            //     const d = @select(u8, @as(@Vector(16, u8), bytes[48..64].*) == char_mask, bitmask, zeroes);
-
-            //     // Add each of the elements next to each other, successively, to stuff each 8 byte mask into one.
-            //     var sum0 = vpadd(a, b);
-            //     const sum1 = vpadd(c, d);
-            //     sum0 = vpadd(sum0, sum1);
-            //     sum0 = vpadd(sum0, sum0);
-
-            //     return @as(@Vector(2, u64), @bitCast(sum0))[0];
-            // },
-            else => return @bitCast(input_vec == @as(VEC, @splat(char))),
-        }
+        return @bitCast(input_vec == @as(VEC, @splat(char)));
     }
 
     inline fn maskForCharRange(input_vec: VEC, comptime char1: u8, comptime char2: u8) VEC_INT {
-        switch (builtin.cpu.arch) {
-            // .aarch64, .aarch64_be => {
-            //     const char1_mask = @as(@Vector(16, u8), @splat(char1));
-            //     const char2_mask = @as(@Vector(16, u8), @splat(char2));
-            //     const bitmask = comptime std.simd.repeat(16, @as(@Vector(8, u8), @splat(1)) << std.simd.iota(u8, 8));
-            //     const zeroes: @Vector(16, u8) = @splat(0);
-            //     const bytes: [64]u8 = input_vec;
-
-            //     const a =
-            //         @select(u8, bytes[0..16].* >= char1_mask, bitmask, zeroes) &
-            //         @select(u8, bytes[0..16].* <= char2_mask, bitmask, zeroes);
-
-            //     const b =
-            //         @select(u8, bytes[16..32].* >= char1_mask, bitmask, zeroes) &
-            //         @select(u8, bytes[16..32].* <= char2_mask, bitmask, zeroes);
-
-            //     const c =
-            //         @select(u8, bytes[32..48].* >= char1_mask, bitmask, zeroes) &
-            //         @select(u8, bytes[32..48].* <= char2_mask, bitmask, zeroes);
-
-            //     const d =
-            //         @select(u8, bytes[48..64].* >= char1_mask, bitmask, zeroes) &
-            //         @select(u8, bytes[48..64].* <= char2_mask, bitmask, zeroes);
-
-            //     // Add each of the elements next to each other, successively, to stuff each 8 byte mask into one.
-            //     var sum0 = vpadd(a, b);
-            //     const sum1 = vpadd(c, d);
-            //     sum0 = vpadd(sum0, sum1);
-            //     sum0 = vpadd(sum0, sum0);
-
-            //     return @as(@Vector(2, u64), @bitCast(sum0))[0];
-            // },
-            else => return @as(VEC_INT, @bitCast(@as(VEC, @splat(char1)) <= input_vec)) & @as(VEC_INT, @bitCast(input_vec <= @as(VEC, @splat(char2)))),
-        }
+        return @as(VEC_INT, @bitCast(@as(VEC, @splat(char1)) <= input_vec)) & @as(VEC_INT, @bitCast(input_vec <= @as(VEC, @splat(char2))));
     }
 
     inline fn getLinebreaks(vec: VEC, ascii: VEC_INT) VEC_INT {
@@ -1303,564 +1207,6 @@ const Parser = struct {
     }
 };
 
-// Algorithm ConvertInfixtoPrefix
-
-// Purpose: Convert an infix expression into a prefix expression. Begin
-// // Create operand and operator stacks as empty stacks.
-// Create OperandStack
-// Create OperatorStack
-
-// // While input expression still remains, read and process the next token.
-
-// while( not an empty input expression ) read next token from the input expression
-
-//     // Test if token is an operand or operator
-//     if ( token is an operand )
-//     // Push operand onto the operand stack.
-//         OperandStack.Push (token)
-//     endif
-
-//     // If it is a left parentheses or operator of higher precedence than the last, or the stack is empty,
-//     else if ( token is '(' or OperatorStack.IsEmpty() or OperatorHierarchy(token) > OperatorHierarchy(OperatorStack.Top()) )
-//     // push it to the operator stack
-//         OperatorStack.Push ( token )
-//     endif
-
-//     else if( token is ')' )
-//     // Continue to pop operator and operand stacks, building
-//     // prefix expressions until left parentheses is found.
-//     // Each prefix expression is push back onto the operand
-//     // stack as either a left or right operand for the next operator.
-//         while( OperatorStack.Top() not equal '(' )
-//             OperatorStack.Pop(operator)
-//             OperandStack.Pop(RightOperand)
-//             OperandStack.Pop(LeftOperand)
-//             operand = operator + LeftOperand + RightOperand
-//             OperandStack.Push(operand)
-//         endwhile
-
-//     // Pop the left parthenses from the operator stack.
-//     OperatorStack.Pop(operator)
-//     endif
-
-//     else if( operator hierarchy of token is less than or equal to hierarchy of top of the operator stack )
-//     // Continue to pop operator and operand stack, building prefix
-//     // expressions until the stack is empty or until an operator at
-//     // the top of the operator stack has a lower hierarchy than that
-//     // of the token.
-//         while( !OperatorStack.IsEmpty() and OperatorHierarchy(token) lessThen Or Equal to OperatorHierarchy(OperatorStack.Top()) )
-//             OperatorStack.Pop(operator)
-//             OperandStack.Pop(RightOperand)
-//             OperandStack.Pop(LeftOperand)
-//             operand = operator + LeftOperand + RightOperand
-//             OperandStack.Push(operand)
-//         endwhile
-//         // Push the lower precedence operator onto the stack
-//         OperatorStack.Push(token)
-//     endif
-// endwhile
-// // If the stack is not empty, continue to pop operator and operand stacks building
-// // prefix expressions until the operator stack is empty.
-// while( !OperatorStack.IsEmpty() ) OperatorStack.Pop(operator)
-//     OperandStack.Pop(RightOperand)
-//     OperandStack.Pop(LeftOperand)
-//     operand = operator + LeftOperand + RightOperand
-
-//     OperandStack.Push(operand)
-// endwhile
-
-// // Save the prefix expression at the top of the operand stack followed by popping // the operand stack.
-
-// print OperandStack.Top()
-
-// OperandStack.Pop()
-
-// End
-
-fn op_precedence(tag: Tag) u8 {
-    return switch (tag) {
-        .@"^" => 3,
-        .@"*", .@"/" => 2,
-        .@"+", .@"-" => 1,
-        else => unreachable,
-    };
-}
-
-fn printStack(buffer: *[16]Token, end_slot: [*]Token) void {
-    var cur: [*]Token = buffer;
-
-    std.debug.print("[", .{});
-    while (cur != end_slot) : (cur += 1) {
-        std.debug.print(" {s}", .{@tagName(cur[0].kind)});
-    }
-    std.debug.print(" ]\n", .{});
-}
-
-fn priority(kind: Tag) u8 {
-    comptime var i: struct {
-        val: comptime_int = 0,
-
-        fn incr(comptime self: *@This()) comptime_int {
-            const v = self.val;
-            self.val = v + 1;
-            return v;
-        }
-    } = .{};
-
-    return switch (kind) {
-        .@"//!" => i.incr(),
-        .@"///", .@";" => i.incr(),
-        .@"=" => i.incr(),
-        .@"const" => i.incr(),
-        .@"+", .@"-" => i.incr(),
-        .@"*", .@"/", .@"%" => i.incr(),
-        .@"^" => i.incr(),
-        else => {
-            std.debug.print("No priority found for '{s}'\n", .{@tagName(kind)});
-            unreachable;
-        },
-    };
-}
-
-// 0000_0000
-// 1111_1111
-// 0110_1010
-
-fn infixToPrefix(gpa: Allocator, source: []const u8, tokens: []const Token) !void {
-    // if (1 == 1) return;
-    const SHOULD_PRINT = true;
-    var cur = source;
-    _ = cur;
-
-    const BUFFER_START_SIZE = 56;
-
-    var op_str_buffer = try gpa.alloc(OpString, BUFFER_START_SIZE);
-    defer gpa.free(op_str_buffer);
-
-    // This is a sentinel value we can use to initialize operands of length 1
-    op_str_buffer[0] = OpString.initOperand(1);
-
-    // Construct a free list
-    {
-        var i: u32 = 1;
-        while (i < BUFFER_START_SIZE - 1) : (i += 1) op_str_buffer[i].next = i + 1;
-        op_str_buffer[BUFFER_START_SIZE - 1].next = 0;
-    }
-
-    // This is now the head of our free list :)
-    var available_op_str: u32 = 1;
-
-    var output: std.ArrayListUnmanaged(Token) = .{};
-    _ = output;
-
-    var operand_list: std.ArrayListUnmanaged(Token) = .{};
-    var operand_stack: std.ArrayListUnmanaged(u32) = .{};
-    var operator_stack: std.ArrayListUnmanaged(Token) = .{};
-
-    // const c = blk: {
-    //     const a = 1;
-    //     const b = 2;
-    //     break :blk a + b;
-    // } + blk: {
-    //     const a = 2;
-    //     const b = 3;
-    //     break :blk a + b;
-    // } * blk: {
-    //     const a = 3;
-    //     const c = 4;
-    //     break :blk a + c;
-    // };
-    // _ = c;
-
-    // std.zig.Ast.parse(gpa: Allocator, source: [:0]const u8, mode: Mode)
-
-    // const c4 = 1.e4;
-    // @compileLog(c4);
-
-    // Print first
-    if (SHOULD_PRINT) {
-        var pos: u32 = 0;
-
-        for (tokens) |token| {
-            if (Parser.isOperand(token.kind)) {
-                std.debug.print("{s} ", .{source[pos..][0..token.len]});
-            } else std.debug.print("{s} ", .{@tagName(token.kind)});
-            pos += token.len;
-        }
-        std.debug.print("\n", .{});
-    }
-
-    var cur_token = tokens;
-
-    while (cur_token[0].kind != .@";") : (cur_token = cur_token[1..]) {
-        // std.debug.print("cur_token: {s}, len: {}\n", .{ @tagName(cur_token[0].kind), cur_token[0].len });
-        if (Parser.isOperand(cur_token[0].kind)) {
-            try operand_list.append(gpa, cur_token[0]);
-            try operand_stack.append(gpa, 0);
-        } else if (operator_stack.items.len == 0 or op_precedence(cur_token[0].kind) > op_precedence(operator_stack.getLast().kind)) {
-            try operator_stack.append(gpa, cur_token[0]);
-        } else {
-            // Continue to pop operator and operand stack, building prefix
-            // expressions until the stack is empty or until an operator at
-            // the top of the operator stack has a lower hierarchy than that
-            // of the token.
-
-            while (operator_stack.items.len > 0 and op_precedence(cur_token[0].kind) <= op_precedence(operator_stack.getLast().kind)) {
-                const operator = operator_stack.pop();
-                const right = operand_stack.pop();
-                const left = operand_stack.pop();
-
-                if (available_op_str == 0) unreachable;
-                const old_available_op_str = available_op_str;
-                const op_str = &op_str_buffer[old_available_op_str];
-                available_op_str = op_str.*.next;
-                op_str.* = OpString.initOperator(operator);
-                op_str.append(&op_str_buffer[left]);
-                op_str.append(&op_str_buffer[right]);
-                try operand_stack.append(gpa, old_available_op_str);
-                //             OperatorStack.Pop(operator)
-                //             OperandStack.Pop(RightOperand)
-                //             OperandStack.Pop(LeftOperand)
-                //             operand = operator + LeftOperand + RightOperand
-                //             OperandStack.Push(operand)
-            }
-
-            //         // Push the lower precedence operator onto the stack
-            //         OperatorStack.Push(token)
-            //     endif
-        }
-    }
-
-    // var prev_is_operand = false;
-
-    // .@"-" => .negation, sub  => @"u-"
-    // .@"-%" => negation_wrap, sub_wrap => .@"u-%"
-    // .@"&" => address_of, bitwise_and => @"u&",
-    // .@"!" => inferred_error_union, boolean_not, error_union => @"u!"
-
-    // Operators which are sometimes unary must be prefixed with a `unary`
-    // @"unary !", @"unary &", @"unary -%", @"unary -"
-    // @"unary .."
-
-    // "..", ",", "(", "{"
-
-    // while (cur_token != tokens.ptr) {
-    //     cur_token -= 1;
-    //     const is_operand = Parser.isOperand(cur_token[0].kind);
-    //     if (Parser.isOperand(cur_token[0].kind)) {
-    //         try output.append(gpa, cur_token[0]);
-    //     } else {
-    //         comptime {
-    //             const ints = [_]u8{
-    //                 @intFromEnum(Tag.@"&") -% 128,
-    //                 @intFromEnum(Tag.@"-") -% 128,
-    //                 @intFromEnum(Tag.@"!") -% 128,
-    //                 @intFromEnum(Tag.@"-%") -% 128,
-    //             };
-    //             @setEvalBranchQuota(std.math.maxInt(u32));
-    //             for (ints) |i| {
-    //                 var found = true;
-    //                 for (std.meta.fields(Tag)) |field| {
-    //                     if (i == field.value) break;
-    //                 } else found = false;
-    //                 // @compileLog(i, found);
-    //             }
-    //         }
-
-    //         switch (cur_token[0].kind) {
-    //             .@")" => try operator_stack.append(gpa, cur_token[0]),
-    //             .@"(" => while (true) {
-    //                 const top = operator_stack.pop();
-    //                 try output.append(gpa, top);
-    //                 if (top.kind == .@")") break;
-    //             },
-    //             .@"}" => {},
-    //             .@";" => {},
-    //             .@"//" => {},
-    //             else => while (operator_stack.items.len > 0 and operator_stack.getLast().kind != .@")" and priority(cur_token[0].kind) < priority(operator_stack.getLast().kind)) {
-    //                 try output.append(gpa, operator_stack.pop());
-    //             } else try operator_stack.append(gpa, cur_token[0]),
-    //         }
-    //     }
-
-    //     prev_is_operand = is_operand;
-    // }
-
-    // while (true) {
-    //     try output.append(gpa, operator_stack.popOrNull() orelse break);
-    // }
-
-    std.debug.print("----------------------\n", .{});
-
-    // var op = output.items[output.items.len..].ptr;
-    // while (op != output.items.ptr) {
-    //     op -= 1;
-    //     std.debug.print("{s} {}\n", .{ @tagName(op[0].kind), op[0].len });
-    // }
-
-    // for (tokens) |token| {
-    //     if (Parser.isOperand(token.kind)) {
-    //         operand_stack_ptr[0] = 0;
-    //         operand_stack_ptr += 1;
-    //     } else if (token.kind == .@";") {
-    //         break;
-    //     } else if (token.kind == .@"(" or
-    //         cur_operator == &operators or
-    //         op_precedence(token.kind) > op_precedence((cur_operator - 1)[0].kind))
-    //     {
-    //         cur_operator[0] = token;
-    //         cur_operator += 1;
-    //         printStack(&operators, cur_operator);
-    //         bitmask <<= 1;
-    //         bitmask_len += 1;
-    //     } else if (token.kind == .@")") {
-    //         //     // Continue to pop operator and operand stacks, building
-    //         //     // prefix expressions until left parentheses is found.
-    //         //     // Each prefix expression is push back onto the operand
-    //         //     // stack as either a left or right operand for the next operator.
-    //         //         while( OperatorStack.Top() not equal '(' )
-    //         //             OperatorStack.Pop(operator)
-    //         //             OperandStack.Pop(RightOperand)
-    //         //             OperandStack.Pop(LeftOperand)
-    //         //             operand = operator + LeftOperand + RightOperand
-    //         //             OperandStack.Push(operand)
-    //         //         endwhile
-
-    //         //     // Pop the left parthenses from the operator stack.
-    //         //     OperatorStack.Pop(operator)
-    //         //     endif
-    //     } else if (op_precedence(token.kind) <= op_precedence((cur_operator - 1)[0].kind)) {
-    //         std.debug.print("::{s}\n", .{@tagName(token.kind)});
-    //         while (cur_operator != &operators and op_precedence(token.kind) <= op_precedence((cur_operator - 1)[0].kind)) {
-    //             cur_operator -= 1;
-    //             // std.debug.print(">{s}\n", .{@tagName(cur_operator[0].kind)});
-    //             printStack(&operators, cur_operator);
-    //             break;
-    //         }
-    //     }
-    //     //     // Continue to pop operator and operand stack, building prefix
-    //     //     // expressions until the stack is empty or until an operator at
-    //     //     // the top of the operator stack has a lower hierarchy than that
-    //     //     // of the token.
-    //     //         while( !OperatorStack.IsEmpty() and OperatorHierarchy(token) lessThen Or Equal to OperatorHierarchy(OperatorStack.Top()) )
-    //     //             OperatorStack.Pop(operator)
-    //     //             OperandStack.Pop(RightOperand)
-    //     //             OperandStack.Pop(LeftOperand)
-    //     //             operand = operator + LeftOperand + RightOperand
-    //     //             OperandStack.Push(operand)
-    //     //         endwhile
-    //     //         // Push the lower precedence operator onto the stack
-    //     //         OperatorStack.Push(token)
-    //     //     endif
-
-    //     cur = cur[token.len..];
-    // }
-    // std.debug.print("\n", .{});
-    // std.debug.print("{}\n", .{bitmask_len});
-    // while (bitmask_len > 0) {
-    //     bitmask_len -= 1;
-    //     const bit: u1 = @truncate(bitmask >> bitmask_len);
-    //     std.debug.print("{}\n", .{bit});
-    // }
-    // std.debug.print("{b:0>64}", .{bitmask});
-}
-
-// const OpString2 = union {
-//     op_str_small: packed struct(u64) {
-//         ops: [3]Token = std.mem.zeroes([3]Token),
-//         bitstring_size: u4,
-//         bitstring: u12 = std.math.maxInt(usize),
-//     },
-//     op_str_index: u32,
-
-//     fn foo(self: *@This()) void {
-//         switch (@as(u64, @bitCast(self.*)) >> 32) {
-//             0 => self.op_str_index,
-//             else => self.op_str_small,
-//         }
-//     }
-// };
-
-const OpStringWithLast = struct {
-    op_string: OpString,
-    last: u32,
-};
-
-const OpString = struct {
-    const BUF_SIZE = 16; // std.simd.suggestVectorSize(Token) orelse 8;
-    const buf_idx_int = std.meta.Int(.unsigned, std.math.log2_int(u64, BUF_SIZE));
-    const BUF_SIZE_MASK = std.math.maxInt(buf_idx_int);
-
-    ops: [BUF_SIZE]Token,
-    op_start: buf_idx_int,
-    op_end: buf_idx_int,
-
-    bitstring_size: std.math.Log2Int(usize),
-    bitstring: usize,
-    next: u32,
-
-    fn len(self: *const @This()) buf_idx_int {
-        return self.op_end -% self.op_start;
-    }
-
-    // fn len(self: *const @This()) buf_idx_int {
-    //     const token_int = std.meta.Int(.unsigned, @bitSizeOf(Token));
-    //     const Vec = @Vector(BUF_SIZE, token_int);
-    //     const vec: Vec = @bitCast(self.ops[0..BUF_SIZE].*);
-    //     const bitmap: std.meta.Int(.unsigned, BUF_SIZE) =
-    //         @bitCast(vec << @as(Vec, @splat(@as(token_int, 8))) >= @as(Vec, @splat(256)));
-
-    //     const length = BUF_SIZE - @clz(bitmap);
-    //     // std.debug.print("\nvec: {}\n", .{vec});
-    //     std.debug.print("bitmap: {b:0>16}\t{}\n\n", .{ bitmap, length });
-    //     // _ = bitmap;
-
-    //     return length;
-    //     // return @intCast(@ctz(bitmap));
-    // }
-
-    fn initOperator(starting_token: Token) @This() {
-        const op_start = BUF_SIZE / 2;
-        var self: @This() = .{
-            .ops = std.mem.zeroes([BUF_SIZE]Token),
-            .op_start = op_start,
-            .op_end = op_start + @as(buf_idx_int, if (starting_token.len == 0) 3 else 1),
-            .bitstring_size = 1,
-            .bitstring = std.math.maxInt(usize),
-            .next = 0,
-        };
-        self.ops[op_start] = starting_token;
-        self.ops[op_start + 1 ..][0..2].* = @bitCast(@as(u32, starting_token.len));
-        return self;
-    }
-
-    fn initOperand(node_count: std.math.Log2Int(usize)) @This() {
-        const op_start = BUF_SIZE / 2;
-        var self: @This() = .{
-            .ops = std.mem.zeroes([BUF_SIZE]Token),
-            .op_start = op_start + 1,
-            .op_end = op_start + 1,
-            .bitstring_size = node_count,
-            .bitstring = std.math.maxInt(usize),
-            .next = 0,
-        };
-        return self;
-    }
-
-    fn prependSimple(self: *@This(), token: Token) void {
-        _ = token;
-        _ = self;
-        // self.bitstring_size
-    }
-
-    fn append(self: *@This(), other: *const @This()) void {
-        append_small: {
-            _ = std.math.add(buf_idx_int, self.len(), other.len()) catch break :append_small;
-            const bitstring_size = std.math.add(
-                @TypeOf(self.bitstring_size),
-                self.bitstring_size,
-                other.bitstring_size,
-            ) catch break :append_small;
-
-            const shifted = self.bitstring << self.bitstring_size;
-            const other_mask = (@as(@TypeOf(self.bitstring), 1) << self.bitstring_size) -% 1;
-            self.bitstring = shifted | (other.bitstring & other_mask);
-            self.bitstring_size = bitstring_size;
-
-            const USE_SIMD = false;
-
-            if (USE_SIMD) {} else {
-                var other_start = other.op_start;
-                const other_end = other.op_end;
-
-                while (other_start != other_end) {
-                    self.ops[self.op_end] = other.ops[other_start];
-                    self.op_end +%= 1;
-                    other_start +%= 1;
-                }
-            }
-
-            // std.debug.print("{} {}\n", .{ self.op_start, self.op_end });
-            // std.debug.print("new len()  : {}\n", .{self.len()});
-            // return self;
-            return;
-        }
-
-        // append_large
-        unreachable;
-        // self.next =
-    }
-
-    fn prepend(self: *@This(), other: *const @This()) void {
-        append_small: {
-            // std.debug.print("{} {} {}\n", .{ self.op_start, self.op_end, self.len() });
-            _ = std.math.add(buf_idx_int, self.len(), other.len()) catch break :append_small;
-            const bitstring_size = std.math.add(
-                @TypeOf(self.bitstring_size),
-                self.bitstring_size,
-                other.bitstring_size,
-            ) catch break :append_small;
-
-            const shifted = other.bitstring << other.bitstring_size;
-            const other_mask = (@as(@TypeOf(other.bitstring), 1) << other.bitstring_size) -% 1;
-            self.bitstring = shifted | (self.bitstring & other_mask);
-            self.bitstring_size = bitstring_size;
-
-            const USE_SIMD = false;
-
-            if (USE_SIMD) {} else {
-                var other_start = other.op_start;
-                const other_end = other.op_end;
-
-                while (true) {
-                    self.op_start -%= 1;
-                    self.ops[self.op_start] = other.ops[other_start];
-                    other_start +%= 1;
-                    if (other_start == other_end) break;
-                }
-            }
-
-            // std.debug.print("new len()  : {}\n", .{self.len()});
-            return;
-        }
-
-        // append_large
-        unreachable;
-        // self.next =
-    }
-};
-
-// fn SpanDeque(comptime T: type) type {
-//     // The size as a power of 2 is stored at end_ptr
-//     return struct {
-//         start: u32 = 0,
-//         end: u32 = 1,
-
-//         pub fn grow(self: *@This(), gpa: Allocator, old_size: usize) !void {
-//             const new_size = @shlExact(old_size, 1);
-//             const new_memory = try gpa.alloc(T, new_size);
-
-//             const old_memory = @as([*]T, @ptrCast(std.mem.alignBackward(usize, @intFromPtr(self.start_ptr), old_size * @sizeOf(T))))[0..old_size];
-//             _ = old_memory;
-//             _ = new_memory;
-//             // gpa.free();
-//         }
-
-//         pub fn append(self: *@This(), gpa: Allocator, element: T) !void {
-//             _ = element;
-//             const size_power: std.meta.Int(.unsigned, @sizeOf(T) * 8) = @bitCast(self.end_ptr.*);
-//             const size = @as(usize, 1) << @intCast(size_power);
-
-//             var new_end_ptr = self.end_ptr +% 1;
-//             // TODO: try using std.mem.isAligned
-//             if (((size * @sizeOf(T) - 1) & @intFromPtr(new_end_ptr)) == 0) new_end_ptr -%= size;
-//             if (self.start_ptr == new_end_ptr) try self.grow(gpa, size);
-//         }
-
-//         // prepend()
-//     };
-// }
-
 pub fn main() !void {
     const gpa = std.heap.c_allocator;
     const sources = try readFiles(gpa);
@@ -1912,9 +1258,11 @@ pub fn main() !void {
 
         const elapsedNanos2: u64 = @intCast(t4 - t3);
 
-        const @"GB/s 2" = @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(elapsedNanos2));
-        std.debug.print("Legacy Tokenizing took {: >9} ({d:.2} GB/s, {d: >5.2}M loc/s) and used {} memory\n", .{ std.fmt.fmtDuration(elapsedNanos2), @"GB/s 2", @as(f64, @floatFromInt(lines)) / @as(f64, @floatFromInt(elapsedNanos2)) * 1000, std.fmt.fmtIntSizeDec(num_tokens2 * 5) });
-        break :blk elapsedNanos2;
+        if (REPORT_SPEED == 1) {
+            const @"GB/s 2" = @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(elapsedNanos2));
+            std.debug.print("Legacy Tokenizing took {: >9} ({d:.2} GB/s, {d: >5.2}M loc/s) and used {} memory\n", .{ std.fmt.fmtDuration(elapsedNanos2), @"GB/s 2", @as(f64, @floatFromInt(lines)) / @as(f64, @floatFromInt(elapsedNanos2)) * 1000, std.fmt.fmtIntSizeDec(num_tokens2 * 5) });
+            break :blk elapsedNanos2;
+        }
     };
     var t1 = std.time.nanoTimestamp();
 
@@ -1973,20 +1321,19 @@ pub fn main() !void {
 
     var num_tokens: usize = 0;
     for (sources.items, source_tokens, 0..) |source, tokens, i| {
-        _ = source;
         _ = i;
-        // try infixToPrefix(gpa, source[@as(u64, tokens[0].len) + tokens[1].len + tokens[2].len + tokens[3].len + tokens[4].len ..], tokens[5..]);
-        // try infixToPrefix(gpa, source[tokens[0].len..], tokens[1..]);
-        // try infixToPrefix(gpa, source, tokens);
+        try infixToPrefix(gpa, source[1..], tokens[1..]);
         num_tokens += tokens.len;
     }
 
     // Fun fact: bytes per nanosecond is the same ratio as GB/s
-    const @"GB/s" = @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(elapsedNanos));
-    std.debug.print("       Tokenizing took {: >9} ({d:.2} GB/s, {d: >5.2}M loc/s) and used {} memory\n", .{ std.fmt.fmtDuration(elapsedNanos), @"GB/s", @as(f64, @floatFromInt(lines)) / @as(f64, @floatFromInt(elapsedNanos)) * 1000, std.fmt.fmtIntSizeDec(num_tokens * 2) });
+    if (REPORT_SPEED == 1) {
+        const @"GB/s" = @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(elapsedNanos));
+        std.debug.print("       Tokenizing took {: >9} ({d:.2} GB/s, {d: >5.2}M loc/s) and used {} memory\n", .{ std.fmt.fmtDuration(elapsedNanos), @"GB/s", @as(f64, @floatFromInt(lines)) / @as(f64, @floatFromInt(elapsedNanos)) * 1000, std.fmt.fmtIntSizeDec(num_tokens * 2) });
 
-    if (elapsedNanos2 > 0) {
-        std.debug.print("       That's {d:.2}x faster and {d:.2}x less memory!\n", .{ @as(f64, @floatFromInt(elapsedNanos2)) / @as(f64, @floatFromInt(elapsedNanos)), @as(f64, @floatFromInt(num_tokens2 * 5)) / @as(f64, @floatFromInt(num_tokens * 2)) });
+        if (elapsedNanos2 > 0) {
+            std.debug.print("       That's {d:.2}x faster and {d:.2}x less memory!\n", .{ @as(f64, @floatFromInt(elapsedNanos2)) / @as(f64, @floatFromInt(elapsedNanos)), @as(f64, @floatFromInt(num_tokens2 * 5)) / @as(f64, @floatFromInt(num_tokens * 2)) });
+        }
     }
 
     // std.debug.print("-" ** 72 ++ "\n", .{});
@@ -2239,10 +1586,6 @@ const Utf8Checker = struct {
         const prev1 = prev(1, input, prev_input);
         const sc = check_special_cases(input, prev1);
         checker.err |= check_multibyte_lengths(input, prev_input, sc);
-
-        if (checker.errors()) |_| {} else |_| {
-            // std.debug.print("{s}\n", .{@as([32]u8, input)});
-        }
     }
 
     // The only problem that can happen at EOF is that a multibyte character is too short
@@ -2507,21 +1850,3 @@ const Utf8Checker = struct {
 //    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
-
-// op: fn (a: u32) error{Noodle}!u32,
-
-// fn Noodle() type {
-//     return struct {};
-// }
-
-// const x = Noodle(){
-//     .a = 1,
-//     .c = 2,
-// };
-
-// const Options = enum { Yes, No };
-
-// const Obj = union (enum) {
-//     int: u32,
-//     str: []const u8,
-// };
