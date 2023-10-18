@@ -8,17 +8,42 @@ So far, a tokenizer implementation is provided. The mainline Zig tokenizer uses 
 
 The test bench fully reads in all of the Zig files under the folders in the `src` folder. In my test I installed the Zig compiler, ZLS, and a few other Zig projects in my `src` folder. The test bench iterates over the source bytes from each Zig file (with added sentinels) and calls the tokenization function on each.
 
-To tokenize 3,185 Zig files with 59,124,871 bytes, including 1,296,390 newlines, the original tokenizer and my new tokenizer have the following characteristics:
+To tokenize 3201 Zig files with 59,144,056 bytes, including 1,297,378 newlines, the original tokenizer and my new tokenizer have the following characteristics:
 
-|  | token memory (megabytes)| run-time (milliseconds) | throughput (gigabytes per second) |throughput (lines of code per second) |
-|:-:|:-:|:-:|:-:|:-:|
-| original | 46.045775MB | 228.805ms  |0.26 GB/s | 5.67M loc/s |
-| this | **18.376734MB** | **84.928ms** | **0.70 GB/s** | **15.26M loc/s** |
+|  | token memory (megabytes)|
+|:-:|:-:|
+| original | 46.06531MB |
+| this | 18.424328MB |
 
-That's 2.69x faster and 2.51x less memory! Thus far, I have measured only on a Zen 3 desktop. However, this is meant to be fast on other architectures too, especially arm64.
-<!-- and I would be interested in hearing from arm64 users who could share some performance numbers. If you continue reading you will see I designed this code with the hope it would be fast on arm64 platforms too. -->
+That's 2.5x less memory!
 
-Oddly enough, I think this code is generally more maintainable too, as adding an operator or keyword to the tokenizer is literally just adding another string into the relevant array. All of the assumptions and tricks I use are explicitly checked for in compile-time assertions (`grep` for `comptime assert`), so violating any of those invariants will result in compile errors that tell you why you can't change certain things.
+### x86_64 Zen 3
+
+|  | run-time (milliseconds) | throughput (gigabytes per second) |throughput (lines of code per second) |
+|:-:|:-:|:-:|:-:|
+| read files | 39.544ms | 1.50 GB/s | 32.81M loc/s |
+| original | 231.201ms  | 0.26 GB/s | 5.67M loc/s |
+| this | 81.362ms | 0.70 GB/s | 15.26M loc/s |
+
+That's ~2.84x faster!
+
+### RISC-V Sifive u74
+
+|  | run-time (milliseconds) | throughput (gigabytes per second) |throughput (lines of code per second) |
+|:-:|:-:|:-:|:-:|
+| read files | 387.609ms |  0.15 GB/s | 3.35M loc/s |
+| original | 2.263s  | 0.03 GB/s | 0.57M loc/s |
+| this | 1.495s | 0.04 GB/s | 0.87M loc/s |
+
+That's ~1.51x faster! And there is still more that can be done. I still need to SWARify the utf8 validator and the keyword checker needs some work too. If we turn the utf8 validator off, it's ~1.81x faster and breaks 1M loc/s! Pretty good for a machine that's ~10x slower than my Zen 3 with the legacy tokenizer.
+
+A 1.5-1.8x speedup is approximately what I expected. Since SWAR has a little more overhead than Zen 3 vectors, I imagined there would be less of a gain than on Zen 3.
+
+# Maintenance note
+
+Oddly enough, I think some of this code is more maintainable too, as adding an operator or keyword to the tokenizer is literally just adding another string into the relevant array. All of the assumptions and tricks I use are explicitly checked for in compile-time assertions (`grep` for `comptime assert`), so violating any of those invariants will result in compile errors that tell you why you can't change certain things.
+
+However, I do have a bunch of weird SWAR tricks that the compiler will hopefully perform automatically one day.
 
 # Designing for high performance
 

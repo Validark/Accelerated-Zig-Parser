@@ -1,3 +1,20 @@
+// zig fmt: off
+const SKIP_OUTLIERS = true;
+const RUN_LEGACY    = true;
+const REPORT_SPEED  = true;
+const VALIDATE_UTF8 = false;
+const INFIX_TEST    = false;
+const USE_SWAR      = false;
+// zig fmt: on
+
+// TODO: mask_for_op_cont should probably be renamed.
+// I need to decide what to do with the handwritten optimizations there.
+// I think the function could use a more thoughtful design, or I could potentially write a tool
+// or work on the compiler so that optimal code gets generated automatically. This project made me realize
+// that compilers could probably be smarter about SWAR transformations.
+
+// I could probably reorganize the `Tag` address space and see if I can squeeze more perf out.
+
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
@@ -8,56 +25,43 @@ const Allocator = std.mem.Allocator;
 
 // std.simd.suggestVectorSize(comptime T: type) == null => SWAR
 
-const USE_SWAR = false;
-
-// zig fmt: off
-const SKIP_OUTLIERS: u1 = 1;
-const RUN_LEGACY   : u1 = 0;
-const REPORT_SPEED : u1 = 0;
-// zig fmt: on
-
-// On some machines, `clz` is more efficient than `ctz`.
+// On arm and ve machines, `@ctz(x)` is implemented as `@bitReverse(@clz(x))`.
 // We can speculatively perform 4 bit reverses in nextChunk so that the main loop can use `@clz` instead.
-// This list comes from checking the emit in godbolt for `@ctz` vs `@clz`.
-// Missing entries are architectures I could not check
-const PREFER_CLZ = switch (builtin.cpu.arch) {
-    .aarch64_32,
-    .aarch64_be,
-    .aarch64,
-    .arm,
-    .armeb,
-    .mips,
-    .mips64,
-    .mips64el,
-    .mipsel,
-    .powerpc,
-    .powerpc64,
-    .powerpc64le,
-    .powerpcle,
-    .s390x,
-    .thumb,
-    .thumbeb,
-    .ve,
-    => true,
+const SPECULATIVELY_REVERSED = switch (builtin.cpu.arch) {
+    .aarch64_32, .aarch64_be, .aarch64, .arm, .armeb, .thumb, .thumbeb => true,
+    .ve => true,
 
-    .amdgcn,
-    .avr,
-    .msp430,
-    .riscv32,
-    .riscv64,
-    .sparc,
-    .sparc64,
-    .sparcel,
-    .wasm32,
-    .wasm64,
-    .x86_64,
-    .x86,
-    => false,
+    .avr => false,
+    .mips, .mips64, .mips64el, .mipsel => false,
+    .msp430 => false,
+    .powerpc, .powerpc64, .powerpc64le, .powerpcle => false,
+    .riscv32, .riscv64 => false,
+    .s390x => false,
+    .sparc, .sparc64, .sparcel => false,
+    .wasm32, .wasm64 => false,
+    .x86, .x86_64 => false,
+    else => false,
+};
+
+// When the implementation of our preferred @clz(x) or @ctz(x) has a branch that checks for 0, we repurpose it.
+// In other words, the code is going to have a `if (x == 0)` branch no matter what, so we may as well optimize it.
+const COUNT_BORDERING_ZEROS_BRANCHES_ON_ZERO = switch (builtin.cpu.arch) {
+    .aarch64_32, .aarch64_be, .aarch64, .arm, .armeb, .thumb, .thumbeb => false,
+    .mips, .mips64, .mips64el, .mipsel => false,
+    .powerpc, .powerpc64, .powerpc64le, .powerpcle => false,
+    .s390x => true,
+    .ve => !SPECULATIVELY_REVERSED,
+
+    .msp430 => false,
+    .riscv32, .riscv64 => !std.Target.riscv.featureSetHas(builtin.cpu.features, .zbb),
+    .sparc, .sparc64, .sparcel => !std.Target.sparc.featureSetHas(builtin.cpu.features, .popc),
+    .wasm32, .wasm64 => false,
+    .x86, .x86_64 => !std.Target.x86.featureSetHas(builtin.cpu.features, .bmi),
 
     else => false,
 };
 
-const suggested_vec_size: ?usize = std.simd.suggestVectorSizeForCpu(u8, builtin.cpu);
+const suggested_vec_size: ?comptime_int = std.simd.suggestVectorSizeForCpu(u8, builtin.cpu);
 
 const DEBUG = builtin.mode == .Debug;
 const VEC_SIZE = 64; // can't be 1
@@ -78,9 +82,9 @@ const EXTENDED_BACK_SENTINELS_LEN = BACK_SENTINELS.len - INDEX_OF_FIRST_0_SENTIN
 /// Returns a slice that is aligned to alignment, but `len` is set to only the "valid" memory.
 /// freed via: allocator.free(buffer[0..std.mem.alignForward(u64, buffer.len, alignment)])
 fn readFileIntoAlignedBuffer(allocator: Allocator, file: std.fs.File, comptime alignment: u32) ![:0]align(alignment) u8 {
-    const bytes_to_allocate = try file.getEndPos();
-    const overaligned_size = try std.math.add(u64, bytes_to_allocate, FRONT_SENTINELS.len + BACK_SENTINELS.len + (alignment - 1));
-    const buffer = try allocator.alignedAlloc(u8, alignment, std.mem.alignBackward(u64, overaligned_size, alignment));
+    const bytes_to_allocate = std.math.cast(usize, try file.getEndPos()) orelse return error.Overflow;
+    const overaligned_size = try std.math.add(usize, bytes_to_allocate, FRONT_SENTINELS.len + BACK_SENTINELS.len + (alignment - 1));
+    const buffer = try allocator.alignedAlloc(u8, alignment, std.mem.alignBackward(usize, overaligned_size, alignment));
 
     buffer[0..FRONT_SENTINELS.len].* = FRONT_SENTINELS.*;
     var cur: []u8 = buffer[FRONT_SENTINELS.len..][0..bytes_to_allocate];
@@ -94,7 +98,10 @@ fn readFileIntoAlignedBuffer(allocator: Allocator, file: std.fs.File, comptime a
 }
 
 fn readFiles(gpa: Allocator) !std.ArrayListUnmanaged([:0]const u8) {
-    const directory = "./src/beep";
+    const directory = switch (INFIX_TEST) {
+        true => "./src/beep",
+        false => "./src/files_to_parse",
+    };
     var parent_dir2 = try std.fs.cwd().openDirZ(directory, .{}, false);
     defer parent_dir2.close();
 
@@ -116,7 +123,7 @@ fn readFiles(gpa: Allocator) !std.ArrayListUnmanaged([:0]const u8) {
             switch (dir.kind) {
                 .file => if (dir.basename.len > 4 and std.mem.eql(u8, dir.basename[dir.basename.len - 4 ..][0..4], ".zig") and dir.path.len - dir.basename.len > 0) {
                     // These two are extreme outliers, omit them from our test bench
-                    if (SKIP_OUTLIERS == 1 and
+                    if (SKIP_OUTLIERS and
                         (std.mem.endsWith(u8, dir.path, "udivmodti4_test.zig") or
                         std.mem.endsWith(u8, dir.path, "udivmoddi4_test.zig")))
                         continue;
@@ -148,7 +155,8 @@ fn readFiles(gpa: Allocator) !std.ArrayListUnmanaged([:0]const u8) {
         const elapsedNanos: u64 = @intCast(t2 - t1);
         const @"GB/s" = @as(f64, @floatFromInt(num_bytes)) / @as(f64, @floatFromInt(elapsedNanos));
 
-        std.debug.print("       Read in files in {} ({d:.2} GB/s) and used {} memory with {} lines across {} files\n", .{ std.fmt.fmtDuration(elapsedNanos), @"GB/s", std.fmt.fmtIntSizeDec(num_bytes), lines, sources.items.len });
+        if (REPORT_SPEED)
+            std.debug.print("       Read in files in {} ({d:.2} GB/s) and used {} memory with {} lines across {} files\n", .{ std.fmt.fmtDuration(elapsedNanos), @"GB/s", std.fmt.fmtIntSizeDec(num_bytes), lines, sources.items.len });
     }
     return sources;
 }
@@ -211,8 +219,8 @@ const Operators = struct {
         break :blk buffer;
     };
 
-    fn getOpWord(op: [*]const u8, len: u3) u32 {
-        const shift_amt = @as(u6, len) * 8;
+    fn getOpWord(op: [*]const u8, len: u32) u32 {
+        const shift_amt = len * 8;
         const relevant_mask: u32 = @intCast((@as(u64, 1) << @intCast(shift_amt)) -% 1);
         return std.mem.readIntLittle(u32, op[0..4]) & relevant_mask;
     }
@@ -238,7 +246,7 @@ const Operators = struct {
 
     /// Given a string starting with a Zig operator, returns the tag type
     /// Assumes there are at least 4 valid bytes at the passed in `op`
-    fn lookup(op: [*]const u8, len: u3) ?Tag {
+    fn lookup(op: [*]const u8, len: u32) ?Tag {
         // std.debug.print("{s}\n", .{op[0..len]});
         const op_word = getOpWord(op, len);
         const hash = rawHash(op_word);
@@ -342,7 +350,7 @@ const Keywords = struct {
         const b = std.mem.readIntLittle(u16, (if (@inComptime())
             keyword[len - 2 .. len][0..2]
         else
-            keyword - 2 + len)[0..2]);
+            keyword - 2 + @as(usize, @intCast(len)))[0..2]);
         return @truncate(((a ^ (len << 14)) *% b) >> 8);
         // return @truncate(((a >> 1) *% (b >> 1) ^ (len << 14)) >> 8);
         // return @truncate((((a >> 1) *% (b >> 1)) >> 8) ^ (len << 6));
@@ -474,68 +482,134 @@ const Tag = blk: {
 const Token = extern struct { len: u8, kind: Tag };
 
 fn printu(v: anytype) void {
-    comptime var shift = @bitSizeOf(v);
+    comptime var shift = @bitSizeOf(@TypeOf(v));
     inline while (true) {
         shift -= 4;
-        std.debug.print("{b:0>4}{}", .{ @as(u4, @truncate(v >> shift)), if (shift % 8 == 0) ' ' else '_' });
+        std.debug.print("{b:0>4}{c}", .{ @as(u4, @truncate(v >> shift)), if (shift % 8 == 0) ' ' else '_' });
         if (shift == 0) break;
     }
     std.debug.print("\n", .{});
 }
 
 fn printx(v: anytype) void {
-    comptime var shift = @bitSizeOf(v);
+    comptime var shift = @bitSizeOf(@TypeOf(v));
     inline while (true) {
         shift -= 4;
-        std.debug.print("{x}{}", .{ @as(u4, @truncate(v >> shift)), if (shift % 8 == 0) ' ' else '_' });
+        std.debug.print("{x}{c}", .{ @as(u4, @truncate(v >> shift)), if (shift % 8 == 0) ' ' else '_' });
         if (shift == 0) break;
     }
     std.debug.print("\n", .{});
 }
 
-test "identifier_mask should match alphanumeric characters and underscores" {
-    var c: u8 = 0;
-    while (c < 128) : (c += 1) {
-        const expected: u8 = switch (c) {
-            'A'...'Z', 'a'...'z', '0'...'9', '_' => 0,
-            else => 1,
-        };
-        try std.testing.expectEqual(expected, Parser.non_identifier_mask(c));
-    }
+// test "identifier_mask should match alphanumeric characters and underscores" {
+//     var c: u8 = 0;
+//     while (c < 128) : (c += 1) {
+//         const expected: u8 = switch (c) {
+//             'A'...'Z', 'a'...'z', '0'...'9', '_' => 0,
+//             else => 1,
+//         };
+//         try std.testing.expectEqual(expected, Parser.non_identifier_mask(c));
+//     }
+// }
+
+// test "movemask swar should properly isolate the highest set bits of all bytes in a bitstring" {
+//     inline for ([_]type{ u64, u32, u16, u8 }) |T| {
+//         var c: std.meta.Int(.unsigned, @sizeOf(T)) = 0;
+//         while (true) {
+//             var v: T = 0;
+//             inline for (0..@sizeOf(T)) |i| {
+//                 const bit: u1 = @truncate(c >> i);
+//                 v |= @as(T, bit) << (i * 8 + 7);
+//             }
+//             try std.testing.expectEqual(c, @intCast(Parser.mov_mask(v)));
+//             c +%= 1;
+//             if (c == 0) break;
+//         }
+//     }
+// }
+
+/// Finds the popCount of the least significant bit of each byte.
+///
+/// E.g. 0b.......1 .......1 .......0 .......0 .......1 .......0 .......1 .......1 -> 5
+///
+fn popCountLSb(v: anytype) @TypeOf(v) {
+    const mask: @TypeOf(v) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(v)), 8), u8), @splat(0x01)));
+    // This is a math trick.
+    // We first mask to get the lowest significant bit in each byte
+    // Then, we take the modulo by 255, i.e. (2^8)-1, which yields our popCount/hamming weight.
+
+    // Why does this work? Well, for a 64 bit SWAR value shifted right by 7, we have the following place values:
+    // 256^7 + 256^6 + 256^5 + 256^4 + 256^3 + 256^2 + 256^1 + 256^0
+
+    // To model the modulo 255 of successive powers of 256,
+    // we can start with the fact that 256^n - 255^n > 0 for n > 0
+    // With this fact, we can say that 256^n % 255 = (256^n - 255^n) % 255 for n > 0
+    // How do we find the difference between 256^n and 255^n? Well, we can interpolate between the two.
+    // Let's say we have 256^4 - 255^n. We start with 256*256*256*256. We decrement one of the 256's, to get 256*256*256*255.
+    // What difference did it make? 256^3 (everything but the decremented value).
+    // Now repeat, decrement a 256 to get 256*256*255*255. What is the difference? 256^2*255^1
+    // Now repeat. We get 256*255*255*255. Difference: 256^1*255^2
+    // Now repeat. We get 255*255*255*255. Difference: 255^3
+    // All together, we find that 256^4 - 255^4 = 256^3*255^0 + 256^2*255^1 + 256^1*255^2 + 256^0*255^3
+
+    // It's easy to generalize this:
+    // For n > 0:
+    // 256^n - 255^n = Σ for k=0 through n, 256^(n-1-k) * 255^k
+
+    // Now how did this help us find 256^n % 255?
+    // Well, for any expansion of the right hand side, 255 is a factor of all but a single term. I.e. (255^k * x) % 255 is 0 for k > 0.
+    // In other words, the modulo of each individual term except 256^(n-1)*255^0 is 0.
+    // Therefore, we conclude that for n > 0, 256^n % 255 = 256^(n-1) % 255
+    // Given that 256^0 % 255 = 1, we have proven that all positive integer powers of 256 modulo 255 is 1.
+
+    // It follows that if we sum any combination of unique powers of 256, then take the modulo 255, we will get the number of unique powers we added, modulo 255.
+    // So long as the following assertion is true, that's the popcount.
+    assert(@sizeOf(@TypeOf(v)) < 255);
+
+    // If you still don't understand it, think of it like a perfect hash function.
+    // Our test checks all possible relevant inputs (due to the mask, there are only @sizeOf(@TypeOf(v)) bits that matter, so we don't have to test irrelevant bit changes)
+    return (v & mask) % 255;
 }
 
-test "movemask swar should properly isolate the highest set bits of all bytes in a bitstring" {
+test "swar popCount" {
     inline for ([_]type{ u64, u32, u16, u8 }) |T| {
         var c: std.meta.Int(.unsigned, @sizeOf(T)) = 0;
         while (true) {
-            var v: T = 0;
-            inline for (0..@sizeOf(T)) |i| {
-                const bit: u1 = @truncate(c >> i);
-                v |= @as(T, bit) << (i * 8 + 7);
-            }
-            try std.testing.expectEqual(c, Parser.mov_mask(v));
+            try std.testing.expectEqual(@popCount(c), @as(std.meta.Int(.unsigned, std.math.log2_int_ceil(u64, 1 + @sizeOf(T))), @intCast(popCountLSb(unmvmask(c) >> 7))));
             c +%= 1;
             if (c == 0) break;
         }
     }
 }
 
-test "mask_for_op_cont should work" {
-    // std.debug.print("\n", .{});
-    var c: u8 = 0;
-    while (true) {
-        const expected: u3 = switch (c) {
-            0x21, 0x25, 0x2a, 0x2b, 0x2e, 0x2f, 0x3c, 0x3d, 0x3e, 0x3f, 0x5c, 0x7c => 1,
-            else => 0,
-        };
-        const v = std.mem.readIntLittle(u32, &[4]u8{ c, c, 0, 0 });
-        const res = Parser.mask_for_op_cont(v) - 1;
-        // std.debug.print("0x{x:0>2} {} vs {}\n", .{ c, res, expected });
-        try std.testing.expectEqual(expected, res);
-        c +%= 1;
-        if (c == 0) break;
-    }
-}
+// test "mask_for_op_cont should work" {
+//     // std.debug.print("\n", .{});
+//     var c: u8 = 0;
+//     while (true) {
+//         const expected: u3 = switch (c) {
+//             0x21, 0x25, 0x2a, 0x2b, 0x2e, 0x2f, 0x3c, 0x3d, 0x3e, 0x3f, 0x5c, 0x7c => 1,
+//             else => 0,
+//         };
+//         const v = std.mem.readIntLittle(u32, &[4]u8{ c, c, 0, 0 });
+//         const res = Parser.mask_for_op_cont(v) - 1;
+//         // std.debug.print("0x{x:0>2} {} vs {}\n", .{ c, res, expected });
+//         try std.testing.expectEqual(expected, res);
+//         c +%= 1;
+//         if (c == 0) break;
+//     }
+// }
+
+// test "idk" {
+//     std.debug.print("\n", .{});
+//     const str = "A@%d&_g`";
+//     const str_bits: u64 = @bitCast(@as([8]u8, str.*));
+
+//     printu(str_bits);
+
+//     // printu(~@as(u8, @intCast(Parser.non_identifier_mask(str_bits))));
+//     std.debug.print("{c}{c}{c}{c} {c}{c}{c}{c}\n", .{ str[0], str[1], str[2], str[3], str[4], str[5], str[6], str[7] });
+//     printu(@bitReverse(@as(u8, @intCast(Parser.non_identifier_mask(str_bits)))));
+// }
 
 // test "mask_for_op_cont should work 2" {
 //     std.debug.print("\n", .{});
@@ -571,6 +645,62 @@ test "mask_for_op_cont should work" {
 //     }
 // }
 
+// test "mask_for_op_cont should do a thing" {
+//     std.debug.print("\n{}\n", .{Parser.mask_for_op_cont(std.mem.readIntSliceNative(u32, "===="))});
+// }
+
+/// The opposite of mov_mask
+fn unmvmask(x: anytype) std.meta.Int(.unsigned, 8 * @bitSizeOf(@TypeOf(x))) {
+    var r: std.meta.Int(.unsigned, 8 * @bitSizeOf(@TypeOf(x))) = 0;
+
+    inline for (0..@bitSizeOf(@TypeOf(x))) |i| {
+        const bit: u1 = @truncate(x >> i);
+        r |= @as(@TypeOf(r), bit) << (i * 8 + 7);
+    }
+
+    return r;
+}
+
+test "swarCTZPlus1" {
+    var i: u3 = 0;
+
+    while (true) {
+        var x: u32 = unmvmask(@as(u4, 8) | i);
+
+        const expected: u32 = switch (x) {
+            0x80808080 => 1,
+            0x80800080 => 1,
+            0x80008080 => 1,
+            0x80000080 => 1,
+            0x80808000 => 2,
+            0x80008000 => 2,
+            0x80800000 => 3,
+            0x80000000 => 4,
+            else => unreachable,
+        };
+
+        inline for (std.meta.fields(@TypeOf(Parser.CTZ_PLUS_1_IMPL))) |impl|
+            try std.testing.expectEqual(expected, Parser.swarCTZPlus1Generic(x, @enumFromInt(impl.value)));
+
+        i +%= 1;
+        if (i == 0) break;
+    }
+}
+
+test "ctz popCount" {
+    inline for (std.meta.fields(@TypeOf(Parser.CTZ_IMPL))) |impl| {
+        inline for ([_]type{u64}) |T| {
+            var c: std.meta.Int(.unsigned, @sizeOf(T)) = 0;
+            while (true) {
+                try std.testing.expectEqual(@ctz(c), @as(u4, @intCast(Parser.swarCTZGeneric(unmvmask(c), @enumFromInt(impl.value)))));
+
+                c +%= 1;
+                if (c == 0) break;
+            }
+        }
+    }
+}
+
 const Parser = struct {
     const Bitmaps = packed struct {
         whitespace: VEC_INT,
@@ -581,7 +711,11 @@ const Parser = struct {
         prev_escaped: VEC_INT,
     };
 
-    fn mask_for_op_cont(v: u32) u3 {
+    fn mask_for_op_cont(v: u32) u32 {
+        // "%", "*", "+", ".", "/", "<", "=", ">", "?", "\\", "|",
+        // "!", "*", ".", "/", "=", "|",
+        // "="
+
         // const str: [4]u8 = @bitCast(v);
         // inline for (0..4) |i| {
         //     inline for (Operators.unpadded_ops, Operators.padded_ops) |op, padded_op| {
@@ -623,33 +757,119 @@ const Parser = struct {
         const magic_mask = low_7_bits ^ comptime ones * 0x2e;
 
         // matches 0x2a,0x2b,0x2e,0x2f
-        const non_a_b_e_or_f = (magic_mask & comptime ones * ~@as(u7, 5)) + mask;
+        const non_a_b_e_or_f = (magic_mask & comptime ones * ~@as(u7, 5)) + mask; // TODO: make this work on first 3 bytes only
 
         // matches 0x21,0x3c,0x3d,0x3e,0x3f
         const is_0x0f_or_higher = magic_mask + comptime ones * (0x80 - 0x0f);
         const is_0x14_or_higher = magic_mask + comptime ones * (0x80 - 0x14);
 
-        const not_0x25 = (low_7_bits ^ comptime ones * 0x25) + mask;
-        const not_0x5c_and_not_0x7c = ((low_7_bits & comptime ones * ~@as(u7, 0x20)) ^ comptime ones * 0x5c) + mask;
-        const x = ((~(not_and_dot & not_bar_star) >> 8) & 0x80) | (~mask & (non_ascii |
-            (non_a_b_e_or_f & (~is_0x0f_or_higher | is_0x14_or_higher) & not_0x25 & not_0x5c_and_not_0x7c)));
+        const not_0x25 = (low_7_bits ^ comptime ones * 0x25) + mask; // TODO: make this only work on first byte only
+        const not_0x5c_and_not_0x7c = ((low_7_bits & comptime ones * ~@as(u7, 0x20)) ^ comptime ones * 0x5c) + mask; // TODO: make this work on first two bytes only
 
-        return @intCast(@ctz(x) / 8 + 1);
+        const non_operator_cont_mask = non_ascii | (non_a_b_e_or_f & (~is_0x0f_or_higher | is_0x14_or_higher) & not_0x25 & not_0x5c_and_not_0x7c);
+        const bad_cont_block_helper_mask = (~(not_and_dot & not_bar_star) >> 8) & 0x80;
+        const x = (bad_cont_block_helper_mask | non_operator_cont_mask) & ~mask;
+
+        // We can infer this because low_7_bits has the upper 8 bits set to 0.
+        // This upper 0 byte will always fail our SWAR checks, i.e. it's most significant bit will be 1 no matter what.
+        assert(x != 0 and x > std.math.maxInt(i32));
+
+        return swarCTZPlus1(x);
+    }
+
+    fn swarCTZPlus1(x: u32) @TypeOf(x) {
+        return swarCTZPlus1Generic(x, CTZ_PLUS_1_IMPL);
+    }
+
+    fn swarCTZPlus1Generic(x: u32, comptime impl: @TypeOf(CTZ_PLUS_1_IMPL)) @TypeOf(x) {
+        assert(x != 0 and x > std.math.maxInt(i32) and (x & 0x7F7F7F7F) == 0);
+        return switch (impl) {
+            .ctz => @ctz(x) / 8 + 1,
+            .popc => @divExact(@popCount(x ^ (x -% 1)), 8),
+            .clz => 4 - @divExact(@clz(x ^ (x -% 1)), 8),
+            .swar => popCountLSb(x -% 1),
+            .naive => blk: {
+                const i = (x ^ (x -% 1)) & 0x80808080;
+                break :blk (((i >> 7) + (i >> 15) + (i >> 23) + (i >> 31)) & 0b111);
+            },
+        };
+    }
+
+    const CTZ_PLUS_1_IMPL: enum { ctz, clz, popc, swar, naive } = switch (builtin.cpu.arch) {
+        .aarch64_32, .aarch64_be, .aarch64, .arm, .armeb, .thumb, .thumbeb => if (std.Target.aarch64.featureSetHas(builtin.cpu.features, .v8a) or
+            (std.Target.arm.featureSetHas(builtin.cpu.features, .has_v7) and // Not sure why it's v7.
+            !std.mem.eql(u8, builtin.cpu.model.name, "cortex_m0") and
+            !std.mem.eql(u8, builtin.cpu.model.name, "cortex_m0plus") and
+            !std.mem.eql(u8, builtin.cpu.model.name, "cortex_m1") and
+            !std.mem.eql(u8, builtin.cpu.model.name, "cortex_m23"))) .ctz else .naive,
+        .mips, .mips64, .mips64el, .mipsel => if (std.Target.mips.featureSetHas(builtin.cpu.features, .mips64)) .clz else .naive,
+        .powerpc, .powerpc64, .powerpc64le, .powerpcle => .clz,
+        .s390x => .clz,
+        .ve => .ctz,
+        .avr => .popc,
+        .msp430 => .popc,
+        .riscv32, .riscv64 => if (std.Target.riscv.featureSetHas(builtin.cpu.features, .zbb)) .ctz else .naive,
+        .sparc, .sparc64, .sparcel => if (std.Target.sparc.featureSetHas(builtin.cpu.features, .popc)) .popc else .naive,
+        .wasm32, .wasm64 => .ctz,
+        .x86, .x86_64 => .ctz,
+        else => .naive,
+    };
+
+    fn swarCTZGeneric(x: u64, comptime impl: @TypeOf(CTZ_IMPL)) @TypeOf(x) {
+        assert((x & 0x7F7F7F7F7F7F7F7F) == 0);
+
+        return switch (impl) {
+            .ctz => @ctz(x) / 8,
+            .swar => popCountLSb((~x & (x -% 1)) >> 7),
+        };
+    }
+
+    const CTZ_IMPL: enum { ctz, swar } = switch (CTZ_PLUS_1_IMPL) {
+        .ctz, .clz, .popc => .ctz,
+        .swar, .naive => .swar,
+    };
+
+    fn swarCTZ(x: u64) @TypeOf(x) {
+        return swarCTZGeneric(x, CTZ_IMPL);
     }
 
     /// Creates a bitstring from the most significant bit of each byte in a given bitstring.
     ///
-    /// Source: http://0x80.pl/articles/scalar-sse-movmask.html
-    fn mov_mask(v: anytype) std.meta.Int(.unsigned, @sizeOf(@TypeOf(v))) {
+    /// E.g. 1....... 0....... 0....... 1....... 0....... 1....... 1....... 1....... => 10010111
+    fn mov_mask(v: anytype) @TypeOf(v) {
         assert(@sizeOf(@TypeOf(v)) <= 8);
         const ones: @TypeOf(v) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(v)), 8), u8), @splat(1)));
-        comptime var mult: std.meta.Int(.unsigned, 2 * @bitSizeOf(@TypeOf(v))) = 0;
-        inline for (0..@sizeOf(@TypeOf(v))) |i|
-            mult |= @as(@TypeOf(v), 1) << (8 * i + (@sizeOf(@TypeOf(v)) - i));
-        return @truncate((mult * (v & comptime 0x80 * ones)) >> @bitSizeOf(@TypeOf(v)));
+        const msb_mask = 0x80 * ones;
+
+        const cpu_name = builtin.cpu.model.llvm_name orelse builtin.cpu.model.name;
+        if (builtin.cpu.arch == .x86_64 and
+            std.Target.x86.featureSetHas(builtin.cpu.features, .bmi2) and
+
+            // PEXT is microcoded (slow) on AMD architectures before Zen 3.
+            (!std.mem.startsWith(u8, cpu_name, "znver") or cpu_name["znver".len] >= '3'))
+        {
+            return @intCast(pext(v, msb_mask));
+        } else {
+            // Source: http://0x80.pl/articles/scalar-sse-movmask.html
+            comptime var mult: std.meta.Int(.unsigned, 2 * @bitSizeOf(@TypeOf(v))) = 0;
+            inline for (0..@sizeOf(@TypeOf(v))) |i|
+                mult |= @as(@TypeOf(v), 1) << (8 * i + (@sizeOf(@TypeOf(v)) - i));
+            return @as(
+                std.meta.Int(.unsigned, @sizeOf(@TypeOf(v))),
+                @truncate((mult * (v & msb_mask)) >> @bitSizeOf(@TypeOf(v))),
+            );
+        }
     }
 
-    fn non_identifier_mask(v: anytype) std.meta.Int(.unsigned, @sizeOf(@TypeOf(v))) {
+    inline fn pext(src: u64, mask: u64) u64 {
+        return asm ("pext %[mask], %[src], %[ret]"
+            : [ret] "=r" (-> u64),
+            : [src] "r" (src),
+              [mask] "r" (mask),
+        );
+    }
+
+    fn non_identifier_mask(v: anytype) @TypeOf(v) {
         const ones: @TypeOf(v) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(v)), 8), u8), @splat(1)));
         const mask = comptime ones * 0x7F;
         const low_7_bits = v & mask;
@@ -666,34 +886,34 @@ const Parser = struct {
         // Upper nibble must be 3. Lower nibble must be [0, 9]
         const flipped_0x30 = low_7_bits ^ comptime ones * 0x30;
         const non_digit = flipped_0x30 + comptime ones * (0x80 - 0xA);
-        return mov_mask(non_digit & ~alpha & non_underscore);
+        return non_digit & ~alpha & non_underscore;
     }
 
-    fn non_line_break_mask(v: anytype) std.meta.Int(.unsigned, @sizeOf(@TypeOf(v))) {
+    fn non_line_break_mask(v: anytype) @TypeOf(v) {
         const ones: @TypeOf(v) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(v)), 8), u8), @splat(1)));
         const mask = comptime ones * 0x7F;
         const low_7_bits = v & mask;
         const non_newline = (low_7_bits ^ comptime ones * '\n') + mask;
         const non_carriage = (low_7_bits ^ comptime ones * '\r') + mask;
-        return mov_mask(non_newline & non_carriage);
+        return non_newline & non_carriage;
     }
 
-    fn non_space_mask(v: anytype) std.meta.Int(.unsigned, @sizeOf(@TypeOf(v))) {
+    fn non_space_mask(v: anytype) @TypeOf(v) {
         const ones: @TypeOf(v) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(v)), 8), u8), @splat(1)));
         const mask = comptime ones * 0x7F;
         const low_7_bits = v & mask;
         const non_space = (low_7_bits ^ comptime ones * ' ') + mask;
         const non_tab = (low_7_bits ^ comptime ones * '\t') + mask;
-        return mov_mask(non_space & non_tab);
+        return non_space & non_tab;
     }
 
-    fn non_char_mask(v: anytype, comptime c: u8) std.meta.Int(.unsigned, @sizeOf(@TypeOf(v))) {
+    fn non_char_mask(v: anytype, comptime c: u8) @TypeOf(v) {
         assert(c < 0x80);
         const ones: @TypeOf(v) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(v)), 8), u8), @splat(1)));
         const mask = comptime ones * 0x7F;
         const low_7_bits = v & mask;
         const non_char = (low_7_bits ^ comptime ones * c) + mask;
-        return mov_mask(non_char);
+        return non_char;
     }
 
     inline fn ascii_mask(vec: VEC) VEC_INT {
@@ -730,7 +950,7 @@ const Parser = struct {
             const bytes: [@divExact(@sizeOf(VEC), 8)]u64 = @bitCast(vec);
             var mask: VEC_INT = 0;
             inline for (bytes, 0..) |chunk, i| {
-                mask |= @as(VEC_INT, non_line_break_mask(chunk)) << (i * 8);
+                mask |= @as(VEC_INT, mov_mask(non_line_break_mask(chunk))) << (i * 8);
             }
             return ascii & ~mask;
         }
@@ -747,7 +967,7 @@ const Parser = struct {
             const bytes: [@divExact(@sizeOf(VEC), 8)]u64 = @bitCast(vec);
             var mask: VEC_INT = 0;
             inline for (bytes, 0..) |chunk, i| {
-                mask |= @as(VEC_INT, non_space_mask(chunk)) << (i * 8);
+                mask |= @as(VEC_INT, mov_mask(non_space_mask(chunk))) << (i * 8);
             }
             return ascii & ~mask;
         }
@@ -767,7 +987,7 @@ const Parser = struct {
             var mask: VEC_INT = 0;
             inline for (bytes, 0..) |chunk, i| {
                 // std.debug.print("{s}\n", .{@as([8]u8, @bitCast(chunk))});
-                mask |= @as(VEC_INT, non_identifier_mask(chunk)) << (i * 8);
+                mask |= @as(VEC_INT, mov_mask(non_identifier_mask(chunk))) << (i * 8);
             }
             return ascii & ~mask;
         }
@@ -782,17 +1002,17 @@ const Parser = struct {
             const bytes: [@divExact(@sizeOf(VEC), 8)]u64 = @bitCast(vec);
             var mask: VEC_INT = 0;
             inline for (bytes, 0..) |chunk, i| {
-                mask |= @as(VEC_INT, non_char_mask(chunk, c)) << (i * 8);
+                mask |= @as(VEC_INT, mov_mask(non_char_mask(chunk, c))) << (i * 8);
             }
             return ascii & ~mask;
         }
     }
 
     fn reverseIfPreferred(b: VEC_INT) VEC_INT {
-        return if (PREFER_CLZ) @bitReverse(b) else b;
+        return if (SPECULATIVELY_REVERSED) @bitReverse(b) else b;
     }
 
-    fn nextChunk(utf8_checker: *Utf8Checker, source: [*]align(VEC_SIZE) const u8, prev_escaped: VEC_INT) Bitmaps {
+    fn nextChunk(utf8_checker: *(if (VALIDATE_UTF8) Utf8Checker else void), source: [*]align(VEC_SIZE) const u8, prev_escaped: VEC_INT) Bitmaps {
         const input_vec: VEC = source[0..VEC_SIZE].*;
         const ascii = ascii_mask(input_vec);
         const quotes = getCharMask(input_vec, ascii, '"');
@@ -818,7 +1038,7 @@ const Parser = struct {
         // Flip the mask for sequences that start on even bits, to correct them
         const escaped = (even_bits ^ invert_mask) & follows_escape;
 
-        utf8_checker.check_next_input(input_vec);
+        if (VALIDATE_UTF8) utf8_checker.check_next_input(input_vec);
         // ----------------------------------------------------------------------------
 
         const linebreaks = getLinebreaks(input_vec, ascii);
@@ -873,7 +1093,7 @@ const Parser = struct {
     // TODO: audit the utf8 validator to make sure we clear the state properly when not using it
     pub fn tokenize(gpa: Allocator, source: [:0]const u8, comptime impl: u1) ![]Token {
         const end_ptr = &source.ptr[source.len];
-        const extended_source_len = std.mem.alignForward(u64, source.len + EXTENDED_BACK_SENTINELS_LEN, VEC_SIZE);
+        const extended_source_len = std.mem.alignForward(usize, source.len + EXTENDED_BACK_SENTINELS_LEN, VEC_SIZE);
         const extended_source = source.ptr[0..extended_source_len];
 
         var tokens = try gpa.alloc(Token, extended_source_len);
@@ -892,24 +1112,40 @@ const Parser = struct {
             std.mem.readIntSliceNative(u32, prev) == std.mem.readIntSliceNative(u32, "\n\xEF\xBB\xBF"),
         )) * 4 ..];
 
-        var bitmaps = std.mem.zeroes(Bitmaps);
+        var bitmaps align(16) = std.mem.zeroes(Bitmaps);
         const bitmaps_len = @divExact(@bitSizeOf(Bitmaps), @bitSizeOf(VEC_INT));
         const bitmap_ptr: *[bitmaps_len]VEC_INT = @ptrCast(&bitmaps);
-        var selected_bitmap_kind: BitmapKind = .whitespace;
-        var op_type: Tag = @enumFromInt(@intFromEnum(selected_bitmap_kind));
-        var bitmap_index: usize = std.math.maxInt(usize);
-        var utf8_checker: Utf8Checker = .{};
+        // var selected_bitmap_kind: BitmapKind = .whitespace;
+        var op_type: Tag = .whitespace;
+        var selected_bitmap: *VEC_INT = &bitmap_ptr[@as(u2, @truncate(@intFromEnum(op_type)))];
+        var bitmap_index: usize = @intFromPtr(cur.ptr) / VEC_SIZE * VEC_SIZE -% VEC_SIZE;
+        var utf8_checker: if (VALIDATE_UTF8) Utf8Checker else void = if (VALIDATE_UTF8) .{};
 
         outer: while (true) {
-            const bitmask_i: u2 = @truncate(@intFromEnum(selected_bitmap_kind));
-
             while (true) {
+                // https://github.com/ziglang/zig/issues/8220
+                // TODO: once labeled switch continues are added, we can make this check run the first iteration only.
+                // If we loop back around, there is no need to check this.
+                // I implemented this with tail call functions but it was messy.
+                if (bitmap_index != @intFromPtr(cur.ptr) / VEC_SIZE * VEC_SIZE) {
+                    // Never skip over a chunk because we have to do utf8 validation.
+                    bitmap_index +%= VEC_SIZE;
+                    bitmaps = nextChunk(&utf8_checker, @alignCast(@as(@TypeOf(cur.ptr), @ptrFromInt(bitmap_index))), bitmaps.prev_escaped);
+                    if (VALIDATE_UTF8) try utf8_checker.errors();
+                }
+
                 const cur_misalignment: LOG_VEC_INT = @truncate(@intFromPtr(cur.ptr));
-                const cur_bitmap_index = @intFromPtr(cur.ptr) / VEC_SIZE;
-                if (bitmap_index != cur_bitmap_index) {
-                    bitmap_index = cur_bitmap_index;
-                    bitmaps = nextChunk(&utf8_checker, @alignCast(cur.ptr - cur_misalignment), bitmaps.prev_escaped);
-                    utf8_checker.errors() catch return error.InvalidUtf8;
+
+                // We invert, i.e. count 1's, because 0's are shifted in by the bitshift.
+                const inverted_bitstring = ~if (SPECULATIVELY_REVERSED)
+                    selected_bitmap.* << cur_misalignment
+                else
+                    selected_bitmap.* >> cur_misalignment;
+
+                // Optimization: If our choice of @clz/@ctz implicitly inserts `if (inverted_bitstring == 0)`, make it more efficient.
+                if (COUNT_BORDERING_ZEROS_BRANCHES_ON_ZERO and inverted_bitstring == 0) {
+                    cur = cur[VEC_SIZE..];
+                    continue;
                 }
 
                 // Optimization: when ctz is implemented with a bitReverse (or just slow),
@@ -917,20 +1153,18 @@ const Parser = struct {
                 const str_len: std.meta.Int(
                     .unsigned,
                     std.math.ceilPowerOfTwoPromote(u64, std.math.log2_int_ceil(u64, VEC_SIZE + 1)),
-                ) = if (PREFER_CLZ)
-                    // We invert the bitstrings, i.e. count 1's, because 0's are shifted in by the bitshift.
-                    @clz(~(bitmap_ptr.*[bitmask_i] << cur_misalignment))
-                else
-                    @ctz(~(bitmap_ptr.*[bitmask_i] >> cur_misalignment));
+                ) = if (SPECULATIVELY_REVERSED) @clz(inverted_bitstring) else @ctz(inverted_bitstring);
 
                 cur = cur[str_len..];
-                if (VEC_SIZE - str_len != cur_misalignment) break;
+
+                if (bitmap_index == @intFromPtr(cur.ptr) / VEC_SIZE * VEC_SIZE) break;
             }
 
             // Catch if we had an unpaired `"`
             if (@intFromPtr(cur.ptr) > @intFromPtr(end_ptr)) return error.UnpairedQuote;
+
             {
-                const is_quoted: u1 = @truncate(@intFromEnum(selected_bitmap_kind));
+                const is_quoted: u1 = @truncate(@intFromPtr(selected_bitmap) / 8);
                 cur = cur[is_quoted..];
             }
 
@@ -1004,12 +1238,12 @@ const Parser = struct {
                     break :outer;
                 } else if (cur[0] == '@') {
                     cur = cur[1..];
-                    selected_bitmap_kind = switch (cur[0]) {
+                    op_type = switch (cur[0]) {
                         'a'...'z', 'A'...'Z' => .builtin,
                         '"' => .string_identifier,
                         else => return error.MissingQuoteOrLetterAfterAtSymbol,
                     };
-                    op_type = @enumFromInt(@intFromEnum(selected_bitmap_kind));
+                    selected_bitmap = &bitmap_ptr.*[@as(u2, @truncate(@intFromEnum(op_type)))];
                 } else if (cur[0] == '\'') {
                     while (true) {
                         cur = cur[1..];
@@ -1017,18 +1251,17 @@ const Parser = struct {
                         cur = cur[@intFromBool(cur[0] == '\\')..];
                     }
 
-                    if (@intFromPtr(cur.ptr) > @intFromPtr(end_ptr)) {
-                        return error.UnpairedSingleQuote;
-                    }
+                    if (@intFromPtr(cur.ptr) > @intFromPtr(end_ptr)) return error.UnpairedSingleQuote;
+
                     cur = cur[1..];
                     op_type = .char_literal;
                     continue;
                 } else if (Operators.isSingleCharOp(cur[0])) {
-                    selected_bitmap_kind = .whitespace;
+                    selected_bitmap = &bitmap_ptr.*[@as(u2, @truncate(@intFromEnum(BitmapKind.whitespace)))];
                     op_type = Operators.hashOp(Operators.getOpWord(cur.ptr, 1));
                     // cur = cur[@intFromBool(cur[0] == ' ')..];
                 } else if (Operators.isMultiCharBeginning(cur[0])) {
-                    var op_len: u3 = 1;
+                    var op_len: u32 = 1;
                     if (impl == 1) {
                         // if (mask_for_op_cont(std.mem.readIntLittle(u32, cur[0..4]))) |op_data| {
                         //     op_type = op_data;
@@ -1077,59 +1310,37 @@ const Parser = struct {
                         // printu32(@bitReverse(std.mem.readIntLittle(u32, cur[0..4])));
                         // printu32(@bitReverse(std.mem.readIntLittle(u32, cur[0..4]) >> 8));
                         op_len = mask_for_op_cont(std.mem.readIntLittle(u32, cur[0..4]));
-
-                        outer_outer_blk: {
-                            outer_blk: {
-                                blk: {
-                                    const op_word4 = Operators.getOpWord(cur.ptr, 4);
-                                    const hash4 = Operators.rawHash(op_word4);
-                                    const op_word3 = Operators.getOpWord(cur.ptr, 3);
-                                    const hash3 = Operators.rawHash(op_word3);
-                                    const op_word2 = Operators.getOpWord(cur.ptr, 2);
-                                    const hash2 = Operators.rawHash(op_word2);
-                                    const op_word1 = Operators.getOpWord(cur.ptr, 1);
-                                    const hash1 = Operators.rawHash(op_word1);
-                                    assert(op_len <= 4);
-                                    if (op_len == 4 and std.mem.readIntLittle(u32, &Operators.sorted_padded_ops[Operators.mapToIndexRaw(hash4)]) == op_word4) {
-                                        op_type = @enumFromInt(hash4);
-                                        cur = cur[4..];
-                                        break :outer_outer_blk;
-                                    }
-
-                                    if (op_len >= 3 and std.mem.readIntLittle(u32, &Operators.sorted_padded_ops[Operators.mapToIndexRaw(hash3)]) == op_word3) {
-                                        op_type = @enumFromInt(hash3);
-                                        cur = cur[3..];
-                                        break :blk;
-                                    }
-
-                                    if (op_len >= 2 and std.mem.readIntLittle(u32, &Operators.sorted_padded_ops[Operators.mapToIndexRaw(hash2)]) == op_word2) {
-                                        op_type = @enumFromInt(hash2);
-                                        cur = cur[2..];
-                                        break :outer_blk;
-                                    }
-
-                                    if (cur[0] == '\\') return error.IncompleteSingleLineStringOpener;
-                                    op_type = @enumFromInt(hash1);
-                                    cur = cur[1..];
-                                    break :outer_outer_blk;
-                                }
-
-                                switch (op_type) {
-                                    .@"///", .@"//!" => {
-                                        selected_bitmap_kind = .unknown;
-                                        break;
-                                    },
-                                    else => {},
-                                }
+                        const op_word4 = Operators.getOpWord(cur.ptr, 4);
+                        const hash4 = Operators.rawHash(op_word4);
+                        const op_word3 = Operators.getOpWord(cur.ptr, 3);
+                        const hash3 = Operators.rawHash(op_word3);
+                        const op_word2 = Operators.getOpWord(cur.ptr, 2);
+                        const hash2 = Operators.rawHash(op_word2);
+                        const op_word1 = Operators.getOpWord(cur.ptr, 1);
+                        const hash1 = Operators.rawHash(op_word1);
+                        assert(op_len <= 4);
+                        if (op_len == 4 and std.mem.readIntLittle(u32, &Operators.sorted_padded_ops[Operators.mapToIndexRaw(hash4)]) == op_word4) {
+                            op_type = @enumFromInt(hash4);
+                            cur = cur[4..];
+                        } else if (op_len >= 3 and std.mem.readIntLittle(u32, &Operators.sorted_padded_ops[Operators.mapToIndexRaw(hash3)]) == op_word3) {
+                            op_type = @enumFromInt(hash3);
+                            cur = cur[3..];
+                            if (op_type == .@"///" or op_type == .@"//!") {
+                                selected_bitmap = &bitmap_ptr.*[@as(u2, @truncate(@intFromEnum(BitmapKind.unknown)))];
+                                break;
                             }
-
-                            switch (op_type) {
-                                .@"//", .@"\\\\" => {
-                                    selected_bitmap_kind = .unknown;
-                                    break;
-                                },
-                                else => {},
+                        } else if (op_len >= 2 and std.mem.readIntLittle(u32, &Operators.sorted_padded_ops[Operators.mapToIndexRaw(hash2)]) == op_word2) {
+                            op_type = @enumFromInt(hash2);
+                            cur = cur[2..];
+                            if (op_type == .@"//" or op_type == .@"\\\\") {
+                                selected_bitmap = &bitmap_ptr.*[@as(u2, @truncate(@intFromEnum(BitmapKind.unknown)))];
+                                break;
                             }
+                        } else if (cur[0] == '\\') {
+                            return error.IncompleteSingleLineStringOpener;
+                        } else {
+                            op_type = @enumFromInt(hash1);
+                            cur = cur[1..];
                         }
                     } else {
                         comptime var op_continuation_chars align(32) = std.mem.zeroes([@divExact(256, @bitSizeOf(usize))]usize);
@@ -1157,7 +1368,7 @@ const Parser = struct {
 
                         switch (op_type) {
                             .@"///", .@"//!", .@"//", .@"\\\\" => {
-                                selected_bitmap_kind = .unknown;
+                                selected_bitmap = &bitmap_ptr.*[@as(u2, @truncate(@intFromEnum(BitmapKind.unknown)))];
                                 break;
                             },
                             else => {},
@@ -1167,14 +1378,14 @@ const Parser = struct {
                     cur = cur[@intFromBool(cur[0] == ' ')..];
                     continue;
                 } else {
-                    selected_bitmap_kind = switch (cur[0]) {
+                    op_type = switch (cur[0]) {
                         'a'...'z', 'A'...'Z', '_' => .identifier,
                         '0'...'9' => .number,
                         '"' => .string,
                         ' ', '\t', '\r', '\n' => .whitespace,
                         else => return error.InvalidToken,
                     };
-                    op_type = @enumFromInt(@intFromEnum(selected_bitmap_kind));
+                    selected_bitmap = &bitmap_ptr.*[@as(u2, @truncate(@intFromEnum(op_type)))];
                 }
 
                 cur = cur[1..];
@@ -1185,10 +1396,11 @@ const Parser = struct {
                 // Branch misses as a percentage are also higher, and yet, it's still faster.
                 // Haven't looked, but maybe it's just putting the branches in a more desirable order?
                 // We really need automatic profile-guided optimization in Zig so we can be certain.
-                if (selected_bitmap_kind == .whitespace and switch (cur[0]) {
-                    ' ', '\t', '\r', '\n' => false,
-                    else => true,
-                }) continue;
+
+                // if (selected_bitmap == &bitmap_ptr.*[@as(u2, @truncate(@intFromEnum(BitmapKind.whitespace)))] and switch (cur[0]) {
+                //     ' ', '\t', '\r', '\n' => false,
+                //     else => true,
+                // }) continue;
 
                 break;
             }
@@ -1223,7 +1435,7 @@ pub fn main() !void {
     // std.debug.print("-" ** 72 ++ "\n", .{});
     var num_tokens2: usize = 0;
 
-    const elapsedNanos2: u64 = if (RUN_LEGACY == 0) 0 else blk: {
+    const elapsedNanos2: u64 = if (!RUN_LEGACY) 0 else blk: {
         const legacy_tokens = try gpa.alloc(Ast.TokenList.Slice, sources.items.len);
         var legacy_token_cur = legacy_tokens;
 
@@ -1258,7 +1470,7 @@ pub fn main() !void {
 
         const elapsedNanos2: u64 = @intCast(t4 - t3);
 
-        if (REPORT_SPEED == 1) {
+        if (REPORT_SPEED) {
             const @"GB/s 2" = @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(elapsedNanos2));
             std.debug.print("Legacy Tokenizing took {: >9} ({d:.2} GB/s, {d: >5.2}M loc/s) and used {} memory\n", .{ std.fmt.fmtDuration(elapsedNanos2), @"GB/s 2", @as(f64, @floatFromInt(lines)) / @as(f64, @floatFromInt(elapsedNanos2)) * 1000, std.fmt.fmtIntSizeDec(num_tokens2 * 5) });
             break :blk elapsedNanos2;
@@ -1321,13 +1533,13 @@ pub fn main() !void {
 
     var num_tokens: usize = 0;
     for (sources.items, source_tokens, 0..) |source, tokens, i| {
+        _ = source;
         _ = i;
-        try infixToPrefix(gpa, source[1..], tokens[1..]);
         num_tokens += tokens.len;
     }
 
     // Fun fact: bytes per nanosecond is the same ratio as GB/s
-    if (REPORT_SPEED == 1) {
+    if (REPORT_SPEED) {
         const @"GB/s" = @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(elapsedNanos));
         std.debug.print("       Tokenizing took {: >9} ({d:.2} GB/s, {d: >5.2}M loc/s) and used {} memory\n", .{ std.fmt.fmtDuration(elapsedNanos), @"GB/s", @as(f64, @floatFromInt(lines)) / @as(f64, @floatFromInt(elapsedNanos)) * 1000, std.fmt.fmtIntSizeDec(num_tokens * 2) });
 
@@ -1335,8 +1547,6 @@ pub fn main() !void {
             std.debug.print("       That's {d:.2}x faster and {d:.2}x less memory!\n", .{ @as(f64, @floatFromInt(elapsedNanos2)) / @as(f64, @floatFromInt(elapsedNanos)), @as(f64, @floatFromInt(num_tokens2 * 5)) / @as(f64, @floatFromInt(num_tokens * 2)) });
         }
     }
-
-    // std.debug.print("-" ** 72 ++ "\n", .{});
 }
 
 // ---------------------------------------------------------------
@@ -1626,8 +1836,8 @@ const Utf8Checker = struct {
     }
 
     // do not forget to call check_eof!
-    fn errors(checker: Utf8Checker) !void {
-        if (@reduce(.Or, checker.err) != 0) return error.UTF8_ERROR;
+    fn errors(checker: Utf8Checker) error{InvalidUtf8}!void {
+        if (@reduce(.Or, checker.err) != 0) return error.InvalidUtf8;
     }
 
     //
