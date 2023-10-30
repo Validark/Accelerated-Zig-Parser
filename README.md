@@ -44,9 +44,9 @@ In the last few days, I have:
     ```
 
 
-- Fixed random performance issues, like the compiler not realizing that our SIMD/SWAR chunks are always aligned loads. (It matters on a lot of less-mainstream machines!)
+- Fixed random performance issues, like the compiler not realizing that our SIMD/SWAR chunks are always aligned loads. (It matters on a lot on less-mainstream machines!)
 
-- Made the SIMD/SWAR code go chunk by chunk in lockstep rather than have each individual component load its 64 (on 64-bit machines) bytes separately. I am assuming that LLVM was able to reuse loaded vectors on some occasions, but in practice I saw a massive speedup in the last week. Granted, the utf8 validator was turned off temporarily while it is being reworked. However, on my Zen 3 machine I typically saw basically no performance difference between running the utf8 validator versus not. The reason for this is because we almost always can early out when the entire chunk is ascii. Due to alignment/cache/happenstance, I typically saw my tokenization times go down with the utf8 validator turned on, so I don't think I am unfairly advantaging my most recent measurements.
+- Made the SIMD/SWAR code go chunk by chunk in lockstep rather than have each individual component load its 64 (on 64-bit machines) bytes separately. I am assuming that LLVM was able to reuse loaded vectors on some occasions, but in practice I saw a massive speedup in the last week. Granted, the utf8 validator was turned off temporarily while it is being reworked. However, on my Zen 3 machine I typically saw basically no performance difference between running the utf8 validator versus not. The reason for this is because we can almost always exit early when the entire chunk is ascii. Due to alignment/cache/happenstance, I typically saw my tokenization times go *down* with the utf8 validator turned *on*, so I don't think I am unfairly advantaging my most recent measurements.
 
 - Turned off the utf8 validator. I need to fix the types for it so it can be re-enabled. We also need to port a SWAR version. simdjson or Golang might have some tricks we can use.
 
