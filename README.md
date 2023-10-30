@@ -216,10 +216,10 @@ My ultimate goal is that this repository will be integrated with the Zig compile
 git clone https://github.com/Validark/Accelerated-Zig-Parser.git
 ```
 
-Next, install one or more Zig projects under the `src` folder.
+Next, install one or more Zig projects under the `src/files_to_parse` folder.
 
 ```
-cd Zig-Parser-Experiment/src
+cd Zig-Parser-Experiment/src/files_to_parse
 git clone https://github.com/ziglang/zig.git
 git clone https://github.com/zigtools/zls.git
 ```
@@ -227,6 +227,6 @@ git clone https://github.com/zigtools/zls.git
 Then run it!
 
 ```
-cd ..
+cd ../..
 zig build -Doptimize=ReleaseFast run
 ```
