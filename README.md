@@ -4,40 +4,89 @@ A high-throughput tokenizer and parser (soon™️) for the Zig programming lang
 
 So far, a tokenizer implementation is provided. The mainline Zig tokenizer uses a deterministic finite state machine. Those are pretty good for some applications, but tokenizing can often employ the use of other techniques for added speed.
 
+# Latest work
+
+In the last few days, I have:
+
+- Replaced the SWAR movmask algorithm with one significantly better on typical hardware. Before, we were using an algorithm which for 64 bit operand `a` would basically do: `(@as(u128, a) * b) >> 64`. Now, we can stay within the lower 64 bits, so no widening is necessary. This is really good for basically every machine I could find info on for the difference between `mulhi` vs `mul`.
+    ```
+    Example with 32 bit integers:
+    We want to concentrate the upper bits of each byte into a single nibble.
+    Doing the gradeschool multiplication algorithm, we can see that each 1 bit
+    in the bottom multiplicand shifts the upper multiplicand, and then we add all these
+    shifted bitstrings together. (Note `.` represents a 0)
+      a.......b.......c.......d.......
+    * ..........1......1......1......1
+    -------------------------------------------------------------------------
+      a.......b.......c.......d.......
+      .b.......c.......d..............
+      ..c.......d.....................
+    + ...d............................
+    -------------------------------------------------------------------------
+      abcd....bcd.....cd......d.......
+
+    Then we simply shift to the right by `32 - 4` (bitstring size minus the number of relevant bits) to isolate the desired `abcd` bits in the least significant byte!
+    ```
+
+- Laid groundwork for exporting non_newline bitmaps, that way we can use it later on in the compiler to figure out what line we are on [without needing to go byte-by-byte later on in the pipeline](https://github.com/ziglang/zig/blob/91e117697ad90430d9266203415712b6cc59f669/src/AstGen.zig#L12498C10-L12515).
+
+- Fixed random performance issues, like the compiler not realizing that our SIMD/SWAR chunks are always aligned loads. (It matters on a lot of less-mainstream machines!)
+
+- Made the SIMD/SWAR code go chunk by chunk in lockstep rather than have each individual component load its 64 (on 64-bit machines) bytes separately. I am assuming that LLVM was able to reuse loaded vectors on some occasions, but in practice I saw a massive speedup in the last week. Granted, the utf8 validator was turned off temporarily while it is being reworked. However, on my Zen 3 machine I typically saw basically no performance difference between running the utf8 validator versus not. The reason for this is because we almost always can early out when the entire chunk is ascii. Due to alignment/cache/happenstance, I typically saw my tokenization times go down with the utf8 validator turned on, so I don't think I am unfairly advantaging my most recent measurements.
+
+- Turned off the utf8 validator. I need to fix the types for it so it can be re-enabled. We also need to port a SWAR version. simdjson or Golang might have some tricks we can use.
+
+- Added an option to enable or disable the folding of comments into adjacent nodes (`FOLD_COMMENTS_INTO_ADJACENT_NODES`). This should make it a little easier to change my mind on the particulars of the AST implementation.
+
+- Added more tests and compile-time assertions. We're getting there!
+
 # Results
 
-The test bench fully reads in all of the Zig files under the folders in the `src` folder. In my test I installed the Zig compiler, ZLS, and a few other Zig projects in my `src` folder. The test bench iterates over the source bytes from each Zig file (with added sentinels) and calls the tokenization function on each.
+**Currently the utf8 validator is turned off! I did a lot of performance optimization the past few days and did not finish porting my changes over yet.**
 
-To tokenize 3201 Zig files with 59,144,056 bytes, including 1,297,378 newlines, the original tokenizer and my new tokenizer have the following characteristics:
+The test bench fully reads in all of the Zig files under the folders in the `src/files_to_parse` folder. In my test I installed the Zig compiler, ZLS, and a few other Zig projects in my `src/files_to_parse` folder. The test bench iterates over the source bytes from each Zig file (with added sentinels) and calls the tokenization function on each **with the utf8 validator turned off**.
 
-|  | token memory (megabytes)|
+To tokenize 3,215 Zig files with 1,298,139 newlines, the original tokenizer and my new tokenizer have the following characteristics:
+
+|  | memory (megabytes)|
 |:-:|:-:|
-| original | 46.06531MB |
-| this | 18.424328MB |
+| raw source files | 59.162811MB |
+| original (tokens) | 46.08376MB |
+| this (tokens) | 18.50587MB |
 
-That's 2.5x less memory!
+That's 2.49x less memory!
+
+Please keep in mind that comparing to the legacy tokenizer's speed is not necessarily straightforward. It is not difficult for me to see the legacy tokenizer's performance change by ~15% by making a trivial change in my code. It varies heavily depending on the particular compile. That said, here are some numbers I am seeing on my machine (with the utf8 validator turned off on my implementation):
 
 ### x86_64 Zen 3
 
-|  | run-time (milliseconds) | throughput (gigabytes per second) |throughput (lines of code per second) |
-|:-:|:-:|:-:|:-:|
-| read files | 39.544ms | 1.50 GB/s | 32.81M loc/s |
-| original | 231.201ms  | 0.26 GB/s | 5.67M loc/s |
-| this | 81.362ms | 0.70 GB/s | 15.26M loc/s |
+**Currently the utf8 validator is turned off! I did a lot of performance optimization the past few days and did not finish porting my changes over yet.**
 
-That's ~2.84x faster!
+|  | run-time (milliseconds) | throughput (megabytes per second) |throughput (lines of code per second) |
+|:-:|:-:|:-:|:-:|
+| read files (baseline) | 35.269ms | 1677.45 MB/s | 35.01M loc/s |
+| original | 235.293ms  | 251.44 MB/s | 5.52M loc/s |
+| this | 78.525ms | 753.42 MB/s | 16.53M loc/s |
+
+That's ~3.00x faster! **Currently the utf8 validator is turned off! I did a lot of performance optimization the past few days and did not finish porting my changes over yet.**
 
 ### RISC-V Sifive u74
 
+**Currently the utf8 validator is turned off! I did a lot of performance optimization the past few days and did not finish porting my changes over yet.**
+
 |  | run-time (milliseconds) | throughput (gigabytes per second) |throughput (lines of code per second) |
 |:-:|:-:|:-:|:-:|
-| read files | 387.609ms |  0.15 GB/s | 3.35M loc/s |
-| original | 2.263s  | 0.03 GB/s | 0.57M loc/s |
-| this | 1.495s | 0.04 GB/s | 0.87M loc/s |
+| read files (baseline) | 360.678ms |  164.03 MB/s | 3.35M loc/s |
+| original | 2.202s  | 26.86 MB/s| 0.59M loc/s |
+| this | 983.737ms | 60.14 MB/s | 1.32M loc/s |
 
-That's ~1.51x faster! And there is still more that can be done. I still need to SWARify the utf8 validator and the keyword checker needs some work too. If we turn the utf8 validator off, it's ~1.81x faster and breaks 1M loc/s! Pretty good for a machine that's ~10x slower than my Zen 3 with the legacy tokenizer.
+That's ~2.24x faster! **Currently the utf8 validator is turned off! I did a lot of performance optimization the past few days and did not finish porting my changes over yet.**
 
-A 1.5-1.8x speedup is approximately what I expected. Since SWAR has a little more overhead than Zen 3 vectors, I imagined there would be less of a gain than on Zen 3.
+
+## To-do
+
+- Fix utf8 validator and get a good SWAR implementation.
+- Make it so we can return memory which holds the non-newline bitmaps.
 
 # Maintenance note
 
@@ -81,6 +130,22 @@ I try to achieve each of these in the following ways:
     - Using SWAR, i.e., SIMD within a register. This is where we read multiple bytes into a 4 or 8 byte register and use conventional arithmetic and logical instructions to operate on multiple bytes simultaneously. SWAR fallbacks will be provided for machines which lack proper SIMD instructions, and the normal implementation will probably use it for operator matching. This is still an active area of development.
 
 3. We reduce memory consumption by not storing start indices explicitly, which typically need to match the address space of the source length. In the case of Zig, where source files are constrained to be at most ~4GiB, only 32 bits of address space is needed for any given file. Thus the goal becomes reducing 32-bit start indices to something smaller. Quasi-succinct schemes for reducing the space consumption of monotonically increasing integer sequences immediately spring to mind, such as [Elias-Fano encoding](https://www.antoniomallia.it/sorted-integers-compression-with-elias-fano-encoding.html). However, we can achieve good space compression by simply storing the length of each token rather than the start index. Because tokens almost always have a length that can fit in a byte, we try to store all lengths in a byte. In the event that the length is too large to be stored in a byte, we store a `0` instead and make the next 4 bytes the true length. This works because tokens cannot have a length of 0, else they would not exist, therefore we can use lengths of `0` to trigger special behavior. We also know that this idea does not affect the upper bound on the number of Token elements we need to allocate because in order for a token to take up 3 times as much space as a typical token, it needs to have a length of at least 256, which the astute reader may note is significantly larger than 3.
+
+4. Use fewer variables where possible. While machines nowadays have *a lot* more registers than they used to, you still only have access to 16 or 32 general purpose registers! If you have more variables than that, you have to spill to the stack (it's actually worse than this, because intermediate values in expressions temporarily need their own registers too). While machines do have extra registers they can use under the hood, you do not! Therefore, we can get better performance by
+   - Using pointers rather than pointers + index
+   - Being clever about how we write out our `non_newlines` bitstrings. Instead of storing all of the bitstrings I get from the SIMD/SWAR code on the stack in a `[4]u64` (on 64 bit machines), and then writing separately to a `non_newlines` pointer, I write *all* the bitstrings into the memory allocated for the `non_newlines` bitstrings. Each time, I increment the place we are writing in the allocation by the width of a single bitstring, i.e. 8 bytes on 64 bit machines. Since I always write the `non_newlines` into the current position in the allocated memory and the other bitstrings are written after it, we will be left at the end with only `non_newlines` bitstrings. The only downside is we need to overallocate an extra 3 u64's than we otherwise would, but that's hardly any trouble. Here is a diagram of how this strategy looks in memory:
+
+   ```
+   |0|1|2|3|4|5|6|7|8|9| <- slots
+   |a|b|c|d|   <- We write our bitstrings to 4 slots. (`a` is `non_newlines`)
+     |a|b|c|d| <- Each time, we move one slot forward
+       |a|b|c|d|
+         |a|b|c|d|
+           |a|b|c|d|
+             |a|b|c|d|
+               |a|b|c|d|
+   |a|a|a|a|a|a|a|b|c|d| <- In the end, we are left with this
+   ```
 
 # Still to-do
 

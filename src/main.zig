@@ -808,20 +808,21 @@ fn swarMovMaskGeneric(v: anytype, comptime impl: enum { pext, mul_hi, mul_lo, na
     };
 
     // Example with 32 bit integers:
+    // We want to concentrate the upper bits of each byte into a single nibble.
     // Doing the gradeschool multiplication algorithm, we can see that each 1 bit
     // in the bottom multiplicand shifts the upper multiplicand, and then we add all these
-    // shifted bitstrings together.
-    //   a0000000b0000000c0000000d0000000
-    // * 00000000001000000100000010000001
+    // shifted bitstrings together. (Note `.` represents a 0)
+    //   a.......b.......c.......d.......
+    // * ..........1......1......1......1
     // -------------------------------------------------------------------------
-    //   a0000000b0000000c0000000d0000000
-    //   0b0000000c0000000d00000000000000
-    //   00c0000000d000000000000000000000
-    // + 000d0000000000000000000000000000
+    //   a.......b.......c.......d.......
+    //   .b.......c.......d..............
+    //   ..c.......d.....................
+    // + ...d............................
     // -------------------------------------------------------------------------
-    //   abcd............................
-    //
-    // Then we simply right-shift to get `abcd` in the lowest bit position.
+    //   abcd....bcd.....cd......d.......
+
+    // Then we simply shift to the right by `32 - 4` (bitstring size minus the number of relevant bits) to isolate the desired `abcd` bits in the least significant byte!
 
     return switch (impl) {
         .pext => @intCast(pext(v, msb_mask)),
