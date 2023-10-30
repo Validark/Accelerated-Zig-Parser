@@ -101,6 +101,7 @@ That's ~2.24x faster! **Currently the utf8 validator is turned off! I did a lot 
 
 - Fix utf8 validator and get a good SWAR implementation.
 - Make it so we can return memory which holds the non-newline bitmaps.
+- Actually implement the AST parser.
 
 # Maintenance note
 
