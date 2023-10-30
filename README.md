@@ -30,7 +30,7 @@ In the last few days, I have:
     ```
 
 - Laid groundwork for exporting non_newline bitmaps, that way we can use it later on in the compiler to figure out what line we are on [without needing to go byte-by-byte later on in the pipeline](https://github.com/ziglang/zig/blob/91e117697ad90430d9266203415712b6cc59f669/src/AstGen.zig#L12498C10-L12515).
-    - Use a clever trick where we write out the SIMD/SWAR movmasked bitstrings into the allocated area, but we shift where we are writing by the width of one bitstring each time. That way, in the end we have filled our buffer with teh first bitstring we write out in each stem, with the overhead of basically one instruction (the pointer increment) per chunk (64 bytes on 64 bit machines).
+    - Use a clever trick where we write out the SIMD/SWAR movmasked bitstrings into the allocated area, but we shift where we are writing by the width of one bitstring each time. That way, in the end we have filled our buffer with the first bitstring we write out in each stem, with the overhead of basically one instruction (the pointer increment) per chunk (64 bytes on 64 bit machines).
     ```
     |0|1|2|3|4|5|6|7|8|9| <- slots
     |a|b|c|d|   <- We write our bitstrings to 4 slots. (`a` is `non_newlines`)
