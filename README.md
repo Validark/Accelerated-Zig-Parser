@@ -134,17 +134,17 @@ I try to achieve each of these in the following ways:
     - SWAR fallbacks are provided for machines which lack proper SIMD instructions.
         - We can check for equality against a character by broadcasting the character and performing an xor operation:
         ```
-        0xaabbccddeeffgghh
+          0xaabbccddeeffgghh
         ^ 0xcccccccccccccccc
         --------------------
-        0x~~~~00~~~~~~~~~~
+          0x~~~~00~~~~~~~~~~
         ```
         - The previous step will result in 0's in the byte array in the positions where we found our target byte (in this case, `cc`). We can then add a broadcasted `0x7F`.
         ```
-        0x~~~~00~~~~~~~~~~
+          0x~~~~00~~~~~~~~~~
         + 0x7F7F7F7F7F7F7F7F
-        ----------------
-        0x8~8~7F8~8~8~8~8~
+          ----------------
+          0x8~8~7F8~8~8~8~8~
         ```
         - This will result in a 1 bit in the most significant bit of each byte that didn't start out as a 0 after the previous step. The only problem with the technique as I have presented it thus far is the potential for overflow across bytes. To remedy this, we mask out the highest bit of each byte before starting this algorithm. That way, when we add 7F we know it cannot overflow beyond the most significant bit of each byte, and then we know we can look at the most significant bit of each byte to tell us whether our target byte was **not** there.
         - Then we can mask out the most significant bit of each byte and emulate a movmask operation, i.e. concentrate the bits together, with a multiplication:
@@ -154,15 +154,15 @@ I try to achieve each of these in the following ways:
         Doing the gradeschool multiplication algorithm, we can see that each 1 bit
         in the bottom multiplicand shifts the upper multiplicand, and then we add all these
         shifted bitstrings together. (Note `.` represents a 0)
-        a.......b.......c.......d.......
+          a.......b.......c.......d.......
         * ..........1......1......1......1
         -------------------------------------------------------------------------
-        a.......b.......c.......d.......
-        .b.......c.......d..............
-        ..c.......d.....................
+          a.......b.......c.......d.......
+          .b.......c.......d..............
+          ..c.......d.....................
         + ...d............................
         -------------------------------------------------------------------------
-        abcd....bcd.....cd......d.......
+          abcd....bcd.....cd......d.......
 
         Then we simply shift to the right by `32 - 4` (bitstring size minus the number of relevant
         bits) to isolate the desired `abcd` bits in the least significant byte!
