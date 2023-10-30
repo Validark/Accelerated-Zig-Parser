@@ -25,7 +25,8 @@ In the last few days, I have:
     -------------------------------------------------------------------------
       abcd....bcd.....cd......d.......
 
-    Then we simply shift to the right by `32 - 4` (bitstring size minus the number of relevant bits) to isolate the desired `abcd` bits in the least significant byte!
+    Then we simply shift to the right by `32 - 4` (bitstring size minus the number of relevant
+    bits) to isolate the desired `abcd` bits in the least significant byte!
     ```
 
 - Laid groundwork for exporting non_newline bitmaps, that way we can use it later on in the compiler to figure out what line we are on [without needing to go byte-by-byte later on in the pipeline](https://github.com/ziglang/zig/blob/91e117697ad90430d9266203415712b6cc59f669/src/AstGen.zig#L12498C10-L12515).
