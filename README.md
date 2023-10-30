@@ -8,7 +8,7 @@ So far, a tokenizer implementation is provided. The mainline Zig tokenizer uses 
 
 In the last few days, I have:
 
-- Replaced the SWAR movmask algorithm with one significantly better on typical hardware. Before, we were using an algorithm which for 64 bit operand `a` would basically do: `(@as(u128, a) * b) >> 64`. Now, we can stay within the lower 64 bits, so no widening is necessary. This is really good for basically every machine I could find info on for the difference between `mulhi` vs `mul`.
+- Replaced the SWAR movmask algorithm with one significantly better on typical hardware. Before, we were using [an algorithm from Wojciech Muła](http://0x80.pl/articles/scalar-sse-movmask.html) which for 64 bit operand `a` would basically do: `(@as(u128, x) * constant) >> 64`. Now, we can stay within the lower 64 bits by concentrating the target bits in the most significant byte, so no widening is necessary. This is really good for basically every machine I could find info on for the difference between `mulhi` vs `mul`.
     ```
     Example with 32 bit integers:
     We want to concentrate the upper bits of each byte into a single nibble.
