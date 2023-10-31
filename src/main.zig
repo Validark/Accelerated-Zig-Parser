@@ -71,11 +71,7 @@ fn readFileIntoAlignedBuffer(allocator: Allocator, file: std.fs.File, comptime a
 }
 
 fn readFiles(gpa: Allocator) !std.ArrayListUnmanaged([:0]const u8) {
-    const directory = switch (INFIX_TEST) {
-        true => "./src/beep",
-        false => "./src/files_to_parse",
-    };
-    var parent_dir2 = try std.fs.cwd().openDirZ(directory, .{}, false);
+    var parent_dir2 = try std.fs.cwd().openDirZ("./src", .{}, false);
     defer parent_dir2.close();
 
     var parent_dir = try std.fs.cwd().openIterableDir(directory, .{});
@@ -95,12 +91,6 @@ fn readFiles(gpa: Allocator) !std.ArrayListUnmanaged([:0]const u8) {
         while (try walker.next()) |dir| {
             switch (dir.kind) {
                 .file => if (dir.basename.len > 4 and std.mem.eql(u8, dir.basename[dir.basename.len - 4 ..][0..4], ".zig") and dir.path.len - dir.basename.len > 0) {
-                    // These two are extreme outliers, omit them from our test bench
-                    if (SKIP_OUTLIERS and
-                        (std.mem.endsWith(u8, dir.path, "udivmodti4_test.zig") or
-                        std.mem.endsWith(u8, dir.path, "udivmoddi4_test.zig")))
-                        continue;
-
                     const file = try parent_dir2.openFile(dir.path, .{});
                     defer file.close();
 
@@ -201,7 +191,7 @@ const Operators = struct {
     }
 
     fn rawHash(op_word: u32) u7 {
-        return @intCast(((op_word *% 698839068) -% comptime (@as(u32, 29) << 25)) >> 25);
+        return @intCast((op_word *% 698839068) >> 25);
     }
 
     fn hashOp(op_word: u32) Tag {
@@ -357,68 +347,17 @@ const Keywords = struct {
         const hash = mapToIndex(hashKw(kw, len));
         const val: [PADDING_RIGHT]u8 = sorted_padded_kws[hash];
         const val_len = val[PADDING_RIGHT - 1]; // [min_kw_len, max_kw_len]
+        if (len != val_len) return null;
+        const vec1: @Vector(PADDING_RIGHT, u8) = val;
+        const tag: Tag = @enumFromInt(~hash);
 
-        if (USE_SWAR) {
-            if (len != val_len) return null;
-            var word1: u64 = @bitCast(kw[0..8].*);
-            var word2: u64 = @bitCast(kw[8..16].*);
+        comptime assert(BACK_SENTINELS.len >= PADDING_RIGHT - min_kw_len);
+        const vec2: @Vector(PADDING_RIGHT, u8) = kw[0..PADDING_RIGHT].*;
 
-            word1 = if (std.math.cast(u6, (64 -| len * 8))) |shift1|
-                (word1 << @intCast(shift1)) >> @intCast(shift1)
-            else
-                unreachable; // len can't be 0
-
-            // TODO:  In-progress SWAR impl. Could probably be better...?
-            // TODO: only works on little-endian
-
-            word2 = if (std.math.cast(
-                u6,
-                // len can't be > max_kw_len (14 atm)
-                128 - len * 8,
-            )) |shift2|
-                (word2 << @intCast(shift2)) >> @intCast(shift2)
-            else
-                0;
-
-            // std.debug.print("\n", .{});
-
-            // std.debug.print("\n", .{});
-
-            const source_word1 = @as(u64, @bitCast(val[0..8].*));
-            const source_word2 = @as(u64, @bitCast(val[8..16].*)) << 8 >> 8;
-
-            if (word1 == source_word1 and word2 == source_word2) {
-                // Dear reader: We can't move this higher because this might produce an invalid tag.
-                // Our hash might map to a padding value in the buffer, and not be a real keyword.
-                // We have to let the compiler hoist this for us.
-                return @enumFromInt(~hash);
-            } else {
-                // std.debug.print("kw: {s}\n", .{kw[0..len]});
-                // std.debug.print("vl: {s}\n", .{val});
-                // printu(word1);
-                // printu(word2);
-                // std.debug.print("\n", .{});
-                // printu(source_word1);
-                // printu(source_word2);
-                // std.debug.print("word1 == source_word1: {}\n", .{word1 == source_word1});
-                // std.debug.print("word2 == source_word2: {}\n", .{word2 == source_word2});
-                return null;
-            }
+        if (@ctz(@as(padded_int, @bitCast(vec1 != vec2))) >= val_len) {
+            return tag;
         } else {
-            const KW_VEC = @Vector(PADDING_RIGHT, u8);
-            var vec1: KW_VEC = val;
-            const vec2: KW_VEC = kw[0..PADDING_RIGHT].*;
-            var other_vec: KW_VEC = @splat(@as(u8, @intCast(len)));
-            const cd = @select(u8, @as(KW_VEC, @splat(val_len)) > std.simd.iota(u8, PADDING_RIGHT), vec2, other_vec);
-
-            if (std.simd.countTrues(cd != vec1) == 0) {
-                // Dear reader: We can't move this higher because this might produce an invalid tag.
-                // Our hash might map to a padding value in the buffer, and not be a real keyword.
-                // We have to let the compiler hoist this for us.
-                return @enumFromInt(~hash);
-            } else {
-                return null;
-            }
+            return null;
         }
     }
 };
@@ -426,9 +365,7 @@ const Keywords = struct {
 const Tag = blk: {
     const BitmapKinds = std.meta.fields(Parser.BitmapKind);
     var decls = [_]std.builtin.Type.Declaration{};
-    var enumFields: [1 + Operators.unpadded_ops.len + Keywords.unpadded_kws.len + BitmapKinds.len]std.builtin.Type.EnumField = undefined;
-
-    enumFields[0] = .{ .name = "invalid", .value = 0xaa };
+    var enumFields: [Operators.unpadded_ops.len + Keywords.unpadded_kws.len + BitmapKinds.len]std.builtin.Type.EnumField = undefined;
 
     for (Operators.unpadded_ops, Operators.padded_ops) |op, padded_op| {
         const hash = Operators.rawHash(Operators.getOpWord(&padded_op, op.len));
@@ -1103,7 +1040,8 @@ const Parser = struct {
 
         whitespace            = 128 | @as(u8, 19),
 
-        char_literal          = 128 | @as(u8,  6), // is_quoted
+        eof                   = 128 | @as(u8,  4),
+
         // zig fmt: on
     };
 
@@ -1124,6 +1062,9 @@ const Parser = struct {
         const extended_source = source.ptr[0..extended_source_len];
         const tokens = try gpa.alloc(Token, extended_source_len);
         errdefer gpa.free(tokens);
+
+        // var extra_lens = try gpa.alloc(u32, source.len / 256);
+        // errdefer gpa.free(extra_lens);
 
         const non_newlines_bitstrings = try gpa.alloc(VEC_INT, extended_source_len / VEC_SIZE + (@bitSizeOf(Bitmaps) - @bitSizeOf(VEC_INT)) / VEC_SIZE);
         // TODO: make this errdefer and return this data out.
@@ -1153,108 +1094,26 @@ const Parser = struct {
         var utf8_checker: if (VALIDATE_UTF8) Utf8Checker else void = if (VALIDATE_UTF8) .{};
         var prev_escaped: VEC_INT = 0;
 
-        outer: while (true) : (cur = cur[1..]) {
-            {
-                var aligned_ptr = @intFromPtr(cur.ptr) / VEC_SIZE * VEC_SIZE;
-                while (true) {
-                    // https://github.com/ziglang/zig/issues/8220
-                    // TODO: once labeled switch continues are added, we can make this check run the first iteration only.
-                    // If we loop back around, there is no need to check this.
-                    // I implemented this with tail call functions but it was messy.
-                    while (bitmap_index != aligned_ptr) {
-                        bitmap_index +%= VEC_SIZE;
-                        const base_ptr = @as([*]align(VEC_SIZE) const u8, @ptrFromInt(bitmap_index));
-
-                        var non_newlines: VEC_INT = 0;
-                        var non_quotes: VEC_INT = 0;
-                        var non_backslashes: VEC_INT = 0;
-                        var non_spaces: VEC_INT = 0;
-                        var identifiers_or_numbers: VEC_INT = 0;
-
-                        inline for (0..VEC_SIZE / NATIVE_VEC_SIZE) |i| {
-                            const chunk = blk: {
-                                const slice: *align(NATIVE_VEC_SIZE) const [NATIVE_VEC_SIZE]u8 = @alignCast(base_ptr[i * NATIVE_VEC_SIZE ..][0..NATIVE_VEC_SIZE]);
-                                break :blk if (USE_SWAR) @as(*align(NATIVE_VEC_SIZE) const NATIVE_VEC_INT, @ptrCast(slice)).* else @as(@Vector(NATIVE_VEC_SIZE, u8), slice.*);
-                            };
-
-                            const shift: LOG_VEC_INT = switch (builtin.cpu.arch.endian()) {
-                                .Little => @intCast(NATIVE_VEC_SIZE * i),
-                                .Big => @intCast((VEC_SIZE - NATIVE_VEC_SIZE) - NATIVE_VEC_SIZE * i),
-                            };
-
-                            non_newlines |= movMask(maskForNonChars(chunk, "\n")) << shift;
-                            non_quotes |= movMask(maskForNonChars(chunk, "\"")) << shift;
-                            non_backslashes |= movMask(maskForNonChars(chunk, "\\")) << shift;
-                            non_spaces |= movMask((maskForNonChars(chunk, " \t"))) << shift;
-                            identifiers_or_numbers |= movMask(nonIdentifierMask(chunk)) << shift;
-
-                            if (VALIDATE_UTF8) {
-                                utf8_checker.check_next_input(chunk);
-                                try utf8_checker.errors();
-                            }
-                        }
-
-                        const backslashes = ~non_backslashes;
-
-                        // ----------------------------------------------------------------------------
-                        // This code is brought to you courtesy of simdjson and simdjzon, both licensed
-                        // under the Apache 2.0 license which is included at the bottom of this file
-
-                        // If there was overflow, pretend the first character isn't a backslash
-                        const backslash: VEC_INT = backslashes & ~prev_escaped;
-                        const follows_escape = (backslash << 1) | prev_escaped;
-
-                        // Get sequences starting on even bits by clearing out the odd series using +
-                        const even_bits: VEC_INT = @bitCast(@as(@Vector(@divExact(VEC_SIZE, 8), u8), @splat(0x55)));
-                        const odd_sequence_starts = backslash & ~even_bits & ~follows_escape;
-                        const x = @addWithOverflow(odd_sequence_starts, backslash);
-                        const invert_mask: VEC_INT = x[0] << 1; // The mask we want to return is the *escaped* bits, not escapes.
-                        prev_escaped = x[1];
-
-                        // Mask every other backslashed character as an escaped character
-                        // Flip the mask for sequences that start on even bits, to correct them
-                        const escaped = (even_bits ^ invert_mask) & follows_escape;
-
-                        // ----------------------------------------------------------------------------
-
-                        bitmap_ptr = bitmap_ptr[1..];
-                        bitmap_ptr[0] = reverseIfPreferred(non_newlines);
-                        bitmap_ptr[1] = reverseIfPreferred(identifiers_or_numbers);
-                        bitmap_ptr[2] = reverseIfPreferred((non_quotes & non_newlines) | escaped);
-                        bitmap_ptr[3] = reverseIfPreferred(~(non_spaces & non_newlines));
-
-                        selected_bitmap = selected_bitmap[1..];
-                    }
-
-                    const cur_misalignment: LOG_VEC_INT = @truncate(@intFromPtr(cur.ptr));
-
-                    // We invert, i.e. count 1's, because 0's are shifted in by the bitshift.
-                    const inverted_bitstring = ~if (SPECULATIVELY_REVERSED)
-                        selected_bitmap[0] << cur_misalignment
-                    else
-                        selected_bitmap[0] >> cur_misalignment;
-
-                    // Optimization: when ctz is implemented with a bitReverse+clz,
-                    // we speculatively bitReverse in `nextChunk` to avoid doing so in this loop.
-                    const str_len: std.meta.Int(
-                        .unsigned,
-                        std.math.ceilPowerOfTwoPromote(u64, std.math.log2_int_ceil(u64, VEC_SIZE + 1)),
-                    ) = if (SPECULATIVELY_REVERSED) @clz(inverted_bitstring) else ctz(inverted_bitstring);
-
-                    cur = cur[str_len..];
-                    aligned_ptr = @intFromPtr(cur.ptr) / VEC_SIZE * VEC_SIZE;
-                    if (bitmap_index == aligned_ptr) break;
+        outer: while (true) {
+            while (true) {
+                const bitmask_i: u2 = @truncate(@intFromEnum(selected_bitmap_kind));
+                const cur_misalignment: LOG_VEC_INT = @truncate(@intFromPtr(cur.ptr));
+                const cur_bitmap_index = @intFromPtr(cur.ptr) / VEC_SIZE;
+                if (bitmap_index != cur_bitmap_index) {
+                    bitmap_index = cur_bitmap_index;
+                    bitmaps = nextChunk(&utf8_checker, @alignCast(cur.ptr - cur_misalignment), bitmaps.prev_escaped);
+                    utf8_checker.errors() catch return error.ParseError;
                 }
+                const bitmask = bitmap_ptr.*[bitmask_i] >> cur_misalignment;
+                const str_len = @ctz(~bitmask);
+                cur = cur[str_len..];
+                if (VEC_SIZE - str_len != @as(u8, cur_misalignment)) break;
             }
 
-            comptime assert(BACK_SENTINELS.len - 1 > std.mem.indexOf(u8, BACK_SENTINELS, "\x00").?); // there should be at least another character
-            comptime assert(BACK_SENTINELS[BACK_SENTINELS.len - 1] == '\n'); // eof reads the non_newlines bitstring, therefore we need a newline at the end
-            if (op_type == .eof) break :outer;
-
-            {
-                const is_quoted: u1 = @truncate((@intFromPtr(selected_bitmap.ptr) / 8) ^ (@intFromPtr(bitmap_ptr.ptr) / 8) ^ 1);
-                cur = cur[is_quoted..];
-            }
+            // Catch if we had an unpaired `"`
+            if (@intFromPtr(cur.ptr) > @intFromPtr(end_ptr)) return error.ParseError;
+            const is_quoted: u1 = @truncate(@intFromEnum(selected_bitmap_kind));
+            cur = cur[is_quoted..];
 
             while (true) {
                 var len: u32 = @intCast(@intFromPtr(cur.ptr) - @intFromPtr(prev.ptr));
@@ -1270,44 +1129,59 @@ const Parser = struct {
                     else => {},
                 }
 
-                advance_blk: {
-                    blk: {
-                        // We are fine with arbitrary lengths attached to operators and keywords, because
-                        // once we know which one it is there is no loss of information in adding comments and
-                        // whitespace to the length. E.g. `const` is always `const` and `+=` is `+=`, whether or
-                        // not we add whitespace to either side.
-                        //
-                        // On the other hand, identifiers, numbers, strings, etc might become harder to deal
-                        // with later if we don't know the exact length. If it turns out that we don't really
-                        // need this information anyway, we can simplify this codepath and collapse comments
-                        // and whitespace into those tokens too.
-                        const prev_op_type = cur_token[0].kind;
-                        switch (@intFromEnum(op_type)) {
-                            BitmapKind.min_bitmap_value...BitmapKind.max_bitmap_value => break :blk, // identifiers, quotes, etc
-                            else => {},
-                        }
+                var advance_amt: u2 = switch (cur_token[0].len) {
+                    0 => 3,
+                    else => 1,
+                };
 
-                        switch (@intFromEnum(prev_op_type)) {
-                            BitmapKind.min_bitmap_value...BitmapKind.max_bitmap_value => break :blk, // identifiers, quotes, etc
-                            else => {},
-                        }
+                blk: {
+                    comptime var min_bitmap_value = 129;
+                    comptime var max_bitmap_value = std.math.minInt(@typeInfo(BitmapKind).Enum.tag_type);
 
-                        const op_type_c = op_type == .whitespace or (FOLD_COMMENTS_INTO_ADJACENT_NODES and op_type == .@"//");
-                        const prev_op_type_c = prev_op_type == .whitespace or (FOLD_COMMENTS_INTO_ADJACENT_NODES and prev_op_type == .@"//");
+                    comptime for (std.meta.fields(BitmapKind)) |field| {
+                        max_bitmap_value = @max(field.value, max_bitmap_value);
+                    };
 
-                        if (op_type_c or prev_op_type_c or
-                            (op_type == prev_op_type and (op_type == .@"//!" or op_type == .@"///" or (!FOLD_COMMENTS_INTO_ADJACENT_NODES and op_type == .@"//"))))
-                        {
-                            if (op_type_c) op_type = prev_op_type;
-                            len += @bitCast(cur_token[1..][0..2].*);
-                            break :advance_blk;
-                        }
+                    // We are fine with arbitrary lengths attached to operators and keywords, because
+                    // once we know which one it is there is no loss of information in adding comments and
+                    // whitespace to the length. E.g. `const` is always `const` and `+=` is `+=`, whether or
+                    // not we add whitespace to either side.
+                    //
+                    // On the other hand, identifiers, numbers, strings, etc might become harder to deal
+                    // with later if we don't know the exact length. If it turns out that we don't really
+                    // need this information anyway, we can simplify this codepath and collapse comments
+                    // and whitespace into those tokens too.
+
+                    const prev_op_type = cur_token[0].kind;
+
+                    const op_type_c = switch (@intFromEnum(op_type)) {
+                        min_bitmap_value...max_bitmap_value => break :blk, // identifiers, quotes, etc
+                        @intFromEnum(Tag.@"//"),
+                        @intFromEnum(Tag.@"//!"),
+                        @intFromEnum(Tag.@"///"),
+                        @intFromEnum(Tag.whitespace),
+                        => true,
+                        else => false, // operators, keywords, etc
+                    };
+
+                    const prev_op_type_c = switch (@intFromEnum(prev_op_type)) {
+                        min_bitmap_value...max_bitmap_value => break :blk, // identifiers, quotes, etc
+                        @intFromEnum(Tag.@"//"),
+                        @intFromEnum(Tag.@"//!"),
+                        @intFromEnum(Tag.@"///"),
+                        @intFromEnum(Tag.whitespace),
+                        => true,
+                        else => false, // operators, keywords, etc
+                    };
+
+                    if (op_type_c or prev_op_type_c) {
+                        advance_amt = 0;
+                        if (op_type_c) op_type = prev_op_type;
+                        len += @bitCast(cur_token[1..][0..2].*);
                     }
-
-                    var advance_amt: u2 = if (cur_token[0].len == 0) 3 else 1;
-                    cur_token = cur_token[advance_amt..];
                 }
 
+                cur_token = cur_token[advance_amt..];
                 cur_token[0] = .{ .len = if (len >= 256) 0 else @intCast(len), .kind = op_type };
                 cur_token[1..][0..2].* = @bitCast(len);
                 prev = cur;
@@ -1493,12 +1367,12 @@ const Parser = struct {
             }
         }
 
-        if (@intFromPtr(cur.ptr) < @intFromPtr(end_ptr)) return error.Found0ByteInFile;
-
-        cur_token = cur_token[if (cur_token[0].len == 0) 3 else 1..];
-        cur_token[0] = .{ .len = 1, .kind = .eof };
+        cur_token = cur_token[switch (cur_token[0].len) {
+            0 => 3,
+            else => 1,
+        }..];
+        cur_token[0] = .{ .len = 0, .kind = .eof };
         cur_token = cur_token[1..];
-
         const new_chunks_data_len = (@intFromPtr(cur_token.ptr) - @intFromPtr(tokens.ptr)) / @sizeOf(Token);
 
         if (gpa.resize(tokens, new_chunks_data_len)) {
@@ -1511,8 +1385,31 @@ const Parser = struct {
     }
 };
 
+fn combineFiles(gpa: Allocator, sources: std.ArrayListUnmanaged([:0]const u8)) !std.ArrayListUnmanaged([:0]const u8) {
+    var bytes: u64 = 0;
+    for (sources.items) |source| {
+        bytes += source.len - 1;
+    }
+    const all_files = try gpa.alignedAlloc(u8, VEC_SIZE, std.mem.alignBackward(u64, bytes + (FRONT_SENTINELS.len + BACK_SENTINELS.len + (VEC_SIZE - 1)), VEC_SIZE));
+    all_files[0..FRONT_SENTINELS.len].* = FRONT_SENTINELS.*;
+    var cur = all_files[FRONT_SENTINELS.len..];
+
+    for (sources.items) |source| {
+        @memcpy(cur[0 .. source.len - 1], source[1..]);
+        cur = cur[source.len - 1 ..];
+    }
+    gpa.free(sources.allocatedSlice());
+    cur[0..BACK_SENTINELS.len].* = BACK_SENTINELS.*;
+    cur = cur[BACK_SENTINELS.len..];
+    @memset(cur, 0);
+    var new_sources = try std.ArrayListUnmanaged([:0]const u8).initCapacity(gpa, 1);
+    new_sources.addOneAssumeCapacity().* = all_files[0 .. bytes + FRONT_SENTINELS.len + 1 :0];
+    return new_sources;
+}
+
+const RUN_LEGACY = true;
+
 pub fn main() !void {
-    const stdout = std.io.getStdOut().writer();
     const gpa = std.heap.c_allocator;
     const sources = try readFiles(gpa);
     var bytes: u64 = 0;
@@ -1529,7 +1426,10 @@ pub fn main() !void {
     var num_tokens2: usize = 0;
     const legacy_token_lists: if (RUN_LEGACY_TOKENIZER) []Ast.TokenList.Slice else void = if (RUN_LEGACY_TOKENIZER) try gpa.alloc(Ast.TokenList.Slice, sources.items.len);
 
-    const elapsedNanos2: u64 = if (!RUN_LEGACY_TOKENIZER) 0 else blk: {
+    const elapsedNanos2: u64 = if (!RUN_LEGACY) 0 else blk: {
+        const legacy_tokens = try gpa.alloc(Ast.TokenList.Slice, sources.items.len);
+        var legacy_token_cur = legacy_tokens;
+
         const t3 = std.time.nanoTimestamp();
         for (sources.items, legacy_token_lists) |sourcey, *legacy_token_list_slot| {
             const source = sourcey[1..];
@@ -1570,60 +1470,25 @@ pub fn main() !void {
     if (RUN_NEW_TOKENIZER or INFIX_TEST) {
         var t1 = std.time.nanoTimestamp();
 
+        // mine:                85ms
+        // original tokenizer: 192ms
+        // mine:               18.36490249633789MiB
+        // original tokenizer: 43.44332695007324MiB
+
+        // mine:
+        // original ast: 332ms
         const source_tokens = try gpa.alloc([]Token, sources.items.len);
-        for (sources.items, source_tokens) |source, *source_token_slot| {
-            source_token_slot.* = try Parser.tokenize(gpa, source, 1);
-            // const b = try Parser.tokenize(gpa, source, 1);
-
-            // var cur_a = a;
-            // var cur_b = b;
-            // var cur = source;
-
-            // while (cur_a.len > 0 and cur_b.len > 0) {
-            //     if (cur_a[0].kind != cur_b[0].kind) break;
-            //     const cur_a_len = switch (cur_a[0].len) {
-            //         0 => @as(u32, @bitCast(cur_a[1..3].*)),
-            //         else => |l| l,
-            //     };
-
-            //     const cur_b_len = switch (cur_b[0].len) {
-            //         0 => @as(u32, @bitCast(cur_b[1..3].*)),
-            //         else => |l| l,
-            //     };
-            //     if (cur_a_len != cur_b_len) break;
-
-            //     const adv_amt: usize = if (cur_a[0].len == 0) 3 else 1;
-            //     cur_a = cur_a[adv_amt..];
-            //     cur_b = cur_b[adv_amt..];
-            //     cur = cur[cur_a_len..];
-            // } else {
-            //     continue;
-            // }
-
-            // try stdout.print("{} {s} {s}\n", .{ i, @tagName(cur_a[0].kind), @tagName(cur_b[0].kind) });
-            // try stdout.print("\"{s}\"\n", .{cur[0..cur_a[0].len]});
-            // {
-            //     const adv_amt: usize = if (cur_a[0].len == 0) 3 else 1;
-            //     cur = cur[cur_a[0].len..];
-            //     cur_a = cur_a[adv_amt..];
-            // }
-            // try stdout.print("\"{s}\"\n", .{cur[0..cur_a[0].len]});
-            // cur = cur[cur_a[0].len..];
-            // cur_a = cur_a[if (cur_a[0].len == 0) 3 else 1..];
-            // try stdout.print("\"{s}\"\n", .{cur[0..cur_a[0].len]});
-            // cur = cur[cur_a[0].len..];
-            // cur_a = cur_a[if (cur_a[0].len == 0) 3 else 1..];
-            // try stdout.print("\"{s}\"\n", .{cur[0..cur_a[0].len]});
-            // break;
+        var source_token_cur = source_tokens;
+        for (sources.items) |source| {
+            source_token_cur[0] = try Parser.tokenize(gpa, source);
+            source_token_cur = source_token_cur[1..];
         }
 
         const t2 = std.time.nanoTimestamp();
         const elapsedNanos: u64 = @intCast(t2 - t1);
 
         var num_tokens: usize = 0;
-        for (sources.items, source_tokens, 0..) |source, tokens, i| {
-            _ = source;
-            _ = i;
+        for (source_tokens) |tokens| {
             num_tokens += tokens.len;
         }
 
@@ -1768,8 +1633,8 @@ const Utf8Checker = struct {
     // end from https://gist.github.com/sharpobject/80dc1b6f3aaeeada8c0e3a04ebc4b60a
     pub fn mm_shuffle_epi8(x: Chunk, mask: Chunk) Chunk {
         return asm (
-            \\vpshufb %[mask], %[x], %[out]
-            : [out] "=x" (-> Chunk),
+            \\ vpshufb %[mask], %[x], %[out]
+            : [out] "=x" (-> u8x32),
             : [x] "+x" (x),
               [mask] "x" (mask),
         );
@@ -1787,8 +1652,8 @@ const Utf8Checker = struct {
 
     fn lookup_chunk(comptime a: [16]u8, b: Chunk) Chunk {
         switch (builtin.cpu.arch) {
-            .x86_64 => return mm_shuffle_epi8(a ** (chunk_len / 16), b),
-            .aarch64, .aarch64_be => return lookup_16_aarch64(b, a ** (chunk_len / 16)),
+            .x86_64 => return mm256_shuffle_epi8(a, b),
+            .aarch64 => return lookup_16_aarch64(b, a),
             else => {
                 var r: Chunk = @splat(0);
                 for (0..chunk_len) |i| {
@@ -2205,3 +2070,21 @@ const Utf8Checker = struct {
 //    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
+
+// op: fn (a: u32) error{Noodle}!u32,
+
+// fn Noodle() type {
+//     return struct {};
+// }
+
+// const x = Noodle(){
+//     .a = 1,
+//     .c = 2,
+// };
+
+// const Options = enum { Yes, No };
+
+// const Obj = union (enum) {
+//     int: u32,
+//     str: []const u8,
+// };
