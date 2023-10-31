@@ -1008,7 +1008,7 @@ const Parser = struct {
         const non_underscore = (low_7_bits ^ comptime ones * '_') + mask;
 
         // alpha check:
-        // Upper nibble must be 4 or 6. Lower 5 bits must be between 1 and 26
+        // Upper 3 bits must be 4 or 6. Lower 5 bits must be between 1 and 26
         const magic_mask = ((v & comptime ones * ~@as(u7, 0x20)) ^ comptime ones * 0x40);
         const non_0x40_or_0x60 = magic_mask + mask;
         const non_alpha = magic_mask + comptime ones * (0x80 - 27);
