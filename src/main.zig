@@ -784,7 +784,6 @@ fn swarMovMask(v: anytype) @TypeOf(v) {
     const ones: @TypeOf(v) = @bitCast(@as(@Vector(@sizeOf(@TypeOf(v)), u8), @splat(1)));
     const msb_mask = 0x80 * ones;
 
-    // This variable is used as a multiplicand in the `mul_lo` and `mul_hi` tricks.
     // We are exploiting a multiplication as a shifter and adder, and the derivation of this number is
     // shown here as a comptime loop.
     // This trick is often generalizable to other problems too: https://stackoverflow.com/a/14547307
@@ -832,7 +831,6 @@ fn swarMovMaskReversed(v: anytype) @TypeOf(v) {
     const ones: T = @bitCast(@as(@Vector(@sizeOf(T), u8), @splat(1)));
     const msb_mask = 0x80 * ones;
 
-    // This variable is used as a multiplicand in the `mul_lo` and `mul_hi` tricks.
     // We are exploiting a multiplication as a shifter and adder, and the derivation of this number is
     // shown here as a comptime loop.
     // This trick is often generalizable to other problems too: https://stackoverflow.com/a/14547307
