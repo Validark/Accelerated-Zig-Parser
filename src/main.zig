@@ -636,19 +636,35 @@ fn ctzBranchless(a: anytype) std.meta.Int(.unsigned, std.math.ceilPowerOfTwoProm
         lookup_table[0] |= @bitSizeOf(T);
     }
     const tzcnt_if_non0 = lookup_table[hash];
+
     return switch (builtin.cpu.arch) {
-        // Apparently my idea just isn't cool enough for sparc. sparc is special.
-        // It prefers the basic code, but only so long as the check for 0 comes at the end of the function.
-        // At the time of writing, it does not hoist this check, and gives me a branch-free implementation.
-        .sparc, .sparc64, .sparcel => if (a == 0) @bitSizeOf(T) else tzcnt_if_non0,
+        .aarch64_32,
+        .aarch64_be,
+        .aarch64,
+        .arm,
+        .armeb,
+        .thumb,
+        .thumbeb,
+
+        .sparc,
+        .sparc64,
+        .sparcel,
+        => if (a == 0) @bitSizeOf(T) else tzcnt_if_non0,
+
+        .x86,
+        .x86_64,
+
+        .riscv32,
+        .riscv64,
+        => tzcnt_if_non0 & (@intFromBool(a == 0) +% @as(u8, @bitSizeOf(T) - 1)),
         else => tzcnt_if_non0 & (@intFromBool(a == 0) +% @as(u8, @bitSizeOf(T) - 1)),
     };
 }
 
 test "ctzBranchless" {
     inline for ([_]type{ u64, u32 }) |T| {
-        inline for (0..@bitSizeOf(T)) |i| {
-            const x = @as(T, 1) << i;
+        inline for (0..@bitSizeOf(T) + 1) |i| {
+            const x = if (i == @bitSizeOf(T)) @as(T, 0) else @as(T, 1) << i;
             try std.testing.expectEqual(@ctz(x), @intCast(ctzBranchless(x)));
         }
     }
@@ -1030,6 +1046,26 @@ const Parser = struct {
         return underscores | upper_alpha | lower_alpha | digits;
     }
 
+    fn swarControlCharMask(v: anytype) @TypeOf(v) {
+        const ones: @TypeOf(v) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(v)), 8), u8), @splat(1)));
+        const mask = comptime ones * 0x7F;
+        const low_7_bits = v & mask;
+        const non_del = low_7_bits + ones;
+        const non_control = low_7_bits + comptime ones * (0x80 - 0x20);
+        return v | ~(non_del | non_control);
+    }
+
+    fn controlCharMask(v: anytype) if (USE_SWAR) NATIVE_VEC_INT else std.meta.Int(.unsigned, NATIVE_VEC_SIZE) {
+        if (USE_SWAR) {
+            assert(@TypeOf(v) == NATIVE_VEC_INT);
+            return swarControlCharMask(v);
+        }
+
+        const delete_code = ~maskForNonChars(v, "\x7F");
+        const other_controls = maskForCharRange(v, 0, 31);
+        return delete_code | other_controls;
+    }
+
     fn maskForNonCharsGeneric(v: anytype, comptime str: []const u8, comptime use_swar: bool) if (USE_SWAR) NATIVE_VEC_INT else std.meta.Int(.unsigned, NATIVE_VEC_SIZE) {
         if (use_swar) {
             assert(@TypeOf(v) == NATIVE_VEC_INT);
@@ -1178,12 +1214,16 @@ const Parser = struct {
                         var non_backslashes: VEC_INT = 0;
                         var non_spaces: VEC_INT = 0;
                         var identifiers_or_numbers: VEC_INT = 0;
+                        var control_chars: VEC_INT = 0;
+                        _ = control_chars;
 
                         inline for (0..comptime VEC_SIZE / NATIVE_VEC_SIZE) |i| {
                             const chunk = blk: {
                                 const slice: *align(NATIVE_VEC_SIZE) const [NATIVE_VEC_SIZE]u8 = @alignCast(base_ptr[i * NATIVE_VEC_SIZE ..][0..NATIVE_VEC_SIZE]);
                                 break :blk if (USE_SWAR) @as(*align(NATIVE_VEC_SIZE) const NATIVE_VEC_INT, @ptrCast(slice)).* else @as(@Vector(NATIVE_VEC_SIZE, u8), slice.*);
                             };
+
+                            // TODO: do a global byte-reverse if that's efficient on our hardware.
 
                             const shift: LOG_VEC_INT = if (ASSEMBLE_BITSTRINGS_BACKWARDS)
                                 @intCast((VEC_SIZE - NATIVE_VEC_SIZE) - NATIVE_VEC_SIZE * i)
@@ -1196,6 +1236,10 @@ const Parser = struct {
                             non_spaces |= movMask((maskForNonChars(chunk, " \t"))) << shift;
                             identifiers_or_numbers |= movMask(nonIdentifierMask(chunk)) << shift;
 
+                            // TODO: check control characters
+                            // control_chars |= movMask(controlCharMask(chunk)) << shift;
+
+                            // TODO: fix utf8 validator
                             if (VALIDATE_UTF8) {
                                 utf8_checker.check_next_input(chunk);
                                 try utf8_checker.errors();
@@ -1203,6 +1247,8 @@ const Parser = struct {
                         }
 
                         const backslashes = ~non_backslashes;
+
+                        // TODO: make a bitreversed implementation of the following code:
 
                         // ----------------------------------------------------------------------------
                         // This code is brought to you courtesy of simdjson and simdjzon, both licensed
@@ -1225,6 +1271,7 @@ const Parser = struct {
 
                         // ----------------------------------------------------------------------------
 
+                        // TODO: we should efficiently check against control chars in quotes/comments
                         bitmap_ptr = bitmap_ptr[1..];
                         bitmap_ptr[0] = reverseIfCheap(non_newlines);
                         bitmap_ptr[1] = reverseIfCheap(identifiers_or_numbers);
@@ -1259,6 +1306,8 @@ const Parser = struct {
             comptime assert(BACK_SENTINELS[BACK_SENTINELS.len - 1] == '\n'); // eof reads the non_newlines bitstring, therefore we need a newline at the end
             if (op_type == .eof) break :outer;
 
+            // TODO: this was originally designed to be very efficient, now... not so much.
+            // We could try to optimize this again.
             {
                 const is_quoted: u1 = @truncate((@intFromPtr(selected_bitmap.ptr) / 8) ^ (@intFromPtr(bitmap_ptr.ptr) / 8) ^ 1);
                 cur = cur[is_quoted..];
@@ -1477,7 +1526,7 @@ const Parser = struct {
                         // '\'' => .char_literal,
                         ' ', '\t', '\n' => .whitespace,
                         0 => .eof,
-                        else => return error.InvalidToken,
+                        else => return error.InvalidCharacter,
                     };
 
                     selected_bitmap = bitmap_ptr[@as(u2, @truncate(@intFromEnum(op_type)))..];
