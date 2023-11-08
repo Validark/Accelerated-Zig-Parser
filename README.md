@@ -8,6 +8,28 @@ So far, a tokenizer implementation is provided. The mainline Zig tokenizer uses 
 
 In the last few days, I have:
 
+- Updated to a [slightly better optimized version](https://github.com/simdjson/simdjson/pull/2042) of the escape-detection algorithm.
+
+- Made toggles so that `"` and `'` can be moved between the SIMD/SWAR section and a naïve scalar version very easily. It appears that for machines which have to use SWAR, it is faster to do the naïve scalar version (almost **~8% uplift on my RISC-V SiFive U74**). On the other hand, it's still more efficient on my desktop to do quote classification in SIMD, but for other less-powerful devices, it may not be worth it.
+    - There is also a trade-off to be made on big-endian hardware. The SIMD `'`/`"` escape detection algorithm currently has to be done in little-endian, so there necessarily has to be a reversal somewhere (or byte-reversal on the vectors) if we want to not use the naïve scalar version.
+        - With SIMD, we need to do a vector reversal, unless we have fast machine-word bit-reverse instructions. At the moment I am not aware of any ISA's supported by the Zig compiler with a fast bit-reverse instruction besides arm/aarch64.
+            - We take advantage of arm's bit-reverse instruction (`rbit`) so that we can use `clz` directly in our bitstring queries, rather than `rbit`+`clz`. On little-endian machines, we do the flip after the escape-detection algorithm. On big-endian, we can do it before, but then we can just bitreverse the backslashes before and after the escape detection algorithm. arm is typically little-endian these days, but who knows, maybe a future ISA can take advantage of the flexibility.
+        - mips64 and powerpc64 have built-in `clz` instructions, and emulate `ctz` via `@bitSizeOf(usize) - clz(~x & (x -% 1))`. Therefore, if we wanted to do quotes in SIMD *and* use `clz`, we would have to flip our bitstrings twice! Ouch! Hopefully I or someone else figures out how to make a big-endian equivalent of the escape character bitstring generation algorithm.
+        - some sparc64 machines have `popc` (e.g. niagara 2 and up), which can emulate `ctz` via `popc(~x & (x -% 1))`. To do `clz` we have to do `x |= x >> 1; x |= x >> 2; x |= x >> 4; x |= x >> 8; x |= x >> 16; x |= x >> 32;` to spread the most-significant bit all the way right-wards, then we can invert the bitstring to get a mask of the leading zeroes, and popcount that. So on big-endian sparc64 machines, we WANT to do a bitreverse. Also, LLVM's Vectorization currently does not work on sparc64 (or powerpc) machines, so we probably have to use the SWAR algorithm for the time being.
+        - machines which do not have `clz` builtin can probably emulate a `ctz` faster than a `clz`.
+
+        - With SWAR, we can do either a `@byteSwap` on the register being treated as a vector or we can reverse the bits with a bitreversing movmask algorithm. The problem with the latter is that we have to do an extra shift right on the bitstring before multiplying because the most significant bit of the most significant byte has to be moved to the lowest bit position of its byte. We *can* avoid this extra shift by instead using a multiply-high operation and concentrating the bits in the upper half of a double machine-word, and maintaining a 3 instruction movmask. However, the problem with this idea is that multiply-high might be a function call or have terrible throughput / port constraints, whereas multiplies typically have a throughput of 1 per cycle. Is the throughput actually a problem in practice though? Unsure. We *do* have quite a lot of other work to do in between multiplies.
+            - To generate 3 bitstrings for a chunk, we need 3 extra instructions for the bitreversed movmask (assuming we don't do `'`/`"` in SWAR). Therefore, if we can do a machine-word byte-reverse faster than 3 shifts and/or in fewer than 3 instructions, it would be smarter to do the byte-reverse. Alternatively, if we have fast multiply-high's somehow, we could use that to eliminate the 3 extra shifts (per native subchunk).
+
+        - For now, I think the bitstring escape sequence algorithm is best left disabled on big-endian hardware without a fast bit-reverse (so just arm atm).
+
+        - Since sparc64 and powerpc have to use SWAR until LLVM improves, they should do quote/escape logic in scalar code, not vector code. sparc64 machines lack bit-reverse and byte-reverse, so we can use the movemask-reversed function on sparc64.
+        - powerpc can stay in big-endian land and use `clz`.
+        - mips64 has an extension to the ISA which adds vector instructions, although I'm not sure if it has gone into real hardware yet or whether those vectors are actually useful for the kind of SIMD we are doing here.
+            - therefore mips64 can stay in big-endian land and use `clz`.
+
+- Partially added some control character bans but there is still more to be done. Still, as of yet, incomplete.
+
 - Replaced the SWAR movmask algorithm with one significantly better on typical hardware. Before, we were using [an algorithm from Wojciech Muła](http://0x80.pl/articles/scalar-sse-movmask.html) which for 64 bit operand `x` would basically do: `(@as(u128, x) * constant) >> 64`. Now, we can stay within the lower 64 bits by concentrating the target bits in the most significant byte, so no widening is necessary. This is really good news for basically every machine I could find info on for the difference between `mulhi` vs `mul`. Typically `mulhi` instructions have much higher latency and signicantly worse throughput, and some machines do not even have a `mulhi` instruction at all. My algorithm modifies [Wojciech Muła's algorithm](http://0x80.pl/articles/scalar-sse-movmask.html) to use only the lower 64 bits of the product of the multiplication:
     ```
     Example with 32 bit integers:
@@ -78,7 +100,7 @@ Please keep in mind that comparing to the legacy tokenizer's speed is not necess
 
 **Currently the utf8 validator is turned off! I did a lot of performance optimization the past few days and did not finish porting my changes over yet.**
 
-|  | run-time (milliseconds) | throughput (megabytes per second) |throughput (lines of code per second) |
+|  | run-time (milliseconds) | throughput (megabytes per second) |throughput (million lines of code per second) |
 |:-:|:-:|:-:|:-:|
 | read files (baseline) | 35.269ms | 1677.45 MB/s | 35.01M loc/s |
 | original | 235.293ms  | 251.44 MB/s | 5.52M loc/s |
@@ -86,18 +108,17 @@ Please keep in mind that comparing to the legacy tokenizer's speed is not necess
 
 That's ~3.00x faster! **Currently the utf8 validator is turned off! I did a lot of performance optimization the past few days and did not finish porting my changes over yet.**
 
-### RISC-V Sifive u74
+### RISC-V SiFive U74
 
 **Currently the utf8 validator is turned off! I did a lot of performance optimization the past few days and did not finish porting my changes over yet.**
 
-|  | run-time (milliseconds) | throughput (gigabytes per second) |throughput (lines of code per second) |
+|  | run-time (milliseconds) | throughput (gigabytes per second) |throughput (million lines of code per second) |
 |:-:|:-:|:-:|:-:|
-| read files (baseline) | 360.678ms |  164.03 MB/s | 3.35M loc/s |
-| original | 2.202s  | 26.86 MB/s| 0.59M loc/s |
-| this | 983.737ms | 60.14 MB/s | 1.32M loc/s |
+| read files (baseline) | 366.666ms |  161.35 MB/s | 3.54M loc/s |
+| original | 2.18s  | 27.13 MB/s | 0.60M loc/s |
+| this | 948.314ms | 62.39 MB/s | 1.37M loc/s |
 
-That's ~2.24x faster! **Currently the utf8 validator is turned off! I did a lot of performance optimization the past few days and did not finish porting my changes over yet.**
-
+That's ~2.30x faster! **Currently the utf8 validator is turned off! I did a lot of performance optimization the past few days and did not finish porting my changes over yet.**
 
 ## To-do
 

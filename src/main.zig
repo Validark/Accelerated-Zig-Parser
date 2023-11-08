@@ -49,7 +49,7 @@ const NATIVE_VEC_CHAR = @Vector(NATIVE_VEC_SIZE, u8);
 const NATIVE_VEC_COND = @Vector(NATIVE_VEC_SIZE, bool);
 
 const FRONT_SENTINELS = "\n";
-const BACK_SENTINELS = "\n" ++ "\x00" ** 13 ++ "\n";
+const BACK_SENTINELS = "\n" ++ "\x00" ** 13 ++ " ";
 const INDEX_OF_FIRST_0_SENTINEL = std.mem.indexOfScalar(u8, BACK_SENTINELS, 0).?;
 const EXTENDED_BACK_SENTINELS_LEN = BACK_SENTINELS.len - INDEX_OF_FIRST_0_SENTINEL;
 
@@ -100,9 +100,11 @@ fn readFiles(gpa: Allocator) !std.ArrayListUnmanaged([:0]const u8) {
             switch (dir.kind) {
                 .file => if (dir.basename.len > 4 and std.mem.eql(u8, dir.basename[dir.basename.len - 4 ..][0..4], ".zig") and dir.path.len - dir.basename.len > 0) {
                     // These two are extreme outliers, omit them from our test bench
-                    if (SKIP_OUTLIERS and
-                        (std.mem.endsWith(u8, dir.path, "udivmodti4_test.zig") or
-                        std.mem.endsWith(u8, dir.path, "udivmoddi4_test.zig")))
+                    // if (!std.mem.eql(u8, dir.basename, "static_test.zig")) continue;
+
+                    if (std.mem.eql(u8, dir.basename, "normal_string_with_newline.zig") or (SKIP_OUTLIERS and
+                        (std.mem.eql(u8, dir.basename, "udivmodti4_test.zig") or
+                        std.mem.eql(u8, dir.basename, "udivmoddi4_test.zig"))))
                         continue;
 
                     const file = try parent_dir2.openFile(dir.path, .{});
@@ -201,7 +203,7 @@ const Operators = struct {
         comptime assert(BACK_SENTINELS.len >= 3);
         const shift_amt = len * 8;
         const relevant_mask: u32 = @intCast((@as(u64, 1) << @intCast(shift_amt)) -% 1);
-        return std.mem.readIntLittle(u32, op[0..4]) & relevant_mask;
+        return std.mem.readInt(u32, op[0..4], .little) & relevant_mask;
     }
 
     fn rawHash(op_word: u32) u7 {
@@ -229,7 +231,8 @@ const Operators = struct {
         // std.debug.print("{s}\n", .{op[0..len]});
         const op_word = getOpWord(op, len);
         const hash = rawHash(op_word);
-        return if (std.mem.readIntLittle(u32, &sorted_padded_ops[mapToIndexRaw(hash)]) == op_word)
+
+        return if (std.mem.readInt(u32, &sorted_padded_ops[mapToIndexRaw(hash)], .little) == op_word)
             @enumFromInt(hash)
         else
             null;
@@ -326,12 +329,12 @@ const Keywords = struct {
 
     pub fn hashKw(keyword: [*]const u8, len: u32) u7 {
         comptime assert(BACK_SENTINELS.len >= 1); // Make sure it's safe to go forward a character
-        const a = std.mem.readIntLittle(u16, keyword[0..2]);
+        const a = std.mem.readInt(u16, keyword[0..2], .little);
         comptime assert(FRONT_SENTINELS.len >= 1); // Make sure it's safe to go back to the previous character
-        const b = std.mem.readIntLittle(u16, (if (@inComptime())
+        const b = std.mem.readInt(u16, (if (@inComptime())
             keyword[len - 2 .. len][0..2]
         else
-            keyword - 2 + @as(usize, @intCast(len)))[0..2]);
+            keyword - 2 + @as(usize, @intCast(len)))[0..2], .little);
         return @truncate(((a ^ (len << 14)) *% b) >> 8);
         // return @truncate(((a >> 1) *% (b >> 1) ^ (len << 14)) >> 8);
         // return @truncate((((a >> 1) *% (b >> 1)) >> 8) ^ (len << 6));
@@ -372,7 +375,7 @@ const Keywords = struct {
             else
                 unreachable; // len can't be 0
 
-            // TODO:  In-progress SWAR impl. Could probably be better...?
+            // TODO: In-progress SWAR impl. Could probably be better...?
             // TODO: only works on little-endian
 
             word2 = if (std.math.cast(
@@ -385,7 +388,6 @@ const Keywords = struct {
                 0;
 
             // std.debug.print("\n", .{});
-
             // std.debug.print("\n", .{});
 
             const source_word1 = @as(u64, @bitCast(val[0..8].*));
@@ -484,7 +486,7 @@ fn printx(v: anytype) void {
     std.debug.print("\n", .{});
 }
 
-test "identifier_mask should match alphanumeric characters and underscores" {
+test "swarNonIdentifierMask should match alphanumeric characters and underscores" {
     var c: u8 = 0;
     while (true) {
         const expected: u1 = switch (c) {
@@ -492,6 +494,21 @@ test "identifier_mask should match alphanumeric characters and underscores" {
             else => 0,
         };
         try std.testing.expectEqual(expected, @intCast(swarMovMask(Parser.swarNonIdentifierMask(c))));
+        c +%= 1;
+        if (c == 0) break;
+    }
+}
+
+test "swarControlCharMask should match alphanumeric characters and underscores" {
+    var c: u8 = 0;
+    while (true) {
+        const expected: u1 = switch (c) {
+            0x7F, 0x0...'\t' - 1, '\t' + 1...0x1F => 1,
+            else => 0,
+        };
+        const got: u1 = @intCast(swarMovMask(Parser.swarControlCharMask(c)));
+        // std.debug.print("c: {x}, expected: {}, got: {}\n", .{ c, expected, got });
+        try std.testing.expectEqual(expected, got);
         c +%= 1;
         if (c == 0) break;
     }
@@ -548,7 +565,7 @@ test "mask_for_op_cont should work" {
             0x21, 0x25, 0x2a, 0x2b, 0x2e, 0x2f, 0x3c, 0x3d, 0x3e, 0x3f, 0x5c, 0x7c => 1,
             else => 0,
         };
-        const v = std.mem.readIntLittle(u32, &[4]u8{ c, c, 0, 0 });
+        const v = std.mem.readInt(u32, &[4]u8{ c, c, 0, 0 }, .little);
         const res = Parser.mask_for_op_cont(v) - 1;
         // std.debug.print("0x{x:0>2} {} vs {}\n", .{ c, res, expected });
         try std.testing.expectEqual(expected, @intCast(res));
@@ -560,32 +577,32 @@ test "mask_for_op_cont should work" {
 // test "mask_for_op_cont should work 2" {
 //     std.debug.print("\n", .{});
 //     {
-//         const v = std.mem.readIntLittle(u32, "//.?");
+//         const v = std.mem.readInt(u32, "//.?", .little);
 //         const res = Parser.mask_for_op_cont(v);
 //         std.debug.print("res: {}\n", .{res});
 //     }
 //     {
-//         const v = std.mem.readIntLittle(u32, ".?.?");
+//         const v = std.mem.readInt(u32, ".?.?", .little);
 //         const res = Parser.mask_for_op_cont(v);
 //         std.debug.print("res: {}\n", .{res});
 //     }
 //     {
-//         const v = std.mem.readIntLittle(u32, "&.??");
+//         const v = std.mem.readInt(u32, "&.??", .little);
 //         const res = Parser.mask_for_op_cont(v);
 //         std.debug.print("res: {}\n", .{res});
 //     }
 //     {
-//         const v = std.mem.readIntLittle(u32, "\\\\+=");
+//         const v = std.mem.readInt(u32, "\\\\+=", .little);
 //         const res = Parser.mask_for_op_cont(v);
 //         std.debug.print("res: {}\n", .{res});
 //     }
 //     {
-//         const v = std.mem.readIntLittle(u32, "\\\\.?");
+//         const v = std.mem.readInt(u32, "\\\\.?", .little);
 //         const res = Parser.mask_for_op_cont(v);
 //         std.debug.print("res: {}\n", .{res});
 //     }
 //     {
-//         const v = std.mem.readIntLittle(u32, "|*.?");
+//         const v = std.mem.readInt(u32, "|*.?", .little);
 //         const res = Parser.mask_for_op_cont(v);
 //         std.debug.print("res: {}\n", .{res});
 //     }
@@ -717,6 +734,16 @@ test "swarCTZPlus1" {
         if (i == 0) break;
     }
 }
+
+const HAS_FAST_VECTOR_REVERSE: bool = switch (builtin.cpu.arch) {
+    .powerpc, .powerpc64, .powerpc64le, .powerpcle => std.Target.powerpc.featureSetHas(builtin.cpu.features, .isa_v30_instructions),
+    else => false,
+};
+
+const HAS_FAST_BYTE_SWAP = switch (builtin.cpu.arch) {
+    .mips, .mips64, .mips64el, .mipsel => if (std.Target.mips.featureSetHas(builtin.cpu.features, .mips64r2)) true,
+    else => false,
+};
 
 const SWAR_CTZ_PLUS_1_IMPL: enum { ctz, clz, popc, swar } = switch (builtin.cpu.arch) {
     .aarch64_32, .aarch64_be, .aarch64, .arm, .armeb, .thumb, .thumbeb => if (std.Target.aarch64.featureSetHas(builtin.cpu.features, .v8a) or
@@ -868,6 +895,9 @@ fn swarMovMaskReversed(v: anytype) @TypeOf(v) {
     // + h............................................................... << 63
 
     return (((v & msb_mask) >> (@sizeOf(T) - 1)) *% mult) >> (@bitSizeOf(T) - @sizeOf(T));
+
+    // We could save an instruction by using mulhi.... but is it worth it? I think not
+    // return @as(std.meta.Int(.unsigned, @sizeOf(T)), @truncate((((v & msb_mask)) *% @as(std.meta.Int(.unsigned, @bitSizeOf(T) * 2), (mult << (@sizeOf(T) - 1)))) >> (@bitSizeOf(T))));
 }
 
 test "movemask reversed swar should properly isolate the highest set bits of all bytes in a bitstring" {
@@ -888,6 +918,7 @@ const Parser = struct {
         identifiers_or_numbers: VEC_INT,
         non_unescaped_quotes: VEC_INT,
         whitespace: VEC_INT,
+        non_unescaped_char_literals: VEC_INT,
         // prev_carriage: VEC_INT,
         // op_cont_chars: VEC_INT,
         // non_unescaped_char_literals: VEC_INT,
@@ -921,13 +952,13 @@ const Parser = struct {
         const non_ascii = v >> 8;
         const low_7_bits = non_ascii & mask;
         // printu32(low_7_bits);
-        const not_and_dot = (((v & 0x7FFF) ^ comptime std.mem.readIntLittle(u16, "&.")) + 0x7FFF);
-        const not_bar_star = (((v & 0x7FFF) ^ comptime std.mem.readIntLittle(u16, "|*")) + 0x7FFF);
+        const not_and_dot = (((v & 0x7FFF) ^ comptime std.mem.readInt(u16, "&.", .little)) + 0x7FFF);
+        const not_bar_star = (((v & 0x7FFF) ^ comptime std.mem.readInt(u16, "|*", .little)) + 0x7FFF);
 
         // TODO: figure out how to do this optimization properly??
-        // const dot_question = 0x8000 & ~(((v & 0x7FFF) ^ comptime std.mem.readIntLittle(u16, ".?")) + 0x7FFF);
-        // const backslashes = 0x8000 & ~(((v & 0x7FFF) ^ comptime std.mem.readIntLittle(u16, "\\\\")) + 0x7FFF);
-        // const slashes = 0x8000 & ~(((v & 0x7FFF) ^ comptime std.mem.readIntLittle(u16, "//")) + 0x7FFF);
+        // const dot_question = 0x8000 & ~(((v & 0x7FFF) ^ comptime std.mem.readInt(u16, ".?", .little)) + 0x7FFF);
+        // const backslashes = 0x8000 & ~(((v & 0x7FFF) ^ comptime std.mem.readInt(u16, "\\\\", .little)) + 0x7FFF);
+        // const slashes = 0x8000 & ~(((v & 0x7FFF) ^ comptime std.mem.readInt(u16, "//", .little)) + 0x7FFF);
 
         // printu32(not_and_dot);
         // printu32(not_and_dot);
@@ -1046,13 +1077,23 @@ const Parser = struct {
         return underscores | upper_alpha | lower_alpha | digits;
     }
 
+    fn swarControlCharMaskInverse(v: u64) @TypeOf(v) {
+        const ones: @TypeOf(v) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(v)), 8), u8), @splat(1)));
+        const mask = comptime ones * 0x7F;
+        const low_7_bits = v & mask;
+        const non_del = ~ones - low_7_bits;
+        const non_control_or_space = low_7_bits + comptime ones * (0x80 - 0x21);
+        return (v | (non_del & non_control_or_space));
+    }
+
     fn swarControlCharMask(v: anytype) @TypeOf(v) {
         const ones: @TypeOf(v) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(v)), 8), u8), @splat(1)));
         const mask = comptime ones * 0x7F;
         const low_7_bits = v & mask;
-        const non_del = low_7_bits + ones;
-        const non_control = low_7_bits + comptime ones * (0x80 - 0x20);
-        return v | ~(non_del | non_control);
+        const del = ones + low_7_bits;
+        const ctrl = (comptime ~(ones * (0x80 - 0x20))) - low_7_bits;
+        const non_tabs = (low_7_bits ^ comptime ones * '\t') + mask;
+        return (~v & (del | ctrl) & non_tabs);
     }
 
     fn controlCharMask(v: anytype) if (USE_SWAR) NATIVE_VEC_INT else std.meta.Int(.unsigned, NATIVE_VEC_SIZE) {
@@ -1061,9 +1102,20 @@ const Parser = struct {
             return swarControlCharMask(v);
         }
 
-        const delete_code = ~maskForNonChars(v, "\x7F");
-        const other_controls = maskForCharRange(v, 0, 31);
+        const delete_code = maskForChars(v, "\x7F");
+        const other_controls = maskForCharRange(v, 0, 31) & ~maskForChars(v, "\t");
         return delete_code | other_controls;
+    }
+
+    fn nonControlCharMask(v: anytype) if (USE_SWAR) NATIVE_VEC_INT else std.meta.Int(.unsigned, NATIVE_VEC_SIZE) {
+        if (USE_SWAR) {
+            assert(@TypeOf(v) == NATIVE_VEC_INT);
+            return swarControlCharMaskInverse(v);
+        }
+
+        const delete_code = maskForNonChars(v, "\x7F");
+        const other_controls = ~maskForCharRange(v, 0, 32);
+        return delete_code & other_controls;
     }
 
     fn maskForNonCharsGeneric(v: anytype, comptime str: []const u8, comptime use_swar: bool) if (USE_SWAR) NATIVE_VEC_INT else std.meta.Int(.unsigned, NATIVE_VEC_SIZE) {
@@ -1096,6 +1148,36 @@ const Parser = struct {
         return maskForNonCharsGeneric(v, str, USE_SWAR);
     }
 
+    fn maskForCharsGeneric(v: anytype, comptime str: []const u8, comptime use_swar: bool) if (USE_SWAR) NATIVE_VEC_INT else std.meta.Int(.unsigned, NATIVE_VEC_SIZE) {
+        if (use_swar) {
+            assert(@TypeOf(v) == NATIVE_VEC_INT);
+            const ones: @TypeOf(v) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(v)), 8), u8), @splat(1)));
+            const mask = comptime ones * 0x7F;
+            const low_7_bits = v & mask;
+            var accumulator: @TypeOf(v) = std.math.minInt(@TypeOf(v));
+
+            inline for (str) |c| {
+                assert(c < 0x80);
+                accumulator |= ~mask - (low_7_bits ^ comptime ones * c);
+            }
+
+            return ~v & accumulator;
+        } else {
+            assert(@TypeOf(v) == NATIVE_VEC_CHAR);
+            var accumulator = @as(std.meta.Int(.unsigned, NATIVE_VEC_SIZE), 0);
+            inline for (str) |c| {
+                assert(c < 0x80); // Because this would break the SWAR version, we enforce it here too.
+                // for some reason, a lot of backends (arm+ppc64) like accumulated `|` better than `&`
+                accumulator |= @bitCast(v == @as(NATIVE_VEC_CHAR, @splat(c)));
+            }
+            return accumulator;
+        }
+    }
+
+    fn maskForChars(v: anytype, comptime str: []const u8) if (USE_SWAR) NATIVE_VEC_INT else std.meta.Int(.unsigned, NATIVE_VEC_SIZE) {
+        return maskForCharsGeneric(v, str, USE_SWAR);
+    }
+
     fn maskForCharRange(input_vec: NATIVE_VEC_CHAR, comptime char1: u8, comptime char2: u8) std.meta.Int(.unsigned, NATIVE_VEC_SIZE) {
         const VEC_T = std.meta.Int(.unsigned, NATIVE_VEC_SIZE);
         return @as(VEC_T, @bitCast(@as(NATIVE_VEC_CHAR, @splat(char1)) <= input_vec)) & @as(VEC_T, @bitCast(input_vec <= @as(NATIVE_VEC_CHAR, @splat(char2))));
@@ -1112,14 +1194,17 @@ const Parser = struct {
     };
 
     // On some machines, it is more efficient to use clz over ctz, and vice versa.
-    const DO_MASK_REVERSE = !DO_BIT_REVERSE and USE_SWAR and switch (builtin.cpu.arch.endian()) {
-        .Little => (builtin.target.cpu.arch.isArmOrThumb() or SWAR_CTZ_PLUS_1_IMPL == .clz),
+    const DO_MASK_REVERSE = 0 == 1 and !DO_BIT_REVERSE and USE_SWAR and switch (builtin.cpu.arch.endian()) {
+        .little => (builtin.target.cpu.arch.isArmOrThumb() or SWAR_CTZ_PLUS_1_IMPL == .clz),
         // I think it should usually be faster to emulate ctz rather than clz
-        .Big => SWAR_CTZ_PLUS_1_IMPL == .popc and SWAR_CTZ_PLUS_1_IMPL == .swar,
+        .big => SWAR_CTZ_PLUS_1_IMPL == .popc or SWAR_CTZ_PLUS_1_IMPL == .swar,
     };
 
-    const USE_REVERSED_BITSTRINGS = (DO_BIT_REVERSE or DO_MASK_REVERSE) == (builtin.cpu.arch.endian() == .Little);
+    const USE_REVERSED_BITSTRINGS = (DO_BIT_REVERSE or DO_MASK_REVERSE) == (builtin.cpu.arch.endian() == .little);
     const ASSEMBLE_BITSTRINGS_BACKWARDS = !DO_BIT_REVERSE and USE_REVERSED_BITSTRINGS;
+
+    const DO_CHAR_LITERAL_IN_SIMD = false;
+    const DO_QUOTE_IN_SIMD = !USE_SWAR;
 
     fn reverseIfCheap(b: VEC_INT) VEC_INT {
         return if (DO_BIT_REVERSE) @bitReverse(b) else b;
@@ -1146,7 +1231,7 @@ const Parser = struct {
 
         whitespace            = 128 | @as(u8, 19),
 
-        char_literal          = 128 | @as(u8,  6), // is_quoted
+        char_literal          = 128 | @as(u8,  4), // is_quoted
         // zig fmt: on
     };
 
@@ -1169,7 +1254,9 @@ const Parser = struct {
         const tokens = try gpa.alloc(Token, extended_source_len);
         errdefer gpa.free(tokens);
 
-        const non_newlines_bitstrings = try gpa.alloc(VEC_INT, extended_source_len / VEC_SIZE + (@bitSizeOf(Bitmaps) - @bitSizeOf(VEC_INT)) / VEC_SIZE);
+        // TODO: add dynamic math here based on DO_CHAR_LITERAL_IN_SIMD and DO_QUOTE_IN_SIMD
+        const non_newlines_bitstrings = try gpa.alloc(VEC_INT, extended_source_len / VEC_SIZE + @sizeOf(Bitmaps) - @sizeOf(VEC_INT));
+
         // TODO: make this errdefer and return this data out.
         // We can use this information later to find out what line we are on.
         defer gpa.free(non_newlines_bitstrings);
@@ -1185,17 +1272,17 @@ const Parser = struct {
 
         comptime assert(FRONT_SENTINELS.len == 1 and FRONT_SENTINELS[0] == '\n' and BACK_SENTINELS.len >= 3);
         var cur = prev[@as(u8, @intFromBool(
-            std.mem.readIntSliceNative(u32, prev) == std.mem.readIntSliceNative(u32, "\n\xEF\xBB\xBF"),
+            std.mem.readInt(u32, prev[0..4], comptime builtin.cpu.arch.endian()) == std.mem.readInt(u32, "\n\xEF\xBB\xBF", comptime builtin.cpu.arch.endian()),
         )) * 4 ..];
 
         var bitmap_ptr: []VEC_INT = non_newlines_bitstrings;
         bitmap_ptr.ptr -= 1;
         bitmap_ptr.len += 1;
         var op_type: Tag = .whitespace;
-        var selected_bitmap: []const VEC_INT = bitmap_ptr[@as(u2, @truncate(@intFromEnum(op_type)))..];
+        var selected_bitmap: []const VEC_INT = bitmap_ptr[@as(u3, @truncate(@intFromEnum(op_type)))..];
         var bitmap_index: usize = @intFromPtr(cur.ptr) / VEC_SIZE * VEC_SIZE -% VEC_SIZE;
-        var utf8_checker: if (VALIDATE_UTF8) Utf8Checker else void = if (VALIDATE_UTF8) .{};
-        var prev_escaped: VEC_INT = 0;
+        var utf8_checker = if (VALIDATE_UTF8) Utf8Checker{};
+        var next_is_escaped = if (DO_QUOTE_IN_SIMD or DO_CHAR_LITERAL_IN_SIMD) @as(VEC_INT, 0);
 
         outer: while (true) : (cur = cur[1..]) {
             {
@@ -1209,35 +1296,49 @@ const Parser = struct {
                         bitmap_index +%= VEC_SIZE;
                         const base_ptr = @as([*]align(VEC_SIZE) const u8, @ptrFromInt(bitmap_index));
 
-                        var non_newlines: VEC_INT = 0;
-                        var non_quotes: VEC_INT = 0;
-                        var non_backslashes: VEC_INT = 0;
+                        var ctrls: VEC_INT = 0;
+                        var non_quotes = if (DO_QUOTE_IN_SIMD) @as(VEC_INT, 0);
+                        var non_char_literals = if (DO_CHAR_LITERAL_IN_SIMD) @as(VEC_INT, 0);
+                        var non_backslashes = if (DO_QUOTE_IN_SIMD or DO_CHAR_LITERAL_IN_SIMD) @as(VEC_INT, 0);
                         var non_spaces: VEC_INT = 0;
                         var identifiers_or_numbers: VEC_INT = 0;
-                        var control_chars: VEC_INT = 0;
-                        _ = control_chars;
 
                         inline for (0..comptime VEC_SIZE / NATIVE_VEC_SIZE) |i| {
                             const chunk = blk: {
                                 const slice: *align(NATIVE_VEC_SIZE) const [NATIVE_VEC_SIZE]u8 = @alignCast(base_ptr[i * NATIVE_VEC_SIZE ..][0..NATIVE_VEC_SIZE]);
-                                break :blk if (USE_SWAR) @as(*align(NATIVE_VEC_SIZE) const NATIVE_VEC_INT, @ptrCast(slice)).* else @as(@Vector(NATIVE_VEC_SIZE, u8), slice.*);
-                            };
 
-                            // TODO: do a global byte-reverse if that's efficient on our hardware.
+                                if (USE_SWAR) {
+                                    break :blk std.mem.nativeToLittle(NATIVE_VEC_INT, @as(*align(NATIVE_VEC_SIZE) const NATIVE_VEC_INT, @ptrCast(slice)).*);
+                                } else {
+                                    const vec = @as(@Vector(NATIVE_VEC_SIZE, u8), slice.*);
+                                    break :blk if (comptime builtin.cpu.arch.endian() == .little)
+                                        vec
+                                    else
+                                        @shuffle(u8, vec, undefined, @as(@TypeOf(vec), @splat(NATIVE_VEC_SIZE - 1)) - std.simd.iota(u8, NATIVE_VEC_SIZE));
+                                }
+                            };
 
                             const shift: LOG_VEC_INT = if (ASSEMBLE_BITSTRINGS_BACKWARDS)
                                 @intCast((VEC_SIZE - NATIVE_VEC_SIZE) - NATIVE_VEC_SIZE * i)
                             else
                                 @intCast(NATIVE_VEC_SIZE * i);
 
-                            non_newlines |= movMask(maskForNonChars(chunk, "\n")) << shift;
-                            non_quotes |= movMask(maskForNonChars(chunk, "\"")) << shift;
-                            non_backslashes |= movMask(maskForNonChars(chunk, "\\")) << shift;
-                            non_spaces |= movMask((maskForNonChars(chunk, " \t"))) << shift;
+                            ctrls |= movMask(controlCharMask(chunk)) << shift;
+
+                            if (DO_QUOTE_IN_SIMD)
+                                non_quotes |= movMask(maskForNonChars(chunk, "\"")) << shift;
+
+                            if (DO_CHAR_LITERAL_IN_SIMD)
+                                non_char_literals |= movMask(maskForNonChars(chunk, "\'")) << shift;
+
+                            if (DO_QUOTE_IN_SIMD or DO_CHAR_LITERAL_IN_SIMD)
+                                non_backslashes |= movMask(maskForNonChars(chunk, "\\")) << shift;
+
+                            non_spaces |= movMask((maskForNonChars(chunk, " \t\n"))) << shift;
                             identifiers_or_numbers |= movMask(nonIdentifierMask(chunk)) << shift;
 
                             // TODO: check control characters
-                            // control_chars |= movMask(controlCharMask(chunk)) << shift;
+                            // control_chars |= movMask(swarControlCharMaskInverse(chunk)) << shift;
 
                             // TODO: fix utf8 validator
                             if (VALIDATE_UTF8) {
@@ -1246,39 +1347,107 @@ const Parser = struct {
                             }
                         }
 
-                        const backslashes = ~non_backslashes;
-
-                        // TODO: make a bitreversed implementation of the following code:
-
-                        // ----------------------------------------------------------------------------
-                        // This code is brought to you courtesy of simdjson and simdjzon, both licensed
-                        // under the Apache 2.0 license which is included at the bottom of this file
-
-                        // If there was overflow, pretend the first character isn't a backslash
-                        const backslash: VEC_INT = backslashes & ~prev_escaped;
-                        const follows_escape = (backslash << 1) | prev_escaped;
-
-                        // Get sequences starting on even bits by clearing out the odd series using +
-                        const even_bits: VEC_INT = @bitCast(@as(@Vector(@divExact(VEC_SIZE, 8), u8), @splat(0x55)));
-                        const odd_sequence_starts = backslash & ~even_bits & ~follows_escape;
-                        const x = @addWithOverflow(odd_sequence_starts, backslash);
-                        const invert_mask: VEC_INT = x[0] << 1; // The mask we want to return is the *escaped* bits, not escapes.
-                        prev_escaped = x[1];
-
-                        // Mask every other backslashed character as an escaped character
-                        // Flip the mask for sequences that start on even bits, to correct them
-                        const escaped = (even_bits ^ invert_mask) & follows_escape;
-
-                        // ----------------------------------------------------------------------------
-
-                        // TODO: we should efficiently check against control chars in quotes/comments
                         bitmap_ptr = bitmap_ptr[1..];
-                        bitmap_ptr[0] = reverseIfCheap(non_newlines);
-                        bitmap_ptr[1] = reverseIfCheap(identifiers_or_numbers);
-                        bitmap_ptr[2] = reverseIfCheap((non_quotes & non_newlines) | escaped);
-                        bitmap_ptr[3] = reverseIfCheap(~(non_spaces & non_newlines));
 
+                        if (DO_QUOTE_IN_SIMD or DO_CHAR_LITERAL_IN_SIMD) {
+                            // ----------------------------------------------------------------------------
+                            // This code is brought to you courtesy of simdjson, licensed
+                            // under the Apache 2.0 license which is included at the bottom of this file
+
+                            const ODD_BITS: VEC_INT = @bitCast(@as(@Vector(@divExact(VEC_SIZE, 8), u8), @splat(0xaa)));
+                            const backslash = ~non_backslashes;
+
+                            // |                                | Mask (shows characters instead of 1's) | Depth | Instructions        |
+                            // |--------------------------------|----------------------------------------|-------|---------------------|
+                            // | string                         | `\\n_\\\n___\\\n___\\\\___\\\\__\\\`   |       |                     |
+                            // |                                | `    even   odd    even   odd   odd`   |       |                     |
+                            // | potential_escape               | ` \  \\\    \\\    \\\\   \\\\  \\\`   | 1     | 1 (backslash & ~first_is_escaped)
+                            // | escape_and_terminal_code       | ` \n \ \n   \ \n   \ \    \ \   \ \`   | 5     | 5 (next_escape_and_terminal_code())
+                            // | escaped                        | `\    \ n    \ n    \ \    \ \   \ ` X | 6     | 7 (escape_and_terminal_code ^ (potential_escape | first_is_escaped))
+                            // | escape                         | `    \ \    \ \    \ \    \ \   \ \`   | 6     | 8 (escape_and_terminal_code & backslash)
+                            // | first_is_escaped               | `\                                 `   | 7 (*) | 9 (escape >> 63) ()
+                            //                                                                               (*) this is not needed until the next iteration
+                            const potential_escape = backslash & ~next_is_escaped;
+
+                            // If we were to just shift and mask out any odd bits, we'd actually get a *half* right answer:
+                            // any even-aligned backslash runs would be correct! Odd-aligned backslash runs would be
+                            // inverted (\\\ would be 010 instead of 101).
+                            //
+                            // ```
+                            // string:              | ____\\\\_\\\\_____ |
+                            // maybe_escaped | ODD  |     \ \   \ \      |
+                            //               even-aligned ^^^  ^^^^ odd-aligned
+                            // ```
+                            //
+                            // Taking that into account, our basic strategy is:
+                            //
+                            // 1. Use subtraction to produce a mask with 1's for even-aligned runs and 0's for
+                            //    odd-aligned runs.
+                            // 2. XOR all odd bits, which masks out the odd bits in even-aligned runs, and brings IN the
+                            //    odd bits in odd-aligned runs.
+                            // 3. & with backslash to clean up any stray bits.
+                            // runs are set to 0, and then XORing with "odd":
+                            //
+                            // |                                | Mask (shows characters instead of 1's) | Instructions        |
+                            // |--------------------------------|----------------------------------------|---------------------|
+                            // | string                         | `\\n_\\\n___\\\n___\\\\___\\\\__\\\`   |
+                            // |                                | `    even   odd    even   odd   odd`   |
+                            // | maybe_escaped                  | `  n  \\n    \\n    \\\_   \\\_  \\` X | 1 (potential_escape << 1)
+                            // | maybe_escaped_and_odd          | ` \n_ \\n _ \\\n_ _ \\\__ _\\\_ \\\`   | 1 (maybe_escaped | odd)
+                            // | even_series_codes_and_odd      | `  n_\\\  _    n_ _\\\\ _     _    `   | 1 (maybe_escaped_and_odd - potential_escape)
+                            // | escape_and_terminal_code       | ` \n \ \n   \ \n   \ \    \ \   \ \`   | 1 (^ odd)
+                            //
+
+                            // Escaped characters are characters following an escape.
+                            const maybe_escaped = potential_escape << 1;
+
+                            // To distinguish odd from even escape sequences, therefore, we turn on any *starting*
+                            // escapes that are on an odd byte. (We actually bring in all odd bits, for speed.)
+                            // - Odd runs of backslashes are 0000, and the code at the end ("n" in \n or \\n) is 1.
+                            // - Odd runs of backslashes are 1111, and the code at the end ("n" in \n or \\n) is 0.
+                            // - All other odd bytes are 1, and even bytes are 0.
+                            const maybe_escaped_and_odd_bits = maybe_escaped | ODD_BITS;
+                            const even_series_codes_and_odd_bits = maybe_escaped_and_odd_bits -% potential_escape;
+
+                            // Now we flip all odd bytes back with xor. This:
+                            // - Makes odd runs of backslashes go from 0000 to 1010
+                            // - Makes even runs of backslashes go from 1111 to 1010
+                            // - Sets actually-escaped codes to 1 (the n in \n and \\n: \n = 11, \\n = 100)
+                            // - Resets all other bytes to 0
+                            const escape_and_terminal_code = even_series_codes_and_odd_bits ^ ODD_BITS;
+
+                            const escaped = escape_and_terminal_code ^ (backslash | next_is_escaped);
+                            const escape = escape_and_terminal_code & backslash;
+                            next_is_escaped = escape >> 63;
+
+                            if (DO_QUOTE_IN_SIMD)
+                                bitmap_ptr[2] = reverseIfCheap((non_quotes & ~ctrls) | escaped);
+
+                            if (DO_CHAR_LITERAL_IN_SIMD)
+                                bitmap_ptr[4] = reverseIfCheap((non_char_literals & ~ctrls) | escaped);
+                            // ----------------------------------------------------------------------------
+                        }
+
+                        bitmap_ptr[0] = reverseIfCheap(~ctrls);
+                        bitmap_ptr[1] = reverseIfCheap(identifiers_or_numbers);
+                        bitmap_ptr[3] = reverseIfCheap(~non_spaces);
                         selected_bitmap = selected_bitmap[1..];
+
+                        // TODO: shift the quotes bitstring by 1 to increase the length automatically
+
+                        // for (base_ptr[0..VEC_SIZE]) |c| {
+                        //     switch (c) {
+                        //         '\n' => std.debug.print("$", .{}),
+                        //         else => std.debug.print("{c}", .{c}),
+                        //     }
+                        // }
+                        // std.debug.print("\n", .{});
+                        // std.debug.print("\n{b:0>64} | ctrls\n", .{@bitReverse(ctrls)});
+                        // std.debug.print("{b:0>64} | spaces\n", .{@bitReverse(~non_spaces)});
+                        // std.debug.print("{b:0>64} | non_unescaped_quotes\n", .{@bitReverse(bitmap_ptr[2])});
+                        // std.debug.print("{b:0>64} | selected_bitmap[0]\n", .{@bitReverse(selected_bitmap[0])});
+
+                        // std.debug.print("\n", .{});
                     }
 
                     const cur_misalignment: LOG_VEC_INT = @truncate(@intFromPtr(cur.ptr));
@@ -1303,15 +1472,15 @@ const Parser = struct {
             }
 
             comptime assert(BACK_SENTINELS.len - 1 > std.mem.indexOf(u8, BACK_SENTINELS, "\x00").?); // there should be at least another character
-            comptime assert(BACK_SENTINELS[BACK_SENTINELS.len - 1] == '\n'); // eof reads the non_newlines bitstring, therefore we need a newline at the end
+            comptime assert(BACK_SENTINELS[BACK_SENTINELS.len - 1] == ' '); // eof reads the non_newlines bitstring, therefore we need a newline at the end
             if (op_type == .eof) break :outer;
 
             // TODO: this was originally designed to be very efficient, now... not so much.
             // We could try to optimize this again.
-            {
-                const is_quoted: u1 = @truncate((@intFromPtr(selected_bitmap.ptr) / 8) ^ (@intFromPtr(bitmap_ptr.ptr) / 8) ^ 1);
-                cur = cur[is_quoted..];
-            }
+            // {
+            //     const is_quoted: u1 = @truncate((@intFromPtr(selected_bitmap.ptr) / 8) ^ (@intFromPtr(bitmap_ptr.ptr) / 8) ^ 1);
+            //     cur = cur[is_quoted..];
+            // }
 
             while (true) {
                 var len: u32 = @intCast(@intFromPtr(cur.ptr) - @intFromPtr(prev.ptr));
@@ -1325,6 +1494,14 @@ const Parser = struct {
                         len += is_space;
                     },
                     else => {},
+                }
+
+                if ((DO_CHAR_LITERAL_IN_SIMD and prev[0] == '\'') or
+                    (DO_QUOTE_IN_SIMD and prev[@intFromBool(op_type == .string_identifier)] == '"'))
+                {
+                    const is_quote = @intFromBool(cur[0] == if (DO_CHAR_LITERAL_IN_SIMD and DO_QUOTE_IN_SIMD) prev[@intFromBool(op_type == .string_identifier)] else if (DO_CHAR_LITERAL_IN_SIMD) '\'' else '"');
+                    cur = cur[is_quote..];
+                    len += is_quote;
                 }
 
                 advance_blk: {
@@ -1376,29 +1553,16 @@ const Parser = struct {
                         '"' => .string_identifier,
                         else => return error.MissingQuoteOrLetterAfterAtSymbol,
                     };
-                    selected_bitmap = bitmap_ptr[@as(u2, @truncate(@intFromEnum(op_type)))..];
-                } else if (cur[0] == '\'') {
-                    while (true) {
-                        cur = cur[1..];
-                        comptime assert(std.mem.indexOfAny(u8, BACK_SENTINELS, "\n") != null);
-                        if (cur[0] == '\'' or cur[0] == '\n') break;
-                        cur = cur[@intFromBool(cur[0] == '\\')..];
-                    }
 
-                    if (cur[0] != '\'') return error.UnterminatedCharacterLiteral;
-                    cur = cur[1..];
-                    const char_literal_len: u32 = @intCast(@intFromPtr(cur.ptr) - @intFromPtr(prev.ptr));
-                    if (char_literal_len > "'\\u{10FFFF}'".len) return error.CharLiteralTooLong;
-                    op_type = .char_literal;
-                    continue;
+                    selected_bitmap = bitmap_ptr[@as(u3, @truncate(@intFromEnum(op_type)))..];
                 } else if (Operators.isSingleCharOp(cur[0])) {
-                    selected_bitmap = bitmap_ptr[@as(u2, @truncate(@intFromEnum(BitmapKind.whitespace)))..];
+                    selected_bitmap = bitmap_ptr[@as(u3, @truncate(@intFromEnum(BitmapKind.whitespace)))..];
                     op_type = Operators.hashOp(Operators.getOpWord(cur.ptr, 1));
                     // cur = cur[@intFromBool(cur[0] == ' ')..];
                 } else if (Operators.isMultiCharBeginning(cur[0])) {
                     var op_len: u32 = 1;
                     if (impl == 1) {
-                        // if (mask_for_op_cont(std.mem.readIntLittle(u32, cur[0..4]))) |op_data| {
+                        // if (mask_for_op_cont(std.mem.readInt(u32, cur[0..4], .little))) |op_data| {
                         //     op_type = op_data;
                         // } else return error.ParseError;
 
@@ -1429,7 +1593,7 @@ const Parser = struct {
 
                         /////////////////////////////////////////////////////////////
 
-                        // op_len = mask_for_op_cont(std.mem.readIntLittle(u32, cur[0..4]));
+                        // op_len = mask_for_op_cont(std.mem.readInt(u32, cur[0..4], .little));
                         // if (op_len == 0) return error.ParseError;
                         // op_type = Operators.hashOp(Operators.getOpWord(prev.ptr, op_len));
                         // cur = cur[op_len..];
@@ -1442,9 +1606,9 @@ const Parser = struct {
                         // }
 
                         // std.debug.print("\n{s}\n", .{cur[0..4]});
-                        // printu32(@bitReverse(std.mem.readIntLittle(u32, cur[0..4])));
-                        // printu32(@bitReverse(std.mem.readIntLittle(u32, cur[0..4]) >> 8));
-                        op_len = mask_for_op_cont(std.mem.readIntLittle(u32, cur[0..4]));
+                        // printu32(@bitReverse(std.mem.readInt(u32, cur[0..4], .little)));
+                        // printu32(@bitReverse(std.mem.readInt(u32, cur[0..4], .little) >> 8));
+                        op_len = mask_for_op_cont(std.mem.readInt(u32, cur[0..4], .little));
                         const op_word4 = Operators.getOpWord(cur.ptr, 4);
                         const hash4 = Operators.rawHash(op_word4);
                         const op_word3 = Operators.getOpWord(cur.ptr, 3);
@@ -1454,24 +1618,26 @@ const Parser = struct {
                         const op_word1 = Operators.getOpWord(cur.ptr, 1);
                         const hash1 = Operators.rawHash(op_word1);
                         assert(op_len <= 4);
-                        if (op_len == 4 and std.mem.readIntLittle(u32, &Operators.sorted_padded_ops[Operators.mapToIndexRaw(hash4)]) == op_word4) {
+                        if (op_len == 4 and std.mem.readInt(u32, &Operators.sorted_padded_ops[Operators.mapToIndexRaw(hash4)], .little) == op_word4) {
                             op_type = @enumFromInt(hash4);
                             cur = cur[4..];
-                        } else if (op_len >= 3 and std.mem.readIntLittle(u32, &Operators.sorted_padded_ops[Operators.mapToIndexRaw(hash3)]) == op_word3) {
+                        } else if (op_len >= 3 and std.mem.readInt(u32, &Operators.sorted_padded_ops[Operators.mapToIndexRaw(hash3)], .little) == op_word3) {
                             op_type = @enumFromInt(hash3);
                             if (op_type == .@"///" or op_type == .@"//!") {
-                                selected_bitmap = bitmap_ptr[@as(u2, @truncate(@intFromEnum(BitmapKind.unknown)))..];
+                                selected_bitmap = bitmap_ptr[@as(u3, @truncate(@intFromEnum(BitmapKind.unknown)))..];
                                 break;
                             }
                             cur = cur[3..];
-                        } else if (op_len >= 2 and std.mem.readIntLittle(u32, &Operators.sorted_padded_ops[Operators.mapToIndexRaw(hash2)]) == op_word2) {
+                        } else if (op_len >= 2 and std.mem.readInt(u32, &Operators.sorted_padded_ops[Operators.mapToIndexRaw(hash2)], .little) == op_word2) {
                             op_type = @enumFromInt(hash2);
                             if (op_type == .@"//" or op_type == .@"\\\\") {
-                                selected_bitmap = bitmap_ptr[@as(u2, @truncate(@intFromEnum(BitmapKind.unknown)))..];
+                                selected_bitmap = bitmap_ptr[@as(u3, @truncate(@intFromEnum(BitmapKind.unknown)))..];
                                 break;
                             }
                             cur = cur[2..];
                         } else if (cur[0] == '\\') {
+                            // std.debug.print("{s}", .{cur});
+
                             return error.IncompleteSingleLineStringOpener;
                         } else {
                             op_type = @enumFromInt(hash1);
@@ -1503,33 +1669,50 @@ const Parser = struct {
 
                         switch (op_type) {
                             .@"///", .@"//!", .@"//", .@"\\\\" => {
-                                selected_bitmap = bitmap_ptr[@as(u2, @truncate(@intFromEnum(BitmapKind.unknown)))..];
+                                selected_bitmap = bitmap_ptr[@as(u3, @truncate(@intFromEnum(BitmapKind.unknown)))..];
                                 break;
                             },
                             else => {},
                         }
                     }
 
-                    // selected_bitmap = bitmap_ptr[@as(u2, @truncate(@intFromEnum(BitmapKind.whitespace)))..];
+                    // selected_bitmap = bitmap_ptr[@as(u3, @truncate(@intFromEnum(BitmapKind.whitespace)))..];
                     // break;
                     cur = cur[@intFromBool(cur[0] == ' ')..];
                     continue;
                 } else if (cur[0] == '\r') {
                     if (cur[1] != '\n') return error.UnpairedCarriageReturn;
                     op_type = .whitespace;
-                    selected_bitmap = bitmap_ptr[@as(u2, @truncate(@intFromEnum(op_type)))..];
+                    selected_bitmap = bitmap_ptr[@as(u3, @truncate(@intFromEnum(op_type)))..];
                 } else {
                     op_type = switch (cur[0]) {
                         'a'...'z', 'A'...'Z', '_' => .identifier,
                         '0'...'9' => .number,
+                        '\'' => .char_literal,
                         '"' => .string,
-                        // '\'' => .char_literal,
                         ' ', '\t', '\n' => .whitespace,
                         0 => .eof,
-                        else => return error.InvalidCharacter,
+                        else => {
+                            std.debug.print("{} {c}\n", .{ cur[0], cur[0] });
+                            return error.InvalidCharacter;
+                        },
                     };
 
-                    selected_bitmap = bitmap_ptr[@as(u2, @truncate(@intFromEnum(op_type)))..];
+                    selected_bitmap = bitmap_ptr[@as(u3, @truncate(@intFromEnum(op_type)))..];
+                }
+
+                if ((!DO_CHAR_LITERAL_IN_SIMD and cur[0] == '\'') or (!DO_QUOTE_IN_SIMD and cur[0] == '"')) {
+                    const chr = if (!DO_CHAR_LITERAL_IN_SIMD and !DO_QUOTE_IN_SIMD) cur[0] else if (!DO_CHAR_LITERAL_IN_SIMD) '\'' else '"';
+
+                    while (true) {
+                        cur = cur[1..];
+                        comptime assert(std.mem.indexOfAny(u8, BACK_SENTINELS, "\n") != null);
+                        if (cur[0] == chr or cur[0] == '\n') break;
+                        cur = cur[@intFromBool(cur[0] == '\\')..];
+                    }
+
+                    cur = cur[1..];
+                    continue;
                 }
 
                 // cur = cur[1..];
@@ -1541,7 +1724,7 @@ const Parser = struct {
                 // Haven't looked, but maybe it's just putting the branches in a more desirable order?
                 // We really need automatic profile-guided optimization in Zig so we can be certain.
 
-                // if (selected_bitmap == &bitmap_ptr.*[@as(u2, @truncate(@intFromEnum(BitmapKind.whitespace)))] and switch (cur[0]) {
+                // if (selected_bitmap == &bitmap_ptr.*[@as(u3, @truncate(@intFromEnum(BitmapKind.whitespace)))] and switch (cur[0]) {
                 //     ' ', '\t', '\r', '\n' => false,
                 //     else => true,
                 // }) continue;
@@ -1751,6 +1934,7 @@ pub fn main() !void {
     _ = elapsedNanos4;
 }
 
+// TODO: make the utf8 validator check against 0x85, 0x2028, 0x2029
 // ---------------------------------------------------------------
 //
 // The code below this point is licensed under the Apache License.
