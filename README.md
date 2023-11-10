@@ -112,7 +112,7 @@ That's ~3.00x faster! **Currently the utf8 validator is turned off! I did a lot 
 
 **Currently the utf8 validator is turned off! I did a lot of performance optimization the past few days and did not finish porting my changes over yet.**
 
-|  | run-time (milliseconds) | throughput (gigabytes per second) |throughput (million lines of code per second) |
+|  | run-time (milliseconds) | throughput (megabytes per second) |throughput (million lines of code per second) |
 |:-:|:-:|:-:|:-:|
 | read files (baseline) | 366.666ms |  161.35 MB/s | 3.54M loc/s |
 | original | 2.18s  | 27.13 MB/s | 0.60M loc/s |
