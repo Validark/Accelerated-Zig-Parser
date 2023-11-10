@@ -74,7 +74,7 @@ fn readFileIntoAlignedBuffer(allocator: Allocator, file: std.fs.File, comptime a
     return buffer[0 .. FRONT_SENTINELS.len + bytes_to_allocate + INDEX_OF_FIRST_0_SENTINEL :0];
 }
 
-fn readFiles(gpa: Allocator) !std.ArrayListUnmanaged([:0]const u8) {
+fn readFiles(gpa: Allocator) !std.ArrayListUnmanaged([:0]align(VEC_SIZE) const u8) {
     const directory = switch (INFIX_TEST) {
         true => "./src/beep",
         false => "./src/files_to_parse",
@@ -88,7 +88,7 @@ fn readFiles(gpa: Allocator) !std.ArrayListUnmanaged([:0]const u8) {
     var num_files: usize = 0;
     var num_bytes: usize = 0;
 
-    var sources: std.ArrayListUnmanaged([:0]const u8) = .{};
+    var sources: std.ArrayListUnmanaged([:0]align(VEC_SIZE) const u8) = .{};
     {
         const t1 = std.time.nanoTimestamp();
         var walker = try parent_dir.walk(gpa); // 12-14 ms just walking the tree
@@ -1118,6 +1118,11 @@ const Parser = struct {
         return delete_code & other_controls;
     }
 
+    fn hasZeroByte(v: anytype) @TypeOf(v) {
+        const ones: @TypeOf(v) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(v)), 8), u8), @splat(1)));
+        return (v -% ones) & ~v & (comptime 0x80 * ones);
+    }
+
     fn maskForNonCharsGeneric(v: anytype, comptime str: []const u8, comptime use_swar: bool) if (USE_SWAR) NATIVE_VEC_INT else std.meta.Int(.unsigned, NATIVE_VEC_SIZE) {
         if (use_swar) {
             assert(@TypeOf(v) == NATIVE_VEC_INT);
@@ -1246,7 +1251,7 @@ const Parser = struct {
     // TODO: audit usages of u32's to make sure it's impossible to ever overflow.
     // TODO: make it so quotes and character literals cannot have newlines in them?
     // TODO: audit the utf8 validator to make sure we clear the state properly when not using it
-    pub fn tokenize(gpa: Allocator, source: [:0]const u8, comptime impl: u1) ![]Token {
+    pub fn tokenize(gpa: Allocator, source: [:0]align(VEC_SIZE) const u8, comptime impl: u1) ![]Token {
         const FOLD_COMMENTS_INTO_ADJACENT_NODES = false;
         const end_ptr = &source.ptr[source.len];
         const extended_source_len = std.mem.alignForward(usize, source.len + EXTENDED_BACK_SENTINELS_LEN, VEC_SIZE);
@@ -1268,7 +1273,7 @@ const Parser = struct {
         // var extra_lens = try gpa.alloc(u32, source.len / 256);
         // errdefer gpa.free(extra_lens);
 
-        var prev = extended_source;
+        var prev: []const u8 = extended_source;
 
         comptime assert(FRONT_SENTINELS.len == 1 and FRONT_SENTINELS[0] == '\n' and BACK_SENTINELS.len >= 3);
         var cur = prev[@as(u8, @intFromBool(
@@ -1323,8 +1328,6 @@ const Parser = struct {
                             else
                                 @intCast(NATIVE_VEC_SIZE * i);
 
-                            ctrls |= movMask(controlCharMask(chunk)) << shift;
-
                             if (DO_QUOTE_IN_SIMD)
                                 non_quotes |= movMask(maskForNonChars(chunk, "\"")) << shift;
 
@@ -1334,6 +1337,7 @@ const Parser = struct {
                             if (DO_QUOTE_IN_SIMD or DO_CHAR_LITERAL_IN_SIMD)
                                 non_backslashes |= movMask(maskForNonChars(chunk, "\\")) << shift;
 
+                            ctrls |= movMask(controlCharMask(chunk)) << shift;
                             non_spaces |= movMask((maskForNonChars(chunk, " \t\n"))) << shift;
                             identifiers_or_numbers |= movMask(nonIdentifierMask(chunk)) << shift;
 
