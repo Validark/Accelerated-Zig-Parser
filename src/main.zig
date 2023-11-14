@@ -10,7 +10,7 @@ const INFIX_TEST           = false;
 // zig fmt: on
 
 // TODO: 64-bit popcounts could probably be refactored to be nicer on 32-bit machines.
-
+// TODO: the quote algo only works for little-endian bit orders
 // TODO: mask_for_op_cont should probably be renamed.
 // I need to decide what to do with the handwritten optimizations there.
 // I think the function could use a more thoughtful design, or I could potentially write a tool
@@ -49,7 +49,8 @@ const NATIVE_VEC_CHAR = @Vector(NATIVE_VEC_SIZE, u8);
 const NATIVE_VEC_COND = @Vector(NATIVE_VEC_SIZE, bool);
 
 const FRONT_SENTINELS = "\n";
-const BACK_SENTINELS = "\n" ++ "\x00" ** 13 ++ " ";
+// const BACK_SENTINELS_OLD = "\n" ++ "\x00" ** 13 ++ " ";
+const BACK_SENTINELS = "\n" ++ "\x00" ** 61 ++ " ";
 const INDEX_OF_FIRST_0_SENTINEL = std.mem.indexOfScalar(u8, BACK_SENTINELS, 0).?;
 const EXTENDED_BACK_SENTINELS_LEN = BACK_SENTINELS.len - INDEX_OF_FIRST_0_SENTINEL;
 
@@ -268,6 +269,8 @@ const Operators = struct {
 };
 
 const Keywords = struct {
+    // We could halve the number of cache lines by using two-byte slices into a dense superstring:
+    // "addrspacerrdeferrorelsenumswitchusingnamespaceunreachablepackedforeturnunionwhilecontinueconstructcomptimevolatileifnpubreakawaitestryasyncatchlinksectionosuspendanytypeanyframeandallowzeropaquexporthreadlocallconvaresumexternoinlinealignoaliasm"
     const unpadded_kws = [_][]const u8{ "addrspace", "align", "allowzero", "and", "anyframe", "anytype", "asm", "async", "await", "break", "callconv", "catch", "comptime", "const", "continue", "defer", "else", "enum", "errdefer", "error", "export", "extern", "fn", "for", "if", "inline", "noalias", "noinline", "nosuspend", "opaque", "or", "orelse", "packed", "pub", "resume", "return", "linksection", "struct", "suspend", "switch", "test", "threadlocal", "try", "union", "unreachable", "usingnamespace", "var", "volatile", "while" };
 
     const masks = blk: {
@@ -363,6 +366,7 @@ const Keywords = struct {
 
         const hash = mapToIndex(hashKw(kw, len));
         const val: [PADDING_RIGHT]u8 = sorted_padded_kws[hash];
+        const hash_inverse = ~hash;
         const val_len = val[PADDING_RIGHT - 1]; // [min_kw_len, max_kw_len]
 
         if (USE_SWAR) {
@@ -397,7 +401,7 @@ const Keywords = struct {
                 // Dear reader: We can't move this higher because this might produce an invalid tag.
                 // Our hash might map to a padding value in the buffer, and not be a real keyword.
                 // We have to let the compiler hoist this for us.
-                return @enumFromInt(~hash);
+                return @enumFromInt(hash_inverse);
             } else {
                 // std.debug.print("kw: {s}\n", .{kw[0..len]});
                 // std.debug.print("vl: {s}\n", .{val});
@@ -421,7 +425,7 @@ const Keywords = struct {
                 // Dear reader: We can't move this higher because this might produce an invalid tag.
                 // Our hash might map to a padding value in the buffer, and not be a real keyword.
                 // We have to let the compiler hoist this for us.
-                return @enumFromInt(~hash);
+                return @enumFromInt(hash_inverse);
             } else {
                 return null;
             }
@@ -1209,7 +1213,7 @@ const Parser = struct {
     const ASSEMBLE_BITSTRINGS_BACKWARDS = !DO_BIT_REVERSE and USE_REVERSED_BITSTRINGS;
 
     const DO_CHAR_LITERAL_IN_SIMD = false;
-    const DO_QUOTE_IN_SIMD = !USE_SWAR;
+    const DO_QUOTE_IN_SIMD = false;
 
     fn reverseIfCheap(b: VEC_INT) VEC_INT {
         return if (DO_BIT_REVERSE) @bitReverse(b) else b;
@@ -1422,7 +1426,7 @@ const Parser = struct {
 
                             const escaped = escape_and_terminal_code ^ (backslash | next_is_escaped);
                             const escape = escape_and_terminal_code & backslash;
-                            next_is_escaped = escape >> 63;
+                            next_is_escaped = escape >> (VEC_SIZE - 1);
 
                             if (DO_QUOTE_IN_SIMD)
                                 bitmap_ptr[2] = reverseIfCheap((non_quotes & ~ctrls) | escaped);
@@ -1697,7 +1701,7 @@ const Parser = struct {
                         ' ', '\t', '\n' => .whitespace,
                         0 => .eof,
                         else => {
-                            std.debug.print("{} {c}\n", .{ cur[0], cur[0] });
+                            // std.debug.print("{} {c}\n", .{ cur[0], cur[0] });
                             return error.InvalidCharacter;
                         },
                     };
@@ -1706,14 +1710,120 @@ const Parser = struct {
                 }
 
                 if ((!DO_CHAR_LITERAL_IN_SIMD and cur[0] == '\'') or (!DO_QUOTE_IN_SIMD and cur[0] == '"')) {
+                    const ON_DEMAND_IMPL: u2 = 1;
                     const chr = if (!DO_CHAR_LITERAL_IN_SIMD and !DO_QUOTE_IN_SIMD) cur[0] else if (!DO_CHAR_LITERAL_IN_SIMD) '\'' else '"';
+                    switch (ON_DEMAND_IMPL) {
+                        0 => {
+                            while (true) {
+                                cur = cur[1..];
+                                comptime assert(std.mem.indexOfAny(u8, BACK_SENTINELS, "\n") != null);
+                                if (cur[0] == chr or cur[0] == '\n') break;
+                                cur = cur[@intFromBool(cur[0] == '\\')..];
+                            }
+                        },
+                        1 => {
+                            cur = cur[1..];
 
-                    while (true) {
-                        cur = cur[1..];
-                        comptime assert(std.mem.indexOfAny(u8, BACK_SENTINELS, "\n") != null);
-                        if (cur[0] == chr or cur[0] == '\n') break;
-                        cur = cur[@intFromBool(cur[0] == '\\')..];
+                            const VEC_SIZE_MINI = 64;
+                            const VEC_INT_MINI = std.meta.Int(.unsigned, VEC_SIZE_MINI);
+                            const VEC_MINI = @Vector(VEC_SIZE_MINI, u8);
+
+                            var next_is_escaped_on_demand: VEC_INT_MINI = 0;
+
+                            while (true) {
+                                const input_vec = cur[0..VEC_SIZE_MINI].*;
+                                const non_quotes: VEC_INT_MINI = @bitCast(@as(VEC_MINI, @splat(chr)) != @as(VEC_MINI, input_vec));
+                                const backslash: VEC_INT_MINI = @bitCast(@as(VEC_MINI, @splat('\\')) == @as(VEC_MINI, input_vec));
+                                const non_tabs: VEC_INT_MINI = @bitCast(@as(VEC_MINI, @splat('\t')) != @as(VEC_MINI, input_vec));
+                                const del: VEC_INT_MINI = @bitCast(@as(VEC_MINI, @splat(0x7F)) == @as(VEC_MINI, input_vec));
+                                const ctrls: VEC_INT_MINI = (@as(VEC_INT_MINI, @bitCast(input_vec < @as(VEC_MINI, @splat(' ')))) | del) & non_tabs;
+
+                                // ----------------------------------------------------------------------------
+                                // This code is brought to you courtesy of simdjson, licensed
+                                // under the Apache 2.0 license which is included at the bottom of this file
+                                const ODD_BITS: VEC_INT_MINI = @bitCast(@as(@Vector(@divExact(VEC_SIZE_MINI, 8), u8), @splat(0xaa)));
+
+                                // |                                | Mask (shows characters instead of 1's) | Depth | Instructions        |
+                                // |--------------------------------|----------------------------------------|-------|---------------------|
+                                // | string                         | `\\n_\\\n___\\\n___\\\\___\\\\__\\\`   |       |                     |
+                                // |                                | `    even   odd    even   odd   odd`   |       |                     |
+                                // | potential_escape               | ` \  \\\    \\\    \\\\   \\\\  \\\`   | 1     | 1 (backslash & ~first_is_escaped)
+                                // | escape_and_terminal_code       | ` \n \ \n   \ \n   \ \    \ \   \ \`   | 5     | 5 (next_escape_and_terminal_code())
+                                // | escaped                        | `\    \ n    \ n    \ \    \ \   \ ` X | 6     | 7 (escape_and_terminal_code ^ (potential_escape | first_is_escaped))
+                                // | escape                         | `    \ \    \ \    \ \    \ \   \ \`   | 6     | 8 (escape_and_terminal_code & backslash)
+                                // | first_is_escaped               | `\                                 `   | 7 (*) | 9 (escape >> 63) ()
+                                //                                                                               (*) this is not needed until the next iteration
+                                const potential_escape = backslash & ~next_is_escaped_on_demand;
+
+                                // If we were to just shift and mask out any odd bits, we'd actually get a *half* right answer:
+                                // any even-aligned backslash runs would be correct! Odd-aligned backslash runs would be
+                                // inverted (\\\ would be 010 instead of 101).
+                                //
+                                // ```
+                                // string:              | ____\\\\_\\\\_____ |
+                                // maybe_escaped | ODD  |     \ \   \ \      |
+                                //               even-aligned ^^^  ^^^^ odd-aligned
+                                // ```
+                                //
+                                // Taking that into account, our basic strategy is:
+                                //
+                                // 1. Use subtraction to produce a mask with 1's for even-aligned runs and 0's for
+                                //    odd-aligned runs.
+                                // 2. XOR all odd bits, which masks out the odd bits in even-aligned runs, and brings IN the
+                                //    odd bits in odd-aligned runs.
+                                // 3. & with backslash to clean up any stray bits.
+                                // runs are set to 0, and then XORing with "odd":
+                                //
+                                // |                                | Mask (shows characters instead of 1's) | Instructions        |
+                                // |--------------------------------|----------------------------------------|---------------------|
+                                // | string                         | `\\n_\\\n___\\\n___\\\\___\\\\__\\\`   |
+                                // |                                | `    even   odd    even   odd   odd`   |
+                                // | maybe_escaped                  | `  n  \\n    \\n    \\\_   \\\_  \\` X | 1 (potential_escape << 1)
+                                // | maybe_escaped_and_odd          | ` \n_ \\n _ \\\n_ _ \\\__ _\\\_ \\\`   | 1 (maybe_escaped | odd)
+                                // | even_series_codes_and_odd      | `  n_\\\  _    n_ _\\\\ _     _    `   | 1 (maybe_escaped_and_odd - potential_escape)
+                                // | escape_and_terminal_code       | ` \n \ \n   \ \n   \ \    \ \   \ \`   | 1 (^ odd)
+                                //
+
+                                // Escaped characters are characters following an escape.
+                                const maybe_escaped = potential_escape << 1;
+
+                                // To distinguish odd from even escape sequences, therefore, we turn on any *starting*
+                                // escapes that are on an odd byte. (We actually bring in all odd bits, for speed.)
+                                // - Odd runs of backslashes are 0000, and the code at the end ("n" in \n or \\n) is 1.
+                                // - Odd runs of backslashes are 1111, and the code at the end ("n" in \n or \\n) is 0.
+                                // - All other odd bytes are 1, and even bytes are 0.
+                                const maybe_escaped_and_odd_bits = maybe_escaped | ODD_BITS;
+                                const even_series_codes_and_odd_bits = maybe_escaped_and_odd_bits -% potential_escape;
+
+                                // Now we flip all odd bytes back with xor. This:
+                                // - Makes odd runs of backslashes go from 0000 to 1010
+                                // - Makes even runs of backslashes go from 1111 to 1010
+                                // - Sets actually-escaped codes to 1 (the n in \n and \\n: \n = 11, \\n = 100)
+                                // - Resets all other bytes to 0
+                                const escape_and_terminal_code = even_series_codes_and_odd_bits ^ ODD_BITS;
+
+                                const escaped = escape_and_terminal_code ^ (backslash | next_is_escaped_on_demand);
+                                const escape = escape_and_terminal_code & backslash;
+                                next_is_escaped_on_demand = escape >> (VEC_SIZE_MINI - 1);
+
+                                const non_unescaped_quotes = ~((non_quotes & ~ctrls) | escaped);
+                                // for (cur[0..VEC_SIZE_MINI]) |c| {
+                                //     switch (c) {
+                                //         '\n' => std.debug.print("$", .{}),
+                                //         else => std.debug.print("{c}", .{c}),
+                                //     }
+                                // }
+                                // std.debug.print("\n{b:0>64}\n{b:0>64}\n", .{ @bitReverse(non_quotes), @bitReverse(escaped) });
+                                // std.debug.print("{b:0>64} {}\n\n", .{ @bitReverse(non_unescaped_quotes), @ctz(non_unescaped_quotes) });
+                                cur = cur[ctz(non_unescaped_quotes)..];
+                                if (non_unescaped_quotes != 0) break;
+                            }
+                        },
+                        2 => {},
+                        3 => {},
                     }
+
+                    if (cur[0] != chr) {}
 
                     cur = cur[1..];
                     continue;
