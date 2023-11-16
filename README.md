@@ -8,6 +8,8 @@ So far, a tokenizer implementation is provided. The mainline Zig tokenizer uses 
 
 In the last few days, I have:
 
+- Updated the keyword lookup algorithm for non-vector architectures to use aligned loads where possible. There still could be room for improvement but today I saw a **~5% performance uplift**.
+
 - Updated to a [slightly better optimized version](https://github.com/simdjson/simdjson/pull/2042) of the escape-detection algorithm.
 
 - Made toggles so that `"` and `'` can be moved between the SIMD/SWAR section and a naïve scalar version very easily. It appears that for machines which have to use SWAR, it is faster to do the naïve scalar version (almost **~8% uplift on my RISC-V SiFive U74**). On the other hand, it's still more efficient on my desktop to do quote classification in SIMD, but for other less-powerful devices, it may not be worth it.
@@ -114,11 +116,11 @@ That's ~3.00x faster! **Currently the utf8 validator is turned off! I did a lot 
 
 |  | run-time (milliseconds) | throughput (megabytes per second) |throughput (million lines of code per second) |
 |:-:|:-:|:-:|:-:|
-| read files (baseline) | 366.666ms |  161.35 MB/s | 3.54M loc/s |
-| original | 2.18s  | 27.13 MB/s | 0.60M loc/s |
-| this | 948.314ms | 62.39 MB/s | 1.37M loc/s |
+| read files (baseline) | 325.1ms |  181.98 MB/s | 3.99M loc/s |
+| original | 2.142s  | 27.61 MB/s | 0.61M loc/s |
+| this | 904.397ms | 65.42 MB/s | 1.44M loc/s |
 
-That's ~2.30x faster! **Currently the utf8 validator is turned off! I did a lot of performance optimization the past few days and did not finish porting my changes over yet.**
+That's ~2.37x faster! **Currently the utf8 validator is turned off! I did a lot of performance optimization the past few days and did not finish porting my changes over yet.**
 
 ## To-do
 

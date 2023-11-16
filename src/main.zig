@@ -1,6 +1,6 @@
 // zig fmt: off
-const SKIP_OUTLIERS        = false;
-const RUN_LEGACY_TOKENIZER = true;
+const SKIP_OUTLIERS        = true;
+const RUN_LEGACY_TOKENIZER = false;
 const RUN_NEW_TOKENIZER    = true;
 const RUN_LEGACY_AST       = false;
 const RUN_NEW_AST          = false;
@@ -78,7 +78,7 @@ fn readFileIntoAlignedBuffer(allocator: Allocator, file: std.fs.File, comptime a
 fn readFiles(gpa: Allocator) !std.ArrayListUnmanaged([:0]align(VEC_SIZE) const u8) {
     if (SKIP_OUTLIERS)
         std.debug.print("Skipping outliers!\n", .{});
-    std.debug.print("v0.4\n", .{});
+    std.debug.print("v0.5\n", .{});
     const directory = switch (INFIX_TEST) {
         true => "./src/beep",
         false => "./src/files_to_parse",
@@ -368,56 +368,74 @@ const Keywords = struct {
         if (!USE_SWAR and len > 255) return null;
 
         const hash = mapToIndex(hashKw(kw, len));
-        const val: [PADDING_RIGHT]u8 = sorted_padded_kws[hash];
-        const hash_inverse = ~hash;
-        const val_len = val[PADDING_RIGHT - 1]; // [min_kw_len, max_kw_len]
+        const val_len = sorted_padded_kws[hash][PADDING_RIGHT - 1]; // [min_kw_len, max_kw_len]
 
         if (USE_SWAR) {
             if (len != val_len) return null;
-            var word1: u64 = @bitCast(kw[0..8].*);
-            var word2: u64 = @bitCast(kw[8..16].*);
 
-            word1 = if (std.math.cast(u6, (64 -| len * 8))) |shift1|
-                (word1 << @intCast(shift1)) >> @intCast(shift1)
-            else
-                unreachable; // len can't be 0
+            const Q = u64;
+            const native_endian = comptime builtin.cpu.arch.endian();
+            const log_int_t = std.math.Log2Int(std.meta.Int(.unsigned, @sizeOf(Q)));
+            const misalignment_kernel = @as(log_int_t, @truncate(@intFromPtr(kw)));
+            const misalignment = @as(std.meta.Int(.unsigned, @bitSizeOf(log_int_t) + 3), misalignment_kernel) << 3;
+            const chunk1: [*]align(@sizeOf(Q)) const u8 = @ptrFromInt(std.mem.alignBackward(usize, @intFromPtr(kw), @sizeOf(Q)));
+            const int1 = std.mem.readInt(Q, chunk1[0..@sizeOf(Q)], native_endian);
+
+            const final1 = switch (native_endian) {
+                .little => int1 >> misalignment,
+                .big => int1 << misalignment,
+            };
+
+            const chunk2: [*]align(@sizeOf(Q)) const u8 = chunk1 + @sizeOf(Q);
+            const int2 = std.mem.readInt(Q, chunk2[0..@sizeOf(Q)], native_endian);
+
+            const other = ~misalignment +% 1;
+            const selector = @as(Q, @intFromBool(misalignment == 0)) -% 1;
+
+            const final2 = switch (native_endian) {
+                .little => int2 << other,
+                .big => int2 >> other,
+            };
+
+            const final3 = switch (native_endian) {
+                .little => int2 >> misalignment,
+                .big => int2 << misalignment,
+            };
+
+            const chunk4: [*]align(@sizeOf(Q)) const u8 = chunk2 + @sizeOf(Q);
+            const int4 = std.mem.readInt(Q, chunk4[0..@sizeOf(Q)], native_endian);
+
+            const final4 = switch (native_endian) {
+                .little => int4 << other,
+                .big => int4 >> other,
+            };
+
+            var word1: Q = final1 | (final2 & selector);
+            var word2: Q = final3 | (final4 & selector);
+
+            const byte_len = len << 3;
+
+            if (byte_len < 64) {
+                if (byte_len == 0) unreachable;
+                const shift1: u6 = @intCast(64 - byte_len);
+                word1 = word1 << shift1 >> shift1;
+            }
 
             // TODO: In-progress SWAR impl. Could probably be better...?
             // TODO: only works on little-endian
 
-            word2 = if (std.math.cast(
-                u6,
-                // len can't be > max_kw_len (14 atm)
-                128 - len * 8,
-            )) |shift2|
-                (word2 << @intCast(shift2)) >> @intCast(shift2)
-            else
-                0;
-
-            // std.debug.print("\n", .{});
-            // std.debug.print("\n", .{});
-
-            const source_word1 = @as(u64, @bitCast(val[0..8].*));
-            const source_word2 = @as(u64, @bitCast(val[8..16].*)) << 8 >> 8;
+            const shift2 = 128 - byte_len;
+            word2 = if (shift2 >= 64) 0 else word2 << @intCast(shift2) >> @intCast(shift2);
+            const source_word1 = @as(*align(8) const u64, @alignCast(@ptrCast(sorted_padded_kws[hash][0..8].ptr))).*;
+            const source_word2 = @as(*align(8) const u64, @alignCast(@ptrCast(sorted_padded_kws[hash][8..16].ptr))).* << 8 >> 8;
 
             if (word1 == source_word1 and word2 == source_word2) {
-                // Dear reader: We can't move this higher because this might produce an invalid tag.
-                // Our hash might map to a padding value in the buffer, and not be a real keyword.
-                // We have to let the compiler hoist this for us.
-                return @enumFromInt(hash_inverse);
+                return @enumFromInt(~hash);
             } else {
-                // std.debug.print("kw: {s}\n", .{kw[0..len]});
-                // std.debug.print("vl: {s}\n", .{val});
-                // printu(word1);
-                // printu(word2);
-                // std.debug.print("\n", .{});
-                // printu(source_word1);
-                // printu(source_word2);
-                // std.debug.print("word1 == source_word1: {}\n", .{word1 == source_word1});
-                // std.debug.print("word2 == source_word2: {}\n", .{word2 == source_word2});
                 return null;
             }
         } else {
+            const val: [PADDING_RIGHT]u8 align(PADDING_RIGHT) = sorted_padded_kws[hash];
             const KW_VEC = @Vector(PADDING_RIGHT, u8);
             var vec1: KW_VEC = val;
             const vec2: KW_VEC = kw[0..PADDING_RIGHT].*;
@@ -428,7 +446,7 @@ const Keywords = struct {
                 // Dear reader: We can't move this higher because this might produce an invalid tag.
                 // Our hash might map to a padding value in the buffer, and not be a real keyword.
                 // We have to let the compiler hoist this for us.
-                return @enumFromInt(hash_inverse);
+                return @enumFromInt(~hash);
             } else {
                 return null;
             }
