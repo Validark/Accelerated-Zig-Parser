@@ -76,6 +76,9 @@ fn readFileIntoAlignedBuffer(allocator: Allocator, file: std.fs.File, comptime a
 }
 
 fn readFiles(gpa: Allocator) !std.ArrayListUnmanaged([:0]align(VEC_SIZE) const u8) {
+    if (SKIP_OUTLIERS)
+        std.debug.print("Skipping outliers!\n", .{});
+    std.debug.print("v0.4\n", .{});
     const directory = switch (INFIX_TEST) {
         true => "./src/beep",
         false => "./src/files_to_parse",
@@ -713,6 +716,28 @@ fn swarCTZPlus1Generic(x: anytype, comptime impl: @TypeOf(SWAR_CTZ_PLUS_1_IMPL))
     };
 }
 
+fn swarCTZGeneric(x: anytype, comptime impl: @TypeOf(SWAR_CTZ_IMPL)) @TypeOf(x) {
+    const ones: @TypeOf(x) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(x)), 8), u8), @splat(1)));
+    assert((x & (ones * 0x7F)) == 0);
+
+    return switch (impl) {
+        .ctz => @ctz(x) >> 3,
+        .swar => popCountLSb((~x & (x -% 1)) >> 7),
+        .swar_bool => popCountLSb(x -% 1) -% @intFromBool(x != 0),
+        // .naive => blk: {
+        //     var i = ((~x & (x -% 1)) & (ones * 0x80)) >> 7;
+        //     inline for (0..comptime std.math.log2_int(u64, @sizeOf(@TypeOf(x)))) |y| {
+        //         i = i +% (i >> (@bitSizeOf(@TypeOf(x)) >> (y + 1)));
+        //     }
+        //     break :blk @as(std.meta.Int(.unsigned, @sizeOf(@TypeOf(x))), @truncate(i));
+        // },
+    };
+}
+
+fn swarCTZ(x: usize) @TypeOf(x) {
+    return swarCTZGeneric(x, SWAR_CTZ_IMPL);
+}
+
 test "swarCTZPlus1" {
     var i: u3 = 0;
 
@@ -1081,13 +1106,14 @@ const Parser = struct {
         return underscores | upper_alpha | lower_alpha | digits;
     }
 
-    fn swarControlCharMaskInverse(v: u64) @TypeOf(v) {
+    fn swarControlCharMaskInverse(v: anytype) @TypeOf(v) {
         const ones: @TypeOf(v) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(v)), 8), u8), @splat(1)));
         const mask = comptime ones * 0x7F;
         const low_7_bits = v & mask;
         const non_del = ~ones - low_7_bits;
-        const non_control_or_space = low_7_bits + comptime ones * (0x80 - 0x21);
-        return (v | (non_del & non_control_or_space));
+        const non_ctrl = low_7_bits + comptime ones * (0x80 - 0x20);
+        const non_tabs = (low_7_bits ^ comptime ones * '\t') + mask;
+        return v | (non_del & non_ctrl) | ~non_tabs;
     }
 
     fn swarControlCharMask(v: anytype) @TypeOf(v) {
@@ -1125,6 +1151,23 @@ const Parser = struct {
     fn hasZeroByte(v: anytype) @TypeOf(v) {
         const ones: @TypeOf(v) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(v)), 8), u8), @splat(1)));
         return (v -% ones) & ~v & (comptime 0x80 * ones);
+    }
+
+    fn maskForNonQuoteGeneric(v: anytype, chr: u8, comptime use_swar: bool) if (USE_SWAR) NATIVE_VEC_INT else std.meta.Int(.unsigned, NATIVE_VEC_SIZE) {
+        if (use_swar) {
+            assert(@TypeOf(v) == NATIVE_VEC_INT);
+            const ones: @TypeOf(v) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(v)), 8), u8), @splat(1)));
+            const mask = comptime ones * 0x7F;
+            const low_7_bits = v & mask;
+            return v | ((low_7_bits ^ (ones * chr)) + mask);
+        } else {
+            assert(@TypeOf(v) == NATIVE_VEC_CHAR);
+            return ~@as(std.meta.Int(.unsigned, NATIVE_VEC_SIZE), @bitCast(v == @as(NATIVE_VEC_CHAR, @splat(chr))));
+        }
+    }
+
+    fn maskForNonQuote(v: anytype, chr: u8) if (USE_SWAR) NATIVE_VEC_INT else std.meta.Int(.unsigned, NATIVE_VEC_SIZE) {
+        return maskForNonQuoteGeneric(v, chr, USE_SWAR);
     }
 
     fn maskForNonCharsGeneric(v: anytype, comptime str: []const u8, comptime use_swar: bool) if (USE_SWAR) NATIVE_VEC_INT else std.meta.Int(.unsigned, NATIVE_VEC_SIZE) {
@@ -1256,6 +1299,8 @@ const Parser = struct {
     // TODO: make it so quotes and character literals cannot have newlines in them?
     // TODO: audit the utf8 validator to make sure we clear the state properly when not using it
     pub fn tokenize(gpa: Allocator, source: [:0]align(VEC_SIZE) const u8, comptime impl: u1) ![]Token {
+        const ON_DEMAND_IMPL: u2 = @intFromBool(!USE_SWAR);
+
         const FOLD_COMMENTS_INTO_ADJACENT_NODES = false;
         const end_ptr = &source.ptr[source.len];
         const extended_source_len = std.mem.alignForward(usize, source.len + EXTENDED_BACK_SENTINELS_LEN, VEC_SIZE);
@@ -1264,7 +1309,7 @@ const Parser = struct {
         errdefer gpa.free(tokens);
 
         // TODO: add dynamic math here based on DO_CHAR_LITERAL_IN_SIMD and DO_QUOTE_IN_SIMD
-        const non_newlines_bitstrings = try gpa.alloc(VEC_INT, extended_source_len / VEC_SIZE + @sizeOf(Bitmaps) - @sizeOf(VEC_INT));
+        const non_newlines_bitstrings = try gpa.alloc(VEC_INT, extended_source_len / VEC_SIZE + @typeInfo(Bitmaps).Struct.fields.len + if (ON_DEMAND_IMPL == 1) 4 else 1);
 
         // TODO: make this errdefer and return this data out.
         // We can use this information later to find out what line we are on.
@@ -1439,6 +1484,13 @@ const Parser = struct {
                         bitmap_ptr[0] = reverseIfCheap(~ctrls);
                         bitmap_ptr[1] = reverseIfCheap(identifiers_or_numbers);
                         bitmap_ptr[3] = reverseIfCheap(~non_spaces);
+
+                        if (ON_DEMAND_IMPL == 1) {
+                            bitmap_ptr[5] = 0;
+                            bitmap_ptr[6] = 0;
+                            bitmap_ptr[7] = 0;
+                            bitmap_ptr[8] = 0;
+                        }
                         selected_bitmap = selected_bitmap[1..];
 
                         // TODO: shift the quotes bitstring by 1 to increase the length automatically
@@ -1644,8 +1696,6 @@ const Parser = struct {
                             }
                             cur = cur[2..];
                         } else if (cur[0] == '\\') {
-                            // std.debug.print("{s}", .{cur});
-
                             return error.IncompleteSingleLineStringOpener;
                         } else {
                             op_type = @enumFromInt(hash1);
@@ -1710,38 +1760,78 @@ const Parser = struct {
                 }
 
                 if ((!DO_CHAR_LITERAL_IN_SIMD and cur[0] == '\'') or (!DO_QUOTE_IN_SIMD and cur[0] == '"')) {
-                    const ON_DEMAND_IMPL: u2 = 1;
                     const chr = if (!DO_CHAR_LITERAL_IN_SIMD and !DO_QUOTE_IN_SIMD) cur[0] else if (!DO_CHAR_LITERAL_IN_SIMD) '\'' else '"';
+
                     switch (ON_DEMAND_IMPL) {
-                        0 => {
-                            while (true) {
+                        0 => mean: while (true) {
+                            inline for (0..2) |_| {
                                 cur = cur[1..];
                                 comptime assert(std.mem.indexOfAny(u8, BACK_SENTINELS, "\n") != null);
-                                if (cur[0] == chr or cur[0] == '\n') break;
+                                if (cur[0] == chr or cur[0] < ' ') break :mean;
                                 cur = cur[@intFromBool(cur[0] == '\\')..];
+                                if (cur[0] < ' ') break :mean;
                             }
                         },
-                        1 => {
+                        1 => sol: {
                             cur = cur[1..];
+                            var next_is_escaped_on_demand: VEC_INT = 0;
 
-                            const VEC_SIZE_MINI = 64;
-                            const VEC_INT_MINI = std.meta.Int(.unsigned, VEC_SIZE_MINI);
-                            const VEC_MINI = @Vector(VEC_SIZE_MINI, u8);
+                            const FORCE_ALIGNMENT = USE_SWAR;
+                            const alignment = if (FORCE_ALIGNMENT) NATIVE_VEC_SIZE else 1;
 
-                            var next_is_escaped_on_demand: VEC_INT_MINI = 0;
+                            var non_unescaped_quotes: VEC_INT = undefined;
+                            const quote_bitmap_old = bitmap_ptr[if (chr == '"') 2 else 4..];
 
-                            while (true) {
-                                const input_vec = cur[0..VEC_SIZE_MINI].*;
-                                const non_quotes: VEC_INT_MINI = @bitCast(@as(VEC_MINI, @splat(chr)) != @as(VEC_MINI, input_vec));
-                                const backslash: VEC_INT_MINI = @bitCast(@as(VEC_MINI, @splat('\\')) == @as(VEC_MINI, input_vec));
-                                const non_tabs: VEC_INT_MINI = @bitCast(@as(VEC_MINI, @splat('\t')) != @as(VEC_MINI, input_vec));
-                                const del: VEC_INT_MINI = @bitCast(@as(VEC_MINI, @splat(0x7F)) == @as(VEC_MINI, input_vec));
-                                const ctrls: VEC_INT_MINI = (@as(VEC_INT_MINI, @bitCast(input_vec < @as(VEC_MINI, @splat(' ')))) | del) & non_tabs;
+                            if (@intFromPtr(cur.ptr) < quote_bitmap_old[3]) {
+                                next_is_escaped_on_demand = quote_bitmap_old[4];
+                                const offset = @intFromPtr(cur.ptr) - (quote_bitmap_old[3] - VEC_SIZE);
+                                const shifted_bitstring = ~(quote_bitmap_old[0] >> @intCast(offset));
+                                cur = cur[ctz(shifted_bitstring)..];
+
+                                if (@intFromPtr(cur.ptr) != quote_bitmap_old[3]) {
+                                    break :sol;
+                                }
+                            }
+
+                            var next_aligned_chunk: [*]align(alignment) const u8 = @ptrFromInt(@intFromPtr(cur.ptr) / alignment * alignment); // cur.ptr when alignment mattereth not
+                            var cur_misalignment: std.math.Log2Int(std.meta.Int(.unsigned, alignment)) = @truncate(@intFromPtr(cur.ptr));
+
+                            while (true) : (cur_misalignment = 0) {
+                                var ctrls: VEC_INT = 0;
+                                var non_quotes = @as(VEC_INT, 0);
+                                var non_backslashes = @as(VEC_INT, 0);
+
+                                inline for (0..comptime VEC_SIZE / NATIVE_VEC_SIZE) |i| {
+                                    const chunk = blk: {
+                                        const slice: *align(if (FORCE_ALIGNMENT) NATIVE_VEC_SIZE else 1) const [NATIVE_VEC_SIZE]u8 = @alignCast((if (FORCE_ALIGNMENT) next_aligned_chunk else cur)[i * NATIVE_VEC_SIZE ..][0..NATIVE_VEC_SIZE]);
+
+                                        if (USE_SWAR) {
+                                            break :blk std.mem.nativeToLittle(NATIVE_VEC_INT, @as(*align(NATIVE_VEC_SIZE) const NATIVE_VEC_INT, @ptrCast(slice)).*);
+                                        } else {
+                                            const vec = @as(@Vector(NATIVE_VEC_SIZE, u8), slice.*);
+                                            break :blk if (comptime builtin.cpu.arch.endian() == .little)
+                                                vec
+                                            else
+                                                @shuffle(u8, vec, undefined, @as(@TypeOf(vec), @splat(NATIVE_VEC_SIZE - 1)) - std.simd.iota(u8, NATIVE_VEC_SIZE));
+                                        }
+                                    };
+
+                                    const shift: LOG_VEC_INT = if (ASSEMBLE_BITSTRINGS_BACKWARDS)
+                                        @intCast((VEC_SIZE - NATIVE_VEC_SIZE) - NATIVE_VEC_SIZE * i)
+                                    else
+                                        @intCast(NATIVE_VEC_SIZE * i);
+
+                                    non_quotes |= movMask(maskForNonQuote(chunk, chr)) << shift;
+                                    non_backslashes |= movMask(maskForNonChars(chunk, "\\")) << shift;
+                                    ctrls |= movMask(controlCharMask(chunk)) << shift;
+                                }
+
+                                const backslash = ~non_backslashes;
 
                                 // ----------------------------------------------------------------------------
                                 // This code is brought to you courtesy of simdjson, licensed
                                 // under the Apache 2.0 license which is included at the bottom of this file
-                                const ODD_BITS: VEC_INT_MINI = @bitCast(@as(@Vector(@divExact(VEC_SIZE_MINI, 8), u8), @splat(0xaa)));
+                                const ODD_BITS: VEC_INT = @bitCast(@as(@Vector(@divExact(VEC_SIZE, 8), u8), @splat(0xaa)));
 
                                 // |                                | Mask (shows characters instead of 1's) | Depth | Instructions        |
                                 // |--------------------------------|----------------------------------------|-------|---------------------|
@@ -1804,23 +1894,184 @@ const Parser = struct {
 
                                 const escaped = escape_and_terminal_code ^ (backslash | next_is_escaped_on_demand);
                                 const escape = escape_and_terminal_code & backslash;
-                                next_is_escaped_on_demand = escape >> (VEC_SIZE_MINI - 1);
+                                next_is_escaped_on_demand = escape >> (VEC_SIZE - 1);
 
-                                const non_unescaped_quotes = ~((non_quotes & ~ctrls) | escaped);
-                                // for (cur[0..VEC_SIZE_MINI]) |c| {
-                                //     switch (c) {
-                                //         '\n' => std.debug.print("$", .{}),
-                                //         else => std.debug.print("{c}", .{c}),
-                                //     }
-                                // }
-                                // std.debug.print("\n{b:0>64}\n{b:0>64}\n", .{ @bitReverse(non_quotes), @bitReverse(escaped) });
-                                // std.debug.print("{b:0>64} {}\n\n", .{ @bitReverse(non_unescaped_quotes), @ctz(non_unescaped_quotes) });
-                                cur = cur[ctz(non_unescaped_quotes)..];
-                                if (non_unescaped_quotes != 0) break;
+                                non_unescaped_quotes = (non_quotes & ~ctrls) | escaped;
+                                const shifted_bitstring = ~(non_unescaped_quotes >> cur_misalignment);
+                                cur = cur[ctz(shifted_bitstring)..];
+                                next_aligned_chunk += VEC_SIZE;
+                                if (if (FORCE_ALIGNMENT) cur.ptr != next_aligned_chunk else shifted_bitstring != 0) break;
+                            }
+
+                            quote_bitmap_old[0] = non_unescaped_quotes;
+                            quote_bitmap_old[3] = @intFromPtr(next_aligned_chunk);
+                            quote_bitmap_old[4] = next_is_escaped_on_demand;
+                        },
+                        2 => {
+                            cur = cur[1..];
+
+                            // const VEC_SIZE_MINI = 64;
+                            // const VEC_INT_MINI = std.meta.Int(.unsigned, VEC_SIZE_MINI);
+                            // const VEC_MINI = @Vector(VEC_SIZE_MINI, u8);
+
+                            var next_is_escaped_on_demand: VEC_INT = 0;
+
+                            const FORCE_ALIGNMENT = true;
+                            const alignment = if (FORCE_ALIGNMENT) NATIVE_VEC_SIZE else 1;
+                            var next_aligned_chunk: [*]align(alignment) const u8 = @ptrFromInt(@intFromPtr(cur.ptr) / alignment * alignment); // cur.ptr when alignment mattereth not
+                            var cur_misalignment: std.math.Log2Int(std.meta.Int(.unsigned, alignment)) = @truncate(@intFromPtr(cur.ptr));
+
+                            while (true) : (cur_misalignment = 0) {
+                                const chunk = blk: {
+                                    const slice: *align(if (FORCE_ALIGNMENT) NATIVE_VEC_SIZE else 1) const [NATIVE_VEC_SIZE]u8 = @alignCast((if (FORCE_ALIGNMENT) next_aligned_chunk else cur)[0..NATIVE_VEC_SIZE]);
+                                    break :blk std.mem.nativeToLittle(NATIVE_VEC_INT, @as(*align(NATIVE_VEC_SIZE) const NATIVE_VEC_INT, @ptrCast(slice)).*);
+                                };
+
+                                const non_quotes = maskForNonQuoteGeneric(chunk, chr, true);
+                                const non_backslashes = maskForNonCharsGeneric(chunk, "\\", true);
+                                const non_ctrls = swarControlCharMaskInverse(chunk);
+
+                                const backslash = ~non_backslashes & 0x8080808080808080;
+
+                                // ----------------------------------------------------------------------------
+                                // This code is brought to you courtesy of simdjson, licensed
+                                // under the Apache 2.0 license which is included at the bottom of this file
+                                const ODD_BYTES: VEC_INT = 0x8000800080008000;
+                                const potential_escape = backslash & ~next_is_escaped_on_demand;
+                                const maybe_escaped = potential_escape << 8;
+                                const maybe_escaped_and_odd_bits = maybe_escaped | ODD_BYTES;
+                                const even_series_codes_and_odd_bits = maybe_escaped_and_odd_bits -% potential_escape;
+                                const escape_and_terminal_code = even_series_codes_and_odd_bits ^ ODD_BYTES;
+                                const escaped = escape_and_terminal_code ^ (backslash | next_is_escaped_on_demand);
+                                const escape = escape_and_terminal_code & backslash;
+                                next_is_escaped_on_demand = escape >> (VEC_SIZE - 1 - 7);
+                                const non_unescaped_quotes = ((non_quotes & non_ctrls) | escaped) & 0x8080808080808080;
+                                const shifted_bitstring = ~(non_unescaped_quotes >> (@as(u6, cur_misalignment) << 3));
+                                // ----------------------------------------------------------------------------
+
+                                cur = cur[swarCTZ(shifted_bitstring & 0x8080808080808080)..];
+                                if (FORCE_ALIGNMENT) next_aligned_chunk += NATIVE_VEC_SIZE;
+                                if (if (FORCE_ALIGNMENT) cur.ptr != next_aligned_chunk else shifted_bitstring != 0) {
+                                    break;
+                                }
                             }
                         },
-                        2 => {},
-                        3 => {},
+                        3 => {
+                            cur = cur[1..];
+                            var next_is_escaped_on_demand: VEC_INT = 0;
+                            const FORCE_ALIGNMENT = USE_SWAR;
+                            const alignment = if (FORCE_ALIGNMENT) NATIVE_VEC_SIZE else 1;
+                            var next_aligned_chunk: [*]align(alignment) const u8 = @ptrFromInt(@intFromPtr(cur.ptr) / alignment * alignment); // cur.ptr when alignment mattereth not
+                            var cur_misalignment: std.math.Log2Int(std.meta.Int(.unsigned, alignment)) = @truncate(@intFromPtr(cur.ptr));
+                            var non_unescaped_quotes: VEC_INT = undefined;
+
+                            while (true) : (cur_misalignment = 0) {
+                                var ctrls: VEC_INT = 0;
+                                var non_quotes = @as(VEC_INT, 0);
+                                var non_backslashes = @as(VEC_INT, 0);
+
+                                inline for (0..comptime VEC_SIZE / NATIVE_VEC_SIZE) |i| {
+                                    const chunk = blk: {
+                                        const slice: *align(if (FORCE_ALIGNMENT) NATIVE_VEC_SIZE else 1) const [NATIVE_VEC_SIZE]u8 = @alignCast((if (FORCE_ALIGNMENT) next_aligned_chunk else cur)[i * NATIVE_VEC_SIZE ..][0..NATIVE_VEC_SIZE]);
+
+                                        if (USE_SWAR) {
+                                            break :blk std.mem.nativeToLittle(NATIVE_VEC_INT, @as(*align(NATIVE_VEC_SIZE) const NATIVE_VEC_INT, @ptrCast(slice)).*);
+                                        } else {
+                                            const vec = @as(@Vector(NATIVE_VEC_SIZE, u8), slice.*);
+                                            break :blk if (comptime builtin.cpu.arch.endian() == .little)
+                                                vec
+                                            else
+                                                @shuffle(u8, vec, undefined, @as(@TypeOf(vec), @splat(NATIVE_VEC_SIZE - 1)) - std.simd.iota(u8, NATIVE_VEC_SIZE));
+                                        }
+                                    };
+
+                                    const shift: LOG_VEC_INT = if (ASSEMBLE_BITSTRINGS_BACKWARDS)
+                                        @intCast((VEC_SIZE - NATIVE_VEC_SIZE) - NATIVE_VEC_SIZE * i)
+                                    else
+                                        @intCast(NATIVE_VEC_SIZE * i);
+
+                                    non_quotes |= movMask(maskForNonQuote(chunk, chr)) << shift;
+                                    non_backslashes |= movMask(maskForNonChars(chunk, "\\")) << shift;
+                                    ctrls |= movMask(controlCharMask(chunk)) << shift;
+                                }
+
+                                const backslash = ~non_backslashes;
+
+                                // ----------------------------------------------------------------------------
+                                // This code is brought to you courtesy of simdjson, licensed
+                                // under the Apache 2.0 license which is included at the bottom of this file
+                                const ODD_BITS: VEC_INT = @bitCast(@as(@Vector(@divExact(VEC_SIZE, 8), u8), @splat(0xaa)));
+
+                                // |                                | Mask (shows characters instead of 1's) | Depth | Instructions        |
+                                // |--------------------------------|----------------------------------------|-------|---------------------|
+                                // | string                         | `\\n_\\\n___\\\n___\\\\___\\\\__\\\`   |       |                     |
+                                // |                                | `    even   odd    even   odd   odd`   |       |                     |
+                                // | potential_escape               | ` \  \\\    \\\    \\\\   \\\\  \\\`   | 1     | 1 (backslash & ~first_is_escaped)
+                                // | escape_and_terminal_code       | ` \n \ \n   \ \n   \ \    \ \   \ \`   | 5     | 5 (next_escape_and_terminal_code())
+                                // | escaped                        | `\    \ n    \ n    \ \    \ \   \ ` X | 6     | 7 (escape_and_terminal_code ^ (potential_escape | first_is_escaped))
+                                // | escape                         | `    \ \    \ \    \ \    \ \   \ \`   | 6     | 8 (escape_and_terminal_code & backslash)
+                                // | first_is_escaped               | `\                                 `   | 7 (*) | 9 (escape >> 63) ()
+                                //                                                                               (*) this is not needed until the next iteration
+                                const potential_escape = backslash & ~next_is_escaped_on_demand;
+
+                                // If we were to just shift and mask out any odd bits, we'd actually get a *half* right answer:
+                                // any even-aligned backslash runs would be correct! Odd-aligned backslash runs would be
+                                // inverted (\\\ would be 010 instead of 101).
+                                //
+                                // ```
+                                // string:              | ____\\\\_\\\\_____ |
+                                // maybe_escaped | ODD  |     \ \   \ \      |
+                                //               even-aligned ^^^  ^^^^ odd-aligned
+                                // ```
+                                //
+                                // Taking that into account, our basic strategy is:
+                                //
+                                // 1. Use subtraction to produce a mask with 1's for even-aligned runs and 0's for
+                                //    odd-aligned runs.
+                                // 2. XOR all odd bits, which masks out the odd bits in even-aligned runs, and brings IN the
+                                //    odd bits in odd-aligned runs.
+                                // 3. & with backslash to clean up any stray bits.
+                                // runs are set to 0, and then XORing with "odd":
+                                //
+                                // |                                | Mask (shows characters instead of 1's) | Instructions        |
+                                // |--------------------------------|----------------------------------------|---------------------|
+                                // | string                         | `\\n_\\\n___\\\n___\\\\___\\\\__\\\`   |
+                                // |                                | `    even   odd    even   odd   odd`   |
+                                // | maybe_escaped                  | `  n  \\n    \\n    \\\_   \\\_  \\` X | 1 (potential_escape << 1)
+                                // | maybe_escaped_and_odd          | ` \n_ \\n _ \\\n_ _ \\\__ _\\\_ \\\`   | 1 (maybe_escaped | odd)
+                                // | even_series_codes_and_odd      | `  n_\\\  _    n_ _\\\\ _     _    `   | 1 (maybe_escaped_and_odd - potential_escape)
+                                // | escape_and_terminal_code       | ` \n \ \n   \ \n   \ \    \ \   \ \`   | 1 (^ odd)
+                                //
+
+                                // Escaped characters are characters following an escape.
+                                const maybe_escaped = potential_escape << 1;
+
+                                // To distinguish odd from even escape sequences, therefore, we turn on any *starting*
+                                // escapes that are on an odd byte. (We actually bring in all odd bits, for speed.)
+                                // - Odd runs of backslashes are 0000, and the code at the end ("n" in \n or \\n) is 1.
+                                // - Odd runs of backslashes are 1111, and the code at the end ("n" in \n or \\n) is 0.
+                                // - All other odd bytes are 1, and even bytes are 0.
+                                const maybe_escaped_and_odd_bits = maybe_escaped | ODD_BITS;
+                                const even_series_codes_and_odd_bits = maybe_escaped_and_odd_bits -% potential_escape;
+
+                                // Now we flip all odd bytes back with xor. This:
+                                // - Makes odd runs of backslashes go from 0000 to 1010
+                                // - Makes even runs of backslashes go from 1111 to 1010
+                                // - Sets actually-escaped codes to 1 (the n in \n and \\n: \n = 11, \\n = 100)
+                                // - Resets all other bytes to 0
+                                const escape_and_terminal_code = even_series_codes_and_odd_bits ^ ODD_BITS;
+
+                                const escaped = escape_and_terminal_code ^ (backslash | next_is_escaped_on_demand);
+                                const escape = escape_and_terminal_code & backslash;
+                                next_is_escaped_on_demand = escape >> (VEC_SIZE - 1);
+
+                                non_unescaped_quotes = (non_quotes & ~ctrls) | escaped;
+                                const shifted_bitstring = ~(non_unescaped_quotes >> cur_misalignment);
+                                cur = cur[ctz(shifted_bitstring)..];
+                                if (FORCE_ALIGNMENT) next_aligned_chunk += VEC_SIZE;
+                                if (if (FORCE_ALIGNMENT) cur.ptr != next_aligned_chunk else shifted_bitstring != 0) break;
+                            }
+                        },
                     }
 
                     if (cur[0] != chr) {}
