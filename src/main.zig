@@ -104,8 +104,6 @@ fn readFiles(gpa: Allocator) !std.ArrayListUnmanaged([:0]align(VEC_SIZE) const u
             switch (dir.kind) {
                 .file => if (dir.basename.len > 4 and std.mem.eql(u8, dir.basename[dir.basename.len - 4 ..][0..4], ".zig") and dir.path.len - dir.basename.len > 0) {
                     // These two are extreme outliers, omit them from our test bench
-                    // if (!std.mem.eql(u8, dir.basename, "static_test.zig")) continue;
-
                     if (std.mem.eql(u8, dir.basename, "normal_string_with_newline.zig") or (SKIP_OUTLIERS and
                         (std.mem.eql(u8, dir.basename, "udivmodti4_test.zig") or
                         std.mem.eql(u8, dir.basename, "udivmoddi4_test.zig"))))
