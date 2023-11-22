@@ -78,7 +78,7 @@ fn readFileIntoAlignedBuffer(allocator: Allocator, file: std.fs.File, comptime a
 fn readFiles(gpa: Allocator) !std.ArrayListUnmanaged([:0]align(VEC_SIZE) const u8) {
     if (SKIP_OUTLIERS)
         std.debug.print("Skipping outliers!\n", .{});
-    std.debug.print("v0.5\n", .{});
+    std.debug.print("v0.6\n", .{});
     const directory = switch (INFIX_TEST) {
         true => "./src/beep",
         false => "./src/files_to_parse",
@@ -272,8 +272,12 @@ const Operators = struct {
 };
 
 const Keywords = struct {
+    const LOOKUP_IMPL: u1 = 0;
+    const SWAR_LOOKUP_IMPL: u3 = 0;
+
     // We could halve the number of cache lines by using two-byte slices into a dense superstring:
-    // "addrspacerrdeferrorelsenumswitchusingnamespaceunreachablepackedforeturnunionwhilecontinueconstructcomptimevolatileifnpubreakawaitestryasyncatchlinksectionosuspendanytypeanyframeandallowzeropaquexporthreadlocallconvaresumexternoinlinealignoaliasm"
+    const kw_buffer: []const u8 = "addrspacerrdeferrorelsenumswitchunreachablepackedforeturnunionwhilecontinueconstructcomptimevolatileifnpubreakawaitestryasyncatchlinksectionosuspendanytypeanyframeandallowzeropaquexporthreadlocallconvaresumexternoinlinealignoaliasmusingnamespace_\x00";
+
     const unpadded_kws = [_][]const u8{ "addrspace", "align", "allowzero", "and", "anyframe", "anytype", "asm", "async", "await", "break", "callconv", "catch", "comptime", "const", "continue", "defer", "else", "enum", "errdefer", "error", "export", "extern", "fn", "for", "if", "inline", "noalias", "noinline", "nosuspend", "opaque", "or", "orelse", "packed", "pub", "resume", "return", "linksection", "struct", "suspend", "switch", "test", "threadlocal", "try", "union", "unreachable", "usingnamespace", "var", "volatile", "while" };
 
     const masks = blk: {
@@ -312,9 +316,9 @@ const Keywords = struct {
     const PADDING_RIGHT = std.math.ceilPowerOfTwo(usize, max_kw_len + 1) catch unreachable;
     const padded_int = std.meta.Int(.unsigned, PADDING_RIGHT);
 
-    const sorted_padded_kws = blk: {
+    const sorted_padded_kws align(PADDING_RIGHT) = blk: {
         const max_hash_is_unused = (masks[masks.len - 1] >> 63) ^ 1;
-        var buffer: [unpadded_kws.len + max_hash_is_unused][PADDING_RIGHT]u8 align(PADDING_RIGHT) = undefined;
+        var buffer: [unpadded_kws.len + max_hash_is_unused][PADDING_RIGHT]u8 = undefined;
 
         for (unpadded_kws) |kw| {
             const padded_kw =
@@ -333,10 +337,40 @@ const Keywords = struct {
         break :blk buffer;
     };
 
+    const kw_slice = struct {
+        const uint = std.meta.Int(
+            .unsigned,
+            std.math.ceilPowerOfTwoPromote(u64, std.math.log2_int_ceil(u64, kw_buffer.len + 1)),
+        );
+        start_index: uint,
+        len: uint,
+    };
+
+    const kw_slices = blk: {
+        @setEvalBranchQuota(std.math.maxInt(u16));
+
+        const max_hash_is_unused = (masks[masks.len - 1] >> 63) ^ 1;
+        var buffer: [unpadded_kws.len + max_hash_is_unused]kw_slice = undefined;
+
+        for (unpadded_kws) |kw|
+            buffer[mapToIndex(hashKw(kw.ptr, kw.len))] = .{
+                .start_index = std.mem.indexOf(u8, kw_buffer, kw) orelse @compileError(std.fmt.comptimePrint("Please include the keyword \"{s}\" inside of `kw_buffer`.\n\n`kw_buffer` is currently:\n{s}\n", .{ kw, kw_buffer })),
+                .len = kw.len,
+            };
+
+        if (max_hash_is_unused == 1) {
+            // We add one extra filler item just in case we hash a value greater than the greatest hashed value
+            buffer[unpadded_kws.len] = std.mem.zeroes(kw_slice);
+        }
+
+        break :blk buffer;
+    };
+
     pub fn hashKw(keyword: [*]const u8, len: u32) u7 {
-        comptime assert(BACK_SENTINELS.len >= 1); // Make sure it's safe to go forward a character
+        assert(len != 0);
+        comptime assert(BACK_SENTINELS.len >= 1); // Make sure it's safe to go forward a character when len=1
         const a = std.mem.readInt(u16, keyword[0..2], .little);
-        comptime assert(FRONT_SENTINELS.len >= 1); // Make sure it's safe to go back to the previous character
+        comptime assert(FRONT_SENTINELS.len >= 1); // Make sure it's safe to go back to the previous character when len=1
         const b = std.mem.readInt(u16, (if (@inComptime())
             keyword[len - 2 .. len][0..2]
         else
@@ -365,90 +399,307 @@ const Keywords = struct {
         if (BACK_SENTINELS.len < PADDING_RIGHT - 1)
             @compileError(std.fmt.comptimePrint("Keywords.lookup requires additional trailing sentinels in the source file. Expected {}, got {}\n", .{ PADDING_RIGHT - 1, BACK_SENTINELS.len }));
 
-        if (!USE_SWAR and len > 255) return null;
-
+        const len_u8 = std.math.cast(u8, len) orelse return null;
         const hash = mapToIndex(hashKw(kw, len));
-        const val_len = sorted_padded_kws[hash][PADDING_RIGHT - 1]; // [min_kw_len, max_kw_len]
 
-        if (USE_SWAR) {
-            if (len != val_len) return null;
+        if (USE_SWAR) { // TODO: make sure this works with big-endian
+            switch (SWAR_LOOKUP_IMPL) {
+                0 => {
+                    const val_len = sorted_padded_kws[hash][PADDING_RIGHT - 1]; // [min_kw_len, max_kw_len]
+                    if (len != val_len) return null;
 
-            const Q = u64;
-            const native_endian = comptime builtin.cpu.arch.endian();
-            const log_int_t = std.math.Log2Int(std.meta.Int(.unsigned, @sizeOf(Q)));
-            const misalignment_kernel = @as(log_int_t, @truncate(@intFromPtr(kw)));
-            const misalignment = @as(std.meta.Int(.unsigned, @bitSizeOf(log_int_t) + 3), misalignment_kernel) << 3;
-            const chunk1: [*]align(@sizeOf(Q)) const u8 = @ptrFromInt(std.mem.alignBackward(usize, @intFromPtr(kw), @sizeOf(Q)));
-            const int1 = std.mem.readInt(Q, chunk1[0..@sizeOf(Q)], native_endian);
+                    const Q = u64;
+                    const native_endian = comptime builtin.cpu.arch.endian();
+                    const log_int_t = std.math.Log2Int(std.meta.Int(.unsigned, @sizeOf(Q)));
+                    const misalignment_kernel = @as(log_int_t, @truncate(@intFromPtr(kw)));
+                    const misalignment = @as(std.meta.Int(.unsigned, @bitSizeOf(log_int_t) + 3), misalignment_kernel) << 3;
+                    const chunk1: [*]align(@sizeOf(Q)) const u8 = @ptrFromInt(std.mem.alignBackward(usize, @intFromPtr(kw), @sizeOf(Q)));
+                    const int1 = std.mem.readInt(Q, chunk1[0..@sizeOf(Q)], native_endian);
 
-            const final1 = switch (native_endian) {
-                .little => int1 >> misalignment,
-                .big => int1 << misalignment,
-            };
+                    const final1 = switch (native_endian) {
+                        .little => int1 >> misalignment,
+                        .big => int1 << misalignment,
+                    };
+                    const chunk2: [*]align(@sizeOf(Q)) const u8 = chunk1 + @sizeOf(Q);
+                    const int2 = std.mem.readInt(Q, chunk2[0..@sizeOf(Q)], native_endian);
 
-            const chunk2: [*]align(@sizeOf(Q)) const u8 = chunk1 + @sizeOf(Q);
-            const int2 = std.mem.readInt(Q, chunk2[0..@sizeOf(Q)], native_endian);
+                    const other = ~misalignment +% 1;
+                    const selector = @as(Q, @intFromBool(misalignment == 0)) -% 1;
 
-            const other = ~misalignment +% 1;
-            const selector = @as(Q, @intFromBool(misalignment == 0)) -% 1;
+                    const final2 = switch (native_endian) {
+                        .little => int2 << other,
+                        .big => int2 >> other,
+                    };
 
-            const final2 = switch (native_endian) {
-                .little => int2 << other,
-                .big => int2 >> other,
-            };
+                    const final3 = switch (native_endian) {
+                        .little => int2 >> misalignment,
+                        .big => int2 << misalignment,
+                    };
 
-            const final3 = switch (native_endian) {
-                .little => int2 >> misalignment,
-                .big => int2 << misalignment,
-            };
+                    const chunk4: [*]align(@sizeOf(Q)) const u8 = chunk2 + @sizeOf(Q);
+                    const int4 = std.mem.readInt(Q, chunk4[0..@sizeOf(Q)], native_endian);
 
-            const chunk4: [*]align(@sizeOf(Q)) const u8 = chunk2 + @sizeOf(Q);
-            const int4 = std.mem.readInt(Q, chunk4[0..@sizeOf(Q)], native_endian);
+                    const final4 = switch (native_endian) {
+                        .little => int4 << other,
+                        .big => int4 >> other,
+                    };
 
-            const final4 = switch (native_endian) {
-                .little => int4 << other,
-                .big => int4 >> other,
-            };
+                    var word1: Q = final1 | (final2 & selector);
+                    var word2: Q = final3 | (final4 & selector);
 
-            var word1: Q = final1 | (final2 & selector);
-            var word2: Q = final3 | (final4 & selector);
+                    const byte_len = len << 3;
 
-            const byte_len = len << 3;
+                    if (byte_len < 64) {
+                        if (byte_len == 0) unreachable;
+                        const shift1: u6 = @intCast(64 - byte_len);
+                        word1 = word1 << shift1 >> shift1;
+                    }
 
-            if (byte_len < 64) {
-                if (byte_len == 0) unreachable;
-                const shift1: u6 = @intCast(64 - byte_len);
-                word1 = word1 << shift1 >> shift1;
-            }
+                    const shift2 = 128 - byte_len; // TODO: can we use wraparound here?
+                    word2 = if (shift2 >= 64) 0 else word2 << @intCast(shift2) >> @intCast(shift2);
 
-            // TODO: In-progress SWAR impl. Could probably be better...?
-            // TODO: only works on little-endian
+                    switch (native_endian) {
+                        .little => word2 |= @as(@TypeOf(word2), len) << (@bitSizeOf(@TypeOf(word2)) - 8),
+                        .big => word2 |= @as(@TypeOf(word2), len),
+                    }
 
-            const shift2 = 128 - byte_len;
-            word2 = if (shift2 >= 64) 0 else word2 << @intCast(shift2) >> @intCast(shift2);
-            const source_word1 = @as(*align(8) const u64, @alignCast(@ptrCast(sorted_padded_kws[hash][0..8].ptr))).*;
-            const source_word2 = @as(*align(8) const u64, @alignCast(@ptrCast(sorted_padded_kws[hash][8..16].ptr))).* << 8 >> 8;
+                    const source_word1 = @as(*align(8) const u64, @alignCast(@ptrCast(sorted_padded_kws[hash][0..8].ptr))).*;
+                    const source_word2 = @as(*align(8) const u64, @alignCast(@ptrCast(sorted_padded_kws[hash][8..16].ptr))).*; // << 8 >> 8;
 
-            if (word1 == source_word1 and word2 == source_word2) {
-                return @enumFromInt(~hash);
-            } else {
-                return null;
+                    if (word1 == source_word1 and word2 == source_word2) {
+                        return @enumFromInt(~hash);
+                    } else {
+                        return null;
+                    }
+                },
+                1 => {
+                    const str = kw_slices[hash];
+                    if (len != str.len) return null;
+                    var ptr1: [*]const u8 = kw;
+                    var ptr2: [*]const u8 = kw_buffer[str.start_index..].ptr;
+                    while (ptr1[0] == ptr2[0]) {
+                        ptr1 += 1;
+                        ptr2 += 1;
+                    }
+                    if (@intFromPtr(ptr2) - @intFromPtr(kw) != len) return null;
+                    return @enumFromInt(~hash);
+                },
+                2 => {
+                    const str = kw_slices[hash];
+                    if (len != str.len) return null;
+                    var ptr1: [*]const u8 = kw;
+                    var ptr2: [*]const u8 = kw_buffer[str.start_index..].ptr;
+                    while (ptr1[0] == ptr2[0]) {
+                        ptr1 += 1;
+                        std.mem.doNotOptimizeAway(ptr1);
+                        ptr2 += 1;
+                    }
+                    if (@intFromPtr(ptr2) - @intFromPtr(kw) != len) return null;
+                    return @enumFromInt(~hash);
+                },
+                3 => {
+                    const str = kw_slices[hash];
+                    if (len != str.len) return null;
+                    for (kw[0..len], kw_buffer[str.start_index..][0..str.len]) |c1, c2| {
+                        std.mem.doNotOptimizeAway(c1);
+                        if (c1 != c2) return null;
+                    }
+                    return @enumFromInt(~hash);
+                },
+                4 => {
+                    const str = kw_slices[hash];
+                    if (len != str.len) return null;
+                    for (kw[0..len], kw_buffer[str.start_index..][0..str.len]) |c1, c2| {
+                        if (c1 != c2) return null;
+                    }
+                    return @enumFromInt(~hash);
+                },
+                5 => {
+                    const str = kw_slices[hash];
+                    if (len != str.len) return null;
+
+                    const Q = u64;
+                    const native_endian = comptime builtin.cpu.arch.endian();
+                    const log_int_t = std.math.Log2Int(std.meta.Int(.unsigned, @sizeOf(Q)));
+                    const misalignment_kernel = @as(log_int_t, @truncate(@intFromPtr(kw)));
+                    const misalignment_kernel_2 = @as(log_int_t, @truncate(@intFromPtr(&kw_buffer[str.start_index])));
+                    const misalignment = @as(std.meta.Int(.unsigned, @bitSizeOf(log_int_t) + 3), misalignment_kernel) << 3;
+                    const misalignment_2 = @as(std.meta.Int(.unsigned, @bitSizeOf(log_int_t) + 3), misalignment_kernel_2) << 3;
+                    const chunk1: [*]align(@sizeOf(Q)) const u8 = @ptrFromInt(std.mem.alignBackward(usize, @intFromPtr(kw), @sizeOf(Q)));
+                    const chunk1_2: [*]align(@sizeOf(Q)) const u8 = @ptrFromInt(std.mem.alignBackward(usize, @intFromPtr(&kw_buffer[str.start_index]), @sizeOf(Q)));
+                    const int1 = std.mem.readInt(Q, chunk1[0..@sizeOf(Q)], native_endian);
+                    const int1_2 = std.mem.readInt(Q, chunk1_2[0..@sizeOf(Q)], native_endian);
+
+                    const final1 = switch (native_endian) {
+                        .little => int1 >> misalignment,
+                        .big => int1 << misalignment,
+                    };
+
+                    const final1_2 = switch (native_endian) {
+                        .little => int1_2 >> misalignment_2,
+                        .big => int1_2 << misalignment_2,
+                    };
+
+                    const chunk2: [*]align(@sizeOf(Q)) const u8 = chunk1 + @sizeOf(Q);
+                    const chunk2_2: [*]align(@sizeOf(Q)) const u8 = chunk1_2 + @sizeOf(Q);
+                    const int2 = std.mem.readInt(Q, chunk2[0..@sizeOf(Q)], native_endian);
+                    const int2_2 = std.mem.readInt(Q, chunk2_2[0..@sizeOf(Q)], native_endian);
+
+                    const other = ~misalignment +% 1;
+                    const other_2 = ~misalignment_2 +% 1;
+                    const selector = @as(Q, @intFromBool(misalignment == 0)) -% 1;
+                    const selector_2 = @as(Q, @intFromBool(misalignment_2 == 0)) -% 1;
+
+                    const final2 = switch (native_endian) {
+                        .little => int2 << other,
+                        .big => int2 >> other,
+                    };
+
+                    const final2_2 = switch (native_endian) {
+                        .little => int2_2 << other_2,
+                        .big => int2_2 >> other_2,
+                    };
+
+                    const final3 = switch (native_endian) {
+                        .little => int2 >> misalignment,
+                        .big => int2 << misalignment,
+                    };
+
+                    const final3_2 = switch (native_endian) {
+                        .little => int2_2 >> misalignment_2,
+                        .big => int2_2 << misalignment_2,
+                    };
+
+                    const chunk4: [*]align(@sizeOf(Q)) const u8 = chunk2 + @sizeOf(Q);
+                    const chunk4_2: [*]align(@sizeOf(Q)) const u8 = chunk2_2 + @sizeOf(Q);
+                    const int4 = std.mem.readInt(Q, chunk4[0..@sizeOf(Q)], native_endian);
+                    const int4_2 = std.mem.readInt(Q, chunk4_2[0..@sizeOf(Q)], native_endian);
+
+                    const final4 = switch (native_endian) {
+                        .little => int4 << other,
+                        .big => int4 >> other,
+                    };
+
+                    const final4_2 = switch (native_endian) {
+                        .little => int4_2 << other_2,
+                        .big => int4_2 >> other_2,
+                    };
+
+                    var word1: Q = final1 | (final2 & selector);
+                    var word2: Q = final3 | (final4 & selector);
+                    var word1_2: Q = final1_2 | (final2_2 & selector_2);
+                    var word2_2: Q = final3_2 | (final4_2 & selector_2);
+
+                    const byte_len = len << 3;
+
+                    if (byte_len < 64) {
+                        if (byte_len == 0) unreachable;
+                        const shift1: u6 = @intCast(64 - byte_len);
+                        word1 = word1 << shift1 >> shift1;
+                        word1_2 = word1_2 << shift1 >> shift1;
+                    }
+
+                    const shift2 = 128 - byte_len; // TODO: can we use wraparound here?
+                    word2 = if (shift2 >= 64) 0 else word2 << @intCast(shift2) >> @intCast(shift2);
+                    word2_2 = if (shift2 >= 64) 0 else word2_2 << @intCast(shift2) >> @intCast(shift2);
+
+                    if (word1 == word1_2 and word2 == word2_2) {
+                        return @enumFromInt(~hash);
+                    } else {
+                        return null;
+                    }
+                },
+                else => {},
             }
         } else {
-            const val: [PADDING_RIGHT]u8 align(PADDING_RIGHT) = sorted_padded_kws[hash];
-            const KW_VEC = @Vector(PADDING_RIGHT, u8);
-            const vec1: KW_VEC = val;
-            const vec2: KW_VEC = kw[0..PADDING_RIGHT].*;
-            const other_vec: KW_VEC = @splat(@as(u8, @intCast(len)));
-            const cd = @select(u8, @as(KW_VEC, @splat(val_len)) > std.simd.iota(u8, PADDING_RIGHT), vec2, other_vec);
+            switch (LOOKUP_IMPL) {
+                0 => {
+                    // const val_len = sorted_padded_kws[hash][PADDING_RIGHT - 1]; // [min_kw_len, max_kw_len]
+                    const KW_VEC = @Vector(PADDING_RIGHT, u8);
+                    const vec1: KW_VEC = sorted_padded_kws[hash];
+                    const vec2: KW_VEC = kw[0..PADDING_RIGHT].*; // the safety of this operation is validated at the top of this function
+                    const len_vec: KW_VEC = @splat(len_u8);
+                    const cd = @select(u8, len_vec > std.simd.iota(u8, PADDING_RIGHT), vec2, len_vec);
+                    comptime assert(max_kw_len < '0' and PADDING_RIGHT - 1 < '0');
 
-            if (std.simd.countTrues(cd != vec1) == 0) {
-                // Dear reader: We can't move this higher because this might produce an invalid tag.
-                // Our hash might map to a padding value in the buffer, and not be a real keyword.
-                // We have to let the compiler hoist this for us.
-                return @enumFromInt(~hash);
-            } else {
-                return null;
+                    if (std.simd.countTrues(cd != vec1) == 0) {
+                        return @enumFromInt(~hash);
+                    } else {
+                        return null;
+                    }
+                },
+                1 => {
+                    const KW_VEC = @Vector(PADDING_RIGHT, u8);
+                    const str = kw_slices[hash];
+
+                    // For performance reasons, instead of branching on a length mismatch here, we incorporate it into the final check. (See comments below)
+
+                    comptime for (kw_slices) |kw_s|
+                        if (kw_s.start_index + PADDING_RIGHT > kw_buffer.len)
+                            @compileError(
+                                std.fmt.comptimePrint(
+                                    "Loading {} bytes starting at \"{s}\" in `kw_buffer` causes a buffer overrun. Please add {} more \\x00 byte(s) to the end." ++
+                                        blk: {
+                                        const kw_buffer_trimmed = std.mem.trimRight(u8, kw_buffer, "\x00");
+                                        var longest_kw: []const u8 = "";
+                                        for (unpadded_kws) |unpadded_kw| {
+                                            if (unpadded_kw.len == max_kw_len) {
+                                                if (longest_kw.len != 0) longest_kw = longest_kw ++ " or ";
+                                                longest_kw = longest_kw ++ "\"" ++ unpadded_kw ++ "\"";
+                                                if (std.mem.endsWith(u8, kw_buffer_trimmed, unpadded_kw)) break :blk "";
+                                            }
+                                        }
+                                        break :blk std.fmt.comptimePrint(" (To reduce the number of required trailing \\x00 bytes to {}, it is recommended to move {s} to the end of `kw_buffer`)", .{ PADDING_RIGHT - max_kw_len, longest_kw });
+                                    },
+                                    .{
+                                        PADDING_RIGHT,
+                                        kw_buffer[kw_s.start_index..][0..kw_s.len],
+                                        kw_s.start_index + PADDING_RIGHT - kw_buffer.len,
+                                    },
+                                ),
+                            );
+
+                    const vec1: KW_VEC = kw_buffer[str.start_index..][0..PADDING_RIGHT].*;
+                    const vec2: KW_VEC = kw[0..PADDING_RIGHT].*; // the safety of this operation is validated at the top of this function
+
+                    comptime for (kw_slices) |kw_s|
+                        if (std.math.cast(u8, kw_s.len) == null)
+                            @compileError(std.fmt.comptimePrint("\"{s}\" is too long.", .{kw_buffer[kw_s.start_index..][kw_s.len]}));
+
+                    const len_vec1: KW_VEC = @splat(@as(u8, @intCast(str.len)));
+                    const len_vec2: KW_VEC = @splat(len_u8);
+
+                    const cc = @select(u8, len_vec1 > std.simd.iota(u8, PADDING_RIGHT), vec1, len_vec1);
+                    const cd = @select(u8, len_vec2 > std.simd.iota(u8, PADDING_RIGHT), vec2, len_vec2);
+
+                    // This algorithm compares two vectors of the form `<keyword><len...>`
+                    // Where:
+                    //   <keyword> is the identifier we found of the form [a-z][a-zA-Z0-9_]*
+                    //   <len..> is the len byte duplicated until the end of the vector
+                    // Here are real examples of a keyword comparisons:
+                    // cc: enum444444444444
+                    // cd: allocator9999999
+
+                    // cc: anyframe88888888
+                    // cd: appendAssumeCapa
+
+                    // How is it guaranteed that the length cannot be erroneously matched as a character?
+                    // Since the keywords we are matching both can only have characters in the set [a-zA-Z0-9_],
+                    // in order for the length to potentially match a character, the length must be at least '0'/0x30/48.
+                    // 1. For cc, we know that all kw_buffer keywords have a length that is less than '0'
+                    //   Therefore, the length in the kw_buffer keyword cannot match any byte in cd
+                    comptime assert(max_kw_len < '0');
+
+                    // 2. For kw keywords, we know that lengths above '0' exceed the length of the vector
+                    //   E.g. if kw had a length of 0x41 ('A'), so long as that is larger than PADDING_RIGHT - 1, it won't get in the vector.
+                    comptime assert('0' > PADDING_RIGHT - 1);
+
+                    if (std.simd.countTrues(cd != cc) == 0) {
+                        return @enumFromInt(~hash);
+                    } else {
+                        return null;
+                    }
+                },
             }
         }
     }
@@ -1318,8 +1569,7 @@ const Parser = struct {
     // TODO: audit the utf8 validator to make sure we clear the state properly when not using it
     pub fn tokenize(gpa: Allocator, source: [:0]align(VEC_SIZE) const u8, comptime impl: u1) ![]Token {
         const ON_DEMAND_IMPL: u2 = @intFromBool(!USE_SWAR);
-
-        const FOLD_COMMENTS_INTO_ADJACENT_NODES = false;
+        const FOLD_COMMENTS_INTO_ADJACENT_NODES = true;
         const end_ptr = &source.ptr[source.len];
         const extended_source_len = std.mem.alignForward(usize, source.len + EXTENDED_BACK_SENTINELS_LEN, VEC_SIZE);
         const extended_source = source.ptr[0..extended_source_len];
@@ -1562,6 +1812,7 @@ const Parser = struct {
 
             while (true) {
                 var len: u32 = @intCast(@intFromPtr(cur.ptr) - @intFromPtr(prev.ptr));
+                assert(len != 0);
 
                 comptime assert(FRONT_SENTINELS[0] == '\n');
                 switch (prev[0]) {
