@@ -1781,14 +1781,13 @@ const Parser = struct {
                     const chr = if (!DO_CHAR_LITERAL_IN_SIMD and !DO_QUOTE_IN_SIMD) cur[0] else if (!DO_CHAR_LITERAL_IN_SIMD) '\'' else '"';
 
                     switch (ON_DEMAND_IMPL) {
-                        0 => mean: while (true) {
-                            inline for (0..2) |_| {
-                                cur = cur[1..];
-                                comptime assert(std.mem.indexOfAny(u8, BACK_SENTINELS, "\n") != null);
-                                if (cur[0] == chr or cur[0] < ' ') break :mean;
-                                cur = cur[@intFromBool(cur[0] == '\\')..];
-                                if (cur[0] < ' ') break :mean;
-                            }
+                        0 => while (true) {
+                            cur = cur[1..];
+                            comptime assert(std.mem.indexOfAny(u8, BACK_SENTINELS, "\n") != null);
+                            if (cur[0] == chr or cur[0] < ' ') break;
+                            std.mem.doNotOptimizeAway(cur[0]); // disable LLVM's default unroll.
+                            cur = cur[@intFromBool(cur[0] == '\\')..];
+                            if (cur[0] < ' ') break;
                         },
                         1 => sol: {
                             cur = cur[1..];

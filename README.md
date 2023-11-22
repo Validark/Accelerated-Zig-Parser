@@ -8,6 +8,8 @@ So far, a tokenizer implementation is provided. The mainline Zig tokenizer uses 
 
 In the last few days, I have:
 
+- Disabled loop unrolling for quote parsing loop on SWAR-enabled machines. Only a 1% uplift on my Sifive U74, but considering that's about 9 milliseconds at the moment, I'll take it.
+
 - Updated the keyword lookup algorithm for non-vector architectures to use aligned loads where possible. There still could be room for improvement but today I saw a **~5% performance uplift**.
 
 - Updated to a [slightly better optimized version](https://github.com/simdjson/simdjson/pull/2042) of the escape-detection algorithm.
@@ -106,7 +108,7 @@ Please keep in mind that comparing to the legacy tokenizer's speed is not necess
 |:-:|:-:|:-:|:-:|
 | read files (baseline) | 35.269ms | 1677.45 MB/s | 35.01M loc/s |
 | original | 235.293ms  | 251.44 MB/s | 5.52M loc/s |
-| this | 78.525ms | 753.42 MB/s | 16.53M loc/s |
+| this     | 78.525ms   | 753.42 MB/s | 16.53M loc/s |
 
 That's ~3.00x faster! **Currently the utf8 validator is turned off! I did a lot of performance optimization the past few days and did not finish porting my changes over yet.**
 
@@ -116,11 +118,11 @@ That's ~3.00x faster! **Currently the utf8 validator is turned off! I did a lot 
 
 |  | run-time (milliseconds) | throughput (megabytes per second) |throughput (million lines of code per second) |
 |:-:|:-:|:-:|:-:|
-| read files (baseline) | 325.1ms |  181.98 MB/s | 3.99M loc/s |
-| original | 2.142s  | 27.61 MB/s | 0.61M loc/s |
-| this | 904.397ms | 65.42 MB/s | 1.44M loc/s |
+| read files (baseline) | 318.989ms |  185.47 MB/s | 4.07M loc/s |
+| original | 2.206s  | 26.81 MB/s | 0.59M loc/s |
+| this | 894.963ms   | 66.11 MB/s | 1.45M loc/s |
 
-That's ~2.37x faster! **Currently the utf8 validator is turned off! I did a lot of performance optimization the past few days and did not finish porting my changes over yet.**
+That's ~2.47x faster! **Currently the utf8 validator is turned off! I did a lot of performance optimization the past few days and did not finish porting my changes over yet.**
 
 ## To-do
 
