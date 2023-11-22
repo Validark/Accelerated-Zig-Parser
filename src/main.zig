@@ -98,7 +98,7 @@ fn readFiles(gpa: Allocator) !std.ArrayListUnmanaged([:0]align(VEC_SIZE) const u
         var walker = try parent_dir.walk(gpa); // 12-14 ms just walking the tree
         defer walker.deinit();
 
-        var total_size: usize = 0;
+        const total_size: usize = 0;
         _ = total_size;
         while (try walker.next()) |dir| {
             switch (dir.kind) {
@@ -437,9 +437,9 @@ const Keywords = struct {
         } else {
             const val: [PADDING_RIGHT]u8 align(PADDING_RIGHT) = sorted_padded_kws[hash];
             const KW_VEC = @Vector(PADDING_RIGHT, u8);
-            var vec1: KW_VEC = val;
+            const vec1: KW_VEC = val;
             const vec2: KW_VEC = kw[0..PADDING_RIGHT].*;
-            var other_vec: KW_VEC = @splat(@as(u8, @intCast(len)));
+            const other_vec: KW_VEC = @splat(@as(u8, @intCast(len)));
             const cd = @select(u8, @as(KW_VEC, @splat(val_len)) > std.simd.iota(u8, PADDING_RIGHT), vec2, other_vec);
 
             if (std.simd.countTrues(cd != vec1) == 0) {
@@ -760,7 +760,7 @@ test "swarCTZPlus1" {
     var i: u3 = 0;
 
     while (true) {
-        var x: u32 = swarUnMovMask(@as(u4, 8) | i);
+        const x: u32 = swarUnMovMask(@as(u4, 8) | i);
 
         const expected: u32 = switch (x) {
             0x80808080 => 1,
@@ -1616,7 +1616,7 @@ const Parser = struct {
                         }
                     }
 
-                    var advance_amt: u2 = if (cur_token[0].len == 0) 3 else 1;
+                    const advance_amt: u2 = if (cur_token[0].len == 0) 3 else 1;
                     cur_token = cur_token[advance_amt..];
                 }
 
@@ -2191,7 +2191,7 @@ pub fn main() !void {
     };
 
     if (RUN_NEW_TOKENIZER or INFIX_TEST) {
-        var t1 = std.time.nanoTimestamp();
+        const t1 = std.time.nanoTimestamp();
 
         const source_tokens = try gpa.alloc([]Token, sources.items.len);
         for (sources.items, source_tokens) |source, *source_token_slot| {
@@ -2252,7 +2252,7 @@ pub fn main() !void {
 
         // Fun fact: bytes per nanosecond is the same ratio as GB/s
         if (RUN_NEW_TOKENIZER and REPORT_SPEED) {
-            var throughput = @as(f64, @floatFromInt(bytes * 1000)) / @as(f64, @floatFromInt(elapsedNanos));
+            const throughput = @as(f64, @floatFromInt(bytes * 1000)) / @as(f64, @floatFromInt(elapsedNanos));
             try stdout.print("       Tokenizing took {: >9} ({d:.2} MB/s, {d: >5.2}M loc/s) and used {} memory\n", .{ std.fmt.fmtDuration(elapsedNanos), throughput, @as(f64, @floatFromInt(lines)) / @as(f64, @floatFromInt(elapsedNanos)) * 1000, std.fmt.fmtIntSizeDec(num_tokens * 2) });
 
             if (elapsedNanos2 > 0) {
