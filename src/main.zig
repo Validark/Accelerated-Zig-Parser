@@ -270,8 +270,8 @@ const Operators = struct {
 };
 
 const Keywords = struct {
-    const LOOKUP_IMPL: u1 = 0;
-    const SWAR_LOOKUP_IMPL: u3 = 0;
+    const LOOKUP_IMPL: u1 = @intFromBool(builtin.mode == .ReleaseSmall);
+    const SWAR_LOOKUP_IMPL: u3 = if (builtin.mode == .ReleaseSmall) 4 else 0;
 
     // We could halve the number of cache lines by using two-byte slices into a dense superstring:
     const kw_buffer: []const u8 = "addrspacerrdeferrorelsenumswitchunreachablepackedforeturnunionwhilecontinueconstructcomptimevolatileifnpubreakawaitestryasyncatchlinksectionosuspendanytypeanyframeandallowzeropaquexporthreadlocallconvaresumexternoinlinealignoaliasmusingnamespace_\x00";
