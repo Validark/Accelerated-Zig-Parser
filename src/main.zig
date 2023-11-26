@@ -9,6 +9,7 @@ const VALIDATE_UTF8        = false;
 const INFIX_TEST           = false;
 // zig fmt: on
 
+// TODO: figure out what behavior we should have for invalid vs unknown
 // TODO: 64-bit popcounts could probably be refactored to be nicer on 32-bit machines.
 // TODO: the quote algo only works for little-endian bit orders
 // TODO: mask_for_op_cont should probably be renamed.
@@ -83,10 +84,10 @@ fn readFiles(gpa: Allocator) !std.ArrayListUnmanaged([:0]align(VEC_SIZE) const u
         true => "./src/beep",
         false => "./src/files_to_parse",
     };
-    var parent_dir2 = try std.fs.cwd().openDirZ(directory, .{}, false);
+    var parent_dir2 = try std.fs.cwd().openDirZ(directory, .{ .iterate = false });
     defer parent_dir2.close();
 
-    var parent_dir = try std.fs.cwd().openIterableDir(directory, .{});
+    var parent_dir = try std.fs.cwd().openDirZ(directory, .{ .iterate = true });
     defer parent_dir.close();
 
     var num_files: usize = 0;
@@ -612,6 +613,28 @@ const Keywords = struct {
         } else {
             switch (LOOKUP_IMPL) {
                 0 => {
+                    // This algorithm compares two vectors of the form `<keyword><len...>`
+                    // Where:
+                    //   <keyword> is the identifier we found of the form [a-z][a-zA-Z0-9_]*
+                    //   <len..> is the len byte duplicated until the end of the vector
+                    // Here are real examples of a keyword comparisons:
+                    // vec1: enum444444444444
+                    // cd  : allocator9999999
+
+                    // vec1: anyframe88888888
+                    // cd  : appendAssumeCapa
+
+                    // How is it guaranteed that the length cannot be erroneously matched as a character?
+                    // Since the keywords we are matching both can only have characters in the set [a-zA-Z0-9_],
+                    // in order for the length to potentially match a character, the length must be at least '0'/0x30/48.
+                    // 1. For cc, we know that all kw_buffer keywords have a length that is less than '0'
+                    //   Therefore, the length in the kw_buffer keyword cannot match any byte in cd
+                    comptime assert(max_kw_len < '0');
+
+                    // 2. For kw keywords, we know that lengths above '0'/0x30/48 exceed the length of the vector
+                    //   E.g. if kw had a length of 0x41 ('A'), so long as that is larger than PADDING_RIGHT - 1, it won't get in the vector.
+                    comptime assert('0' > PADDING_RIGHT - 1);
+
                     // const val_len = sorted_padded_kws[hash][PADDING_RIGHT - 1]; // [min_kw_len, max_kw_len]
                     const KW_VEC = @Vector(PADDING_RIGHT, u8);
                     const vec1: KW_VEC = sorted_padded_kws[hash];
@@ -909,6 +932,8 @@ fn ctzBranchless(a: anytype) std.meta.Int(.unsigned, std.math.ceilPowerOfTwoProm
     const constant = switch (@bitSizeOf(T)) {
         64 => 151050438420815295,
         32 => 125613361,
+        // 16 => 2479,
+        // 8 => 23,
         else => return @ctz(a),
     };
     const shift = @bitSizeOf(T) - @bitSizeOf(std.math.Log2Int(T));
@@ -1208,6 +1233,52 @@ test "movemask reversed swar should properly isolate the highest set bits of all
     }
 }
 
+// end from https://gist.github.com/sharpobject/80dc1b6f3aaeeada8c0e3a04ebc4b60a
+pub fn _mm_shuffle_epi8(x: @Vector(NATIVE_VEC_SIZE, u8), mask: @Vector(NATIVE_VEC_SIZE, u8)) @Vector(NATIVE_VEC_SIZE, u8) {
+    return asm (
+        \\vpshufb %[mask], %[x], %[out]
+        : [out] "=x" (-> @Vector(NATIVE_VEC_SIZE, u8)),
+        : [x] "+x" (x),
+          [mask] "x" (mask),
+    );
+}
+
+// https://developer.arm.com/architectures/instruction-sets/intrinsics/vqtbl1q_s8
+pub fn _lookup_16_aarch64(x: @Vector(16, u8), mask: @Vector(16, u8)) @Vector(16, u8) {
+    return asm (
+        \\tbl  %[out].16b, {%[mask].16b}, %[x].16b
+        : [out] "=&x" (-> @Vector(16, u8)),
+        : [x] "x" (x),
+          [mask] "x" (mask),
+    );
+}
+
+fn _lookup_chunk(comptime a: [16]u8, b: @Vector(16, u8)) @Vector(16, u8) {
+    switch (builtin.cpu.arch) {
+        .x86_64 => return _mm_shuffle_epi8(a ** (NATIVE_VEC_SIZE / 16), b),
+        .aarch64, .aarch64_32, .aarch64_be => return _lookup_16_aarch64(b, a),
+        else => {
+            var r: @Vector(NATIVE_VEC_SIZE, u8) = @splat(0);
+            for (0..NATIVE_VEC_SIZE) |i| {
+                const c = b[i];
+                assert(c <= 0x0F);
+                r[i] = a[c];
+            }
+            return r;
+
+            // var r: Chunk = @splat(0);
+            // for (0..16) |i| {
+            //     inline for ([2]comptime_int{ 0, 16 }) |o| {
+            //         if ((b[o + i] & 0x80) == 0) {
+            //             r[o + i] = a[o + b[o + i] & 0x0F];
+            //         }
+            //     }
+            // }
+            // return r;
+        },
+    }
+}
+
 const Parser = struct {
     const Bitmaps = packed struct {
         non_newlines: VEC_INT,
@@ -1404,16 +1475,16 @@ const Parser = struct {
         return delete_code | other_controls;
     }
 
-    fn nonControlCharMask(v: anytype) if (USE_SWAR) NATIVE_VEC_INT else std.meta.Int(.unsigned, NATIVE_VEC_SIZE) {
-        if (USE_SWAR) {
-            assert(@TypeOf(v) == NATIVE_VEC_INT);
-            return swarControlCharMaskInverse(v);
-        }
+    // fn nonControlCharMask(v: anytype) if (USE_SWAR) NATIVE_VEC_INT else std.meta.Int(.unsigned, NATIVE_VEC_SIZE) {
+    //     if (USE_SWAR) {
+    //         assert(@TypeOf(v) == NATIVE_VEC_INT);
+    //         return swarControlCharMaskInverse(v);
+    //     }
 
-        const delete_code = maskForNonChars(v, "\x7F");
-        const other_controls = ~maskForCharRange(v, 0, 32);
-        return delete_code & other_controls;
-    }
+    //     const delete_code = maskForNonChars(v, "\x7F");
+    //     const other_controls = ~maskForCharRange(v, 0, 32);
+    //     return delete_code & other_controls;
+    // }
 
     fn hasZeroByte(v: anytype) @TypeOf(v) {
         const ones: @TypeOf(v) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(v)), 8), u8), @splat(1)));
@@ -1962,15 +2033,12 @@ const Parser = struct {
                                 break;
                             }
                             cur = cur[2..];
-                        } else if (cur[0] == '\\') {
-                            return error.IncompleteSingleLineStringOpener;
                         } else {
-                            op_type = @enumFromInt(hash1);
+                            op_type = if (cur[0] == '\\') .invalid else @enumFromInt(hash1);
                             cur = cur[1..];
                         }
                     } else {
                         comptime var op_continuation_chars align(32) = std.mem.zeroes([@divExact(256, @bitSizeOf(usize))]usize);
-
                         comptime for (Operators.unpadded_ops) |op| {
                             for (op[1..]) |c| {
                                 op_continuation_chars[c / @bitSizeOf(usize)] |=
@@ -2017,10 +2085,7 @@ const Parser = struct {
                         '"' => .string,
                         ' ', '\t', '\n' => .whitespace,
                         0 => .eof,
-                        else => {
-                            // std.debug.print("{} {c}\n", .{ cur[0], cur[0] });
-                            return error.InvalidCharacter;
-                        },
+                        else => .unknown,
                     };
 
                     selected_bitmap = bitmap_ptr[@as(u3, @truncate(@intFromEnum(op_type)))..];
