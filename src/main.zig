@@ -28,30 +28,25 @@ const mem = std.mem;
 const Ast = std.zig.Ast;
 const Allocator = std.mem.Allocator;
 
-/// This is the chunk size, not necessarily the native vector size.
-/// If we support 64-bit operations, we want to be doing 64-bit count-trailing-zeros,
+/// This is the "efficient builtin operand" size.
+/// E.g. if we support 64-bit operations, we want to be doing 64-bit count-trailing-zeros,
 /// even if we have to combine multiple bitstrings to get to the point where we can do that.
 /// For now, we use `usize` as our reasonable guess for what size of bitstring we can operate on efficiently.
-/// Will probably have to be updated if we get machines with efficient 128-bit operations that still have 64-bit pointers.
-const VEC_SIZE = @bitSizeOf(usize);
-const VEC_INT = std.meta.Int(.unsigned, VEC_SIZE);
-const VEC = @Vector(VEC_SIZE, u8);
-const IVEC = @Vector(VEC_SIZE, i8);
-const LOG_VEC_INT = std.math.Log2Int(VEC_INT);
+const WORD_SIZE = if (std.mem.endsWith(u8, @tagName(builtin.cpu.arch), "64_32")) 64 else @bitSizeOf(usize);
+const WORD = std.meta.Int(.unsigned, WORD_SIZE);
 
 const IS_VECTORIZER_BROKEN = builtin.cpu.arch.isSPARC() or builtin.cpu.arch.isPPC() or builtin.cpu.arch.isPPC64();
 const SUGGESTED_VEC_SIZE = if (IS_VECTORIZER_BROKEN) null else std.simd.suggestVectorSizeForCpu(u8, builtin.cpu);
 const USE_SWAR = SUGGESTED_VEC_SIZE == null;
 
 // This is the native vector size.
-const NATIVE_VEC_INT = std.meta.Int(.unsigned, 8 * (SUGGESTED_VEC_SIZE orelse @sizeOf(usize)));
+const NATIVE_VEC_INT = std.meta.Int(.unsigned, 8 * (SUGGESTED_VEC_SIZE orelse @sizeOf(WORD)));
 const NATIVE_VEC_SIZE = @sizeOf(NATIVE_VEC_INT);
-const NATIVE_VEC_CHAR = @Vector(NATIVE_VEC_SIZE, u8);
-const NATIVE_VEC_COND = @Vector(NATIVE_VEC_SIZE, bool);
+const NATIVE_CHAR_VEC = @Vector(NATIVE_VEC_SIZE, u8);
 
 const FRONT_SENTINELS = "\n";
 // const BACK_SENTINELS_OLD = "\n" ++ "\x00" ** 13 ++ " ";
-const BACK_SENTINELS = "\n" ++ "\x00" ** 61 ++ " ";
+const BACK_SENTINELS = "\n" ++ "\x00" ** 62 ++ " ";
 const INDEX_OF_FIRST_0_SENTINEL = std.mem.indexOfScalar(u8, BACK_SENTINELS, 0).?;
 const EXTENDED_BACK_SENTINELS_LEN = BACK_SENTINELS.len - INDEX_OF_FIRST_0_SENTINEL;
 
@@ -76,7 +71,7 @@ fn readFileIntoAlignedBuffer(allocator: Allocator, file: std.fs.File, comptime a
     return buffer[0 .. FRONT_SENTINELS.len + bytes_to_allocate + INDEX_OF_FIRST_0_SENTINEL :0];
 }
 
-fn readFiles(gpa: Allocator) !std.ArrayListUnmanaged([:0]align(VEC_SIZE) const u8) {
+fn readFiles(gpa: Allocator) !std.ArrayListUnmanaged([:0]align(WORD_SIZE) const u8) {
     if (SKIP_OUTLIERS)
         std.debug.print("Skipping outliers!\n", .{});
     std.debug.print("v0.6\n", .{});
@@ -93,7 +88,7 @@ fn readFiles(gpa: Allocator) !std.ArrayListUnmanaged([:0]align(VEC_SIZE) const u
     var num_files: usize = 0;
     var num_bytes: usize = 0;
 
-    var sources: std.ArrayListUnmanaged([:0]align(VEC_SIZE) const u8) = .{};
+    var sources: std.ArrayListUnmanaged([:0]align(WORD_SIZE) const u8) = .{};
     {
         const t1 = std.time.nanoTimestamp();
         var walker = try parent_dir.walk(gpa); // 12-14 ms just walking the tree
@@ -114,7 +109,7 @@ fn readFiles(gpa: Allocator) !std.ArrayListUnmanaged([:0]align(VEC_SIZE) const u
                     defer file.close();
 
                     num_files += 1;
-                    const source = try readFileIntoAlignedBuffer(gpa, file, VEC_SIZE);
+                    const source = try readFileIntoAlignedBuffer(gpa, file, WORD_SIZE);
                     // const source = try file.readToEndAllocOptions(gpa, std.math.maxInt(u32), null, 1, 0);
                     num_bytes += source.len - 2;
 
@@ -312,7 +307,7 @@ const Keywords = struct {
         break :blk max;
     };
 
-    const PADDING_RIGHT = std.math.ceilPowerOfTwo(usize, max_kw_len + 1) catch unreachable;
+    const PADDING_RIGHT = std.math.ceilPowerOfTwo(u64, max_kw_len + 1) catch unreachable;
     const padded_int = std.meta.Int(.unsigned, PADDING_RIGHT);
 
     const sorted_padded_kws align(PADDING_RIGHT) = blk: {
@@ -398,6 +393,7 @@ const Keywords = struct {
         if (BACK_SENTINELS.len < PADDING_RIGHT - 1)
             @compileError(std.fmt.comptimePrint("Keywords.lookup requires additional trailing sentinels in the source file. Expected {}, got {}\n", .{ PADDING_RIGHT - 1, BACK_SENTINELS.len }));
 
+        assert(len != 0);
         const len_u8 = std.math.cast(u8, len) orelse return null;
         const hash = mapToIndex(hashKw(kw, len));
 
@@ -449,7 +445,7 @@ const Keywords = struct {
                     const byte_len = len << 3;
 
                     if (byte_len < 64) {
-                        if (byte_len == 0) unreachable;
+                        assert(byte_len != 0);
                         const shift1: u6 = @intCast(64 - byte_len);
                         word1 = word1 << shift1 >> shift1;
                     }
@@ -921,7 +917,7 @@ fn swarUnMovMask(x: anytype) std.meta.Int(.unsigned, 8 * @bitSizeOf(@TypeOf(x)))
 // Performs a ctz operation using David Seal's method with a small twist.
 // LLVM produces a version of this code by default, but with an explicit branch on 0.
 // This code is branchless on machines that can do `@intFromBool(a == 0)` without branching.
-fn ctzBranchless(a: anytype) std.meta.Int(.unsigned, std.math.ceilPowerOfTwoPromote(u64, std.math.log2_int_ceil(u64, VEC_SIZE + 1))) {
+fn ctzBranchless(a: anytype) std.meta.Int(.unsigned, std.math.ceilPowerOfTwoPromote(u64, std.math.log2_int_ceil(u64, WORD_SIZE + 1))) {
     const T = @TypeOf(a);
 
     // Produce a mask of just the lowest set bit if one exists, else 0.
@@ -986,7 +982,7 @@ test "ctzBranchless" {
     }
 }
 
-fn ctz(a: anytype) std.meta.Int(.unsigned, std.math.ceilPowerOfTwoPromote(u64, std.math.log2_int_ceil(u64, VEC_SIZE + 1))) {
+fn ctz(a: anytype) std.meta.Int(.unsigned, std.math.ceilPowerOfTwoPromote(u64, std.math.log2_int_ceil(u64, WORD_SIZE + 1))) {
     return if (SWAR_CTZ_IMPL == .ctz) @ctz(a) else ctzBranchless(a);
 }
 
@@ -1026,7 +1022,7 @@ fn swarCTZGeneric(x: anytype, comptime impl: @TypeOf(SWAR_CTZ_IMPL)) @TypeOf(x) 
     };
 }
 
-fn swarCTZ(x: usize) @TypeOf(x) {
+fn swarCTZ(x: WORD) @TypeOf(x) {
     return swarCTZGeneric(x, SWAR_CTZ_IMPL);
 }
 
@@ -1281,14 +1277,14 @@ fn _lookup_chunk(comptime a: [16]u8, b: @Vector(16, u8)) @Vector(16, u8) {
 
 const Parser = struct {
     const Bitmaps = packed struct {
-        non_newlines: VEC_INT,
-        identifiers_or_numbers: VEC_INT,
-        non_unescaped_quotes: VEC_INT,
-        whitespace: VEC_INT,
-        non_unescaped_char_literals: VEC_INT,
-        // prev_carriage: VEC_INT,
-        // op_cont_chars: VEC_INT,
-        // non_unescaped_char_literals: VEC_INT,
+        non_newlines: WORD,
+        identifiers_or_numbers: WORD,
+        non_unescaped_quotes: WORD,
+        whitespace: WORD,
+        non_unescaped_char_literals: WORD,
+        // prev_carriage: WORD,
+        // op_cont_chars: WORD,
+        // non_unescaped_char_literals: WORD,
     };
 
     fn mask_for_op_cont(v: u32) u32 {
@@ -1499,8 +1495,8 @@ const Parser = struct {
             const low_7_bits = v & mask;
             return v | ((low_7_bits ^ (ones * chr)) + mask);
         } else {
-            assert(@TypeOf(v) == NATIVE_VEC_CHAR);
-            return ~@as(std.meta.Int(.unsigned, NATIVE_VEC_SIZE), @bitCast(v == @as(NATIVE_VEC_CHAR, @splat(chr))));
+            assert(@TypeOf(v) == NATIVE_CHAR_VEC);
+            return ~@as(std.meta.Int(.unsigned, NATIVE_VEC_SIZE), @bitCast(v == @as(NATIVE_CHAR_VEC, @splat(chr))));
         }
     }
 
@@ -1523,12 +1519,12 @@ const Parser = struct {
 
             return v | accumulator;
         } else {
-            assert(@TypeOf(v) == NATIVE_VEC_CHAR);
+            assert(@TypeOf(v) == NATIVE_CHAR_VEC);
             var accumulator = @as(std.meta.Int(.unsigned, NATIVE_VEC_SIZE), 0);
             inline for (str) |c| {
                 assert(c < 0x80); // Because this would break the SWAR version, we enforce it here too.
                 // for some reason, a lot of backends (arm+ppc64) like accumulated `|` better than `&`
-                accumulator |= @bitCast(v == @as(NATIVE_VEC_CHAR, @splat(c)));
+                accumulator |= @bitCast(v == @as(NATIVE_CHAR_VEC, @splat(c)));
             }
             return ~accumulator;
         }
@@ -1553,12 +1549,12 @@ const Parser = struct {
 
             return ~v & accumulator;
         } else {
-            assert(@TypeOf(v) == NATIVE_VEC_CHAR);
+            assert(@TypeOf(v) == NATIVE_CHAR_VEC);
             var accumulator = @as(std.meta.Int(.unsigned, NATIVE_VEC_SIZE), 0);
             inline for (str) |c| {
                 assert(c < 0x80); // Because this would break the SWAR version, we enforce it here too.
                 // for some reason, a lot of backends (arm+ppc64) like accumulated `|` better than `&`
-                accumulator |= @bitCast(v == @as(NATIVE_VEC_CHAR, @splat(c)));
+                accumulator |= @bitCast(v == @as(NATIVE_CHAR_VEC, @splat(c)));
             }
             return accumulator;
         }
@@ -1568,9 +1564,9 @@ const Parser = struct {
         return maskForCharsGeneric(v, str, USE_SWAR);
     }
 
-    fn maskForCharRange(input_vec: NATIVE_VEC_CHAR, comptime char1: u8, comptime char2: u8) std.meta.Int(.unsigned, NATIVE_VEC_SIZE) {
+    fn maskForCharRange(input_vec: NATIVE_CHAR_VEC, comptime char1: u8, comptime char2: u8) std.meta.Int(.unsigned, NATIVE_VEC_SIZE) {
         const VEC_T = std.meta.Int(.unsigned, NATIVE_VEC_SIZE);
-        return @as(VEC_T, @bitCast(@as(NATIVE_VEC_CHAR, @splat(char1)) <= input_vec)) & @as(VEC_T, @bitCast(input_vec <= @as(NATIVE_VEC_CHAR, @splat(char2))));
+        return @as(VEC_T, @bitCast(@as(NATIVE_CHAR_VEC, @splat(char1)) <= input_vec)) & @as(VEC_T, @bitCast(input_vec <= @as(NATIVE_CHAR_VEC, @splat(char2))));
     }
 
     // On arm and ve machines, `@ctz(x)` is implemented as `@bitReverse(@clz(x))`.
@@ -1596,11 +1592,11 @@ const Parser = struct {
     const DO_CHAR_LITERAL_IN_SIMD = false;
     const DO_QUOTE_IN_SIMD = false;
 
-    fn reverseIfCheap(b: VEC_INT) VEC_INT {
+    fn reverseIfCheap(b: WORD) WORD {
         return if (DO_BIT_REVERSE) @bitReverse(b) else b;
     }
 
-    fn movMask(v: anytype) VEC_INT {
+    fn movMask(v: anytype) WORD {
         return if (USE_SWAR) (if (DO_MASK_REVERSE) swarMovMaskReversed(v) else swarMovMask(v)) else v;
     }
 
@@ -1636,17 +1632,17 @@ const Parser = struct {
     // TODO: audit usages of u32's to make sure it's impossible to ever overflow.
     // TODO: make it so quotes and character literals cannot have newlines in them?
     // TODO: audit the utf8 validator to make sure we clear the state properly when not using it
-    pub fn tokenize(gpa: Allocator, source: [:0]align(VEC_SIZE) const u8, comptime impl: u1) ![]Token {
+    pub fn tokenize(gpa: Allocator, source: [:0]align(WORD_SIZE) const u8, comptime impl: u1) ![]Token {
         const ON_DEMAND_IMPL: u2 = @intFromBool(!USE_SWAR);
         const FOLD_COMMENTS_INTO_ADJACENT_NODES = true;
         const end_ptr = &source.ptr[source.len];
-        const extended_source_len = std.mem.alignForward(usize, source.len + EXTENDED_BACK_SENTINELS_LEN, VEC_SIZE);
+        const extended_source_len = std.mem.alignForward(usize, source.len + EXTENDED_BACK_SENTINELS_LEN, WORD_SIZE);
         const extended_source = source.ptr[0..extended_source_len];
         const tokens = try gpa.alloc(Token, extended_source_len);
         errdefer gpa.free(tokens);
 
         // TODO: add dynamic math here based on DO_CHAR_LITERAL_IN_SIMD and DO_QUOTE_IN_SIMD
-        const non_newlines_bitstrings = try gpa.alloc(VEC_INT, extended_source_len / VEC_SIZE + @typeInfo(Bitmaps).Struct.fields.len + if (ON_DEMAND_IMPL == 1) 4 else 1);
+        const non_newlines_bitstrings = try gpa.alloc(WORD, extended_source_len / WORD_SIZE + @typeInfo(Bitmaps).Struct.fields.len + if (ON_DEMAND_IMPL == 1) 4 else 1);
 
         // TODO: make this errdefer and return this data out.
         // We can use this information later to find out what line we are on.
@@ -1666,35 +1662,35 @@ const Parser = struct {
             std.mem.readInt(u32, prev[0..4], comptime builtin.cpu.arch.endian()) == std.mem.readInt(u32, "\n\xEF\xBB\xBF", comptime builtin.cpu.arch.endian()),
         )) * 4 ..];
 
-        var bitmap_ptr: []VEC_INT = non_newlines_bitstrings;
+        var bitmap_ptr: []WORD = non_newlines_bitstrings;
         bitmap_ptr.ptr -= 1;
         bitmap_ptr.len += 1;
         var op_type: Tag = .whitespace;
-        var selected_bitmap: []const VEC_INT = bitmap_ptr[@as(u3, @truncate(@intFromEnum(op_type)))..];
-        var bitmap_index: usize = @intFromPtr(cur.ptr) / VEC_SIZE * VEC_SIZE -% VEC_SIZE;
+        var selected_bitmap: []const WORD = bitmap_ptr[@as(u3, @truncate(@intFromEnum(op_type)))..];
+        var bitmap_index = @intFromPtr(cur.ptr) / WORD_SIZE * WORD_SIZE -% WORD_SIZE;
         var utf8_checker = if (VALIDATE_UTF8) Utf8Checker{};
-        var next_is_escaped = if (DO_QUOTE_IN_SIMD or DO_CHAR_LITERAL_IN_SIMD) @as(VEC_INT, 0);
+        var next_is_escaped = if (DO_QUOTE_IN_SIMD or DO_CHAR_LITERAL_IN_SIMD) @as(WORD, 0);
 
         outer: while (true) : (cur = cur[1..]) {
             {
-                var aligned_ptr = @intFromPtr(cur.ptr) / VEC_SIZE * VEC_SIZE;
+                var aligned_ptr = @intFromPtr(cur.ptr) / WORD_SIZE * WORD_SIZE;
                 while (true) {
                     // https://github.com/ziglang/zig/issues/8220
                     // TODO: once labeled switch continues are added, we can make this check run the first iteration only.
                     // If we loop back around, there is no need to check this.
                     // I implemented this with tail call functions but it was messy.
                     while (bitmap_index != aligned_ptr) {
-                        bitmap_index +%= VEC_SIZE;
-                        const base_ptr = @as([*]align(VEC_SIZE) const u8, @ptrFromInt(bitmap_index));
+                        bitmap_index +%= WORD_SIZE;
+                        const base_ptr = @as([*]align(WORD_SIZE) const u8, @ptrFromInt(bitmap_index));
 
-                        var ctrls: VEC_INT = 0;
-                        var non_quotes = if (DO_QUOTE_IN_SIMD) @as(VEC_INT, 0);
-                        var non_char_literals = if (DO_CHAR_LITERAL_IN_SIMD) @as(VEC_INT, 0);
-                        var non_backslashes = if (DO_QUOTE_IN_SIMD or DO_CHAR_LITERAL_IN_SIMD) @as(VEC_INT, 0);
-                        var non_spaces: VEC_INT = 0;
-                        var identifiers_or_numbers: VEC_INT = 0;
+                        var ctrls: WORD = 0;
+                        var non_quotes = if (DO_QUOTE_IN_SIMD) @as(WORD, 0);
+                        var non_char_literals = if (DO_CHAR_LITERAL_IN_SIMD) @as(WORD, 0);
+                        var non_backslashes = if (DO_QUOTE_IN_SIMD or DO_CHAR_LITERAL_IN_SIMD) @as(WORD, 0);
+                        var non_spaces: WORD = 0;
+                        var identifiers_or_numbers: WORD = 0;
 
-                        inline for (0..comptime VEC_SIZE / NATIVE_VEC_SIZE) |i| {
+                        inline for (0..comptime WORD_SIZE / NATIVE_VEC_SIZE) |i| {
                             const chunk = blk: {
                                 const slice: *align(NATIVE_VEC_SIZE) const [NATIVE_VEC_SIZE]u8 = @alignCast(base_ptr[i * NATIVE_VEC_SIZE ..][0..NATIVE_VEC_SIZE]);
 
@@ -1709,8 +1705,8 @@ const Parser = struct {
                                 }
                             };
 
-                            const shift: LOG_VEC_INT = if (ASSEMBLE_BITSTRINGS_BACKWARDS)
-                                @intCast((VEC_SIZE - NATIVE_VEC_SIZE) - NATIVE_VEC_SIZE * i)
+                            const shift: std.math.Log2Int(WORD) = if (ASSEMBLE_BITSTRINGS_BACKWARDS)
+                                @intCast((WORD_SIZE - NATIVE_VEC_SIZE) - NATIVE_VEC_SIZE * i)
                             else
                                 @intCast(NATIVE_VEC_SIZE * i);
 
@@ -1744,7 +1740,7 @@ const Parser = struct {
                             // This code is brought to you courtesy of simdjson, licensed
                             // under the Apache 2.0 license which is included at the bottom of this file
 
-                            const ODD_BITS: VEC_INT = @bitCast(@as(@Vector(@divExact(VEC_SIZE, 8), u8), @splat(0xaa)));
+                            const ODD_BITS: WORD = @bitCast(@as(@Vector(@divExact(WORD_SIZE, 8), u8), @splat(0xaa)));
                             const backslash = ~non_backslashes;
 
                             // |                                | Mask (shows characters instead of 1's) | Depth | Instructions        |
@@ -1808,7 +1804,7 @@ const Parser = struct {
 
                             const escaped = escape_and_terminal_code ^ (backslash | next_is_escaped);
                             const escape = escape_and_terminal_code & backslash;
-                            next_is_escaped = escape >> (VEC_SIZE - 1);
+                            next_is_escaped = escape >> (WORD_SIZE - 1);
 
                             if (DO_QUOTE_IN_SIMD)
                                 bitmap_ptr[2] = reverseIfCheap((non_quotes & ~ctrls) | escaped);
@@ -1832,7 +1828,7 @@ const Parser = struct {
 
                         // TODO: shift the quotes bitstring by 1 to increase the length automatically
 
-                        // for (base_ptr[0..VEC_SIZE]) |c| {
+                        // for (base_ptr[0..WORD_SIZE]) |c| {
                         //     switch (c) {
                         //         '\n' => std.debug.print("$", .{}),
                         //         else => std.debug.print("{c}", .{c}),
@@ -1847,7 +1843,7 @@ const Parser = struct {
                         // std.debug.print("\n", .{});
                     }
 
-                    const cur_misalignment: LOG_VEC_INT = @truncate(@intFromPtr(cur.ptr));
+                    const cur_misalignment: std.math.Log2Int(WORD) = @truncate(@intFromPtr(cur.ptr));
 
                     // We invert, i.e. count 1's, because 0's are shifted in by the bitshift.
                     const inverted_bitstring = ~if (USE_REVERSED_BITSTRINGS)
@@ -1859,11 +1855,11 @@ const Parser = struct {
                     // we speculatively bitReverse in `nextChunk` to avoid doing so in this loop.
                     const str_len: std.meta.Int(
                         .unsigned,
-                        std.math.ceilPowerOfTwoPromote(u64, std.math.log2_int_ceil(u64, VEC_SIZE + 1)),
+                        std.math.ceilPowerOfTwoPromote(u64, std.math.log2_int_ceil(u64, WORD_SIZE + 1)),
                     ) = if (USE_REVERSED_BITSTRINGS) @clz(inverted_bitstring) else ctz(inverted_bitstring);
 
                     cur = cur[str_len..];
-                    aligned_ptr = @intFromPtr(cur.ptr) / VEC_SIZE * VEC_SIZE;
+                    aligned_ptr = @intFromPtr(cur.ptr) / WORD_SIZE * WORD_SIZE;
                     if (bitmap_index == aligned_ptr) break;
                 }
             }
@@ -2038,17 +2034,17 @@ const Parser = struct {
                             cur = cur[1..];
                         }
                     } else {
-                        comptime var op_continuation_chars align(32) = std.mem.zeroes([@divExact(256, @bitSizeOf(usize))]usize);
+                        comptime var op_continuation_chars align(32) = std.mem.zeroes([@divExact(256, WORD_SIZE)]WORD);
                         comptime for (Operators.unpadded_ops) |op| {
                             for (op[1..]) |c| {
-                                op_continuation_chars[c / @bitSizeOf(usize)] |=
-                                    @as(usize, 1) << @truncate(c);
+                                op_continuation_chars[c / WORD_SIZE] |=
+                                    @as(WORD, 1) << @truncate(c);
                             }
                         };
 
                         inline for (0..3) |_| {
                             const c = cur[op_len];
-                            const is_op_char: u1 = @truncate(op_continuation_chars[c / @bitSizeOf(usize)] >> @truncate(c));
+                            const is_op_char: u1 = @truncate(op_continuation_chars[c / WORD_SIZE] >> @truncate(c));
                             if (is_op_char == 0) break;
                             op_len += 1;
                         }
@@ -2105,17 +2101,17 @@ const Parser = struct {
                         },
                         1 => sol: {
                             cur = cur[1..];
-                            var next_is_escaped_on_demand: VEC_INT = 0;
+                            var next_is_escaped_on_demand: WORD = 0;
 
-                            const FORCE_ALIGNMENT = USE_SWAR;
+                            const FORCE_ALIGNMENT = USE_SWAR; // TODO: make this more accurate
                             const alignment = if (FORCE_ALIGNMENT) NATIVE_VEC_SIZE else 1;
 
-                            var non_unescaped_quotes: VEC_INT = undefined;
+                            var non_unescaped_quotes: WORD = undefined;
                             const quote_bitmap_old = bitmap_ptr[if (chr == '"') 2 else 4..];
 
                             if (@intFromPtr(cur.ptr) < quote_bitmap_old[3]) {
                                 next_is_escaped_on_demand = quote_bitmap_old[4];
-                                const offset = @intFromPtr(cur.ptr) - (quote_bitmap_old[3] - VEC_SIZE);
+                                const offset = @intFromPtr(cur.ptr) - (quote_bitmap_old[3] - WORD_SIZE);
                                 const shifted_bitstring = ~(quote_bitmap_old[0] >> @intCast(offset));
                                 cur = cur[ctz(shifted_bitstring)..];
 
@@ -2128,11 +2124,12 @@ const Parser = struct {
                             var cur_misalignment: std.math.Log2Int(std.meta.Int(.unsigned, alignment)) = @truncate(@intFromPtr(cur.ptr));
 
                             while (true) : (cur_misalignment = 0) {
-                                var ctrls: VEC_INT = 0;
-                                var non_quotes = @as(VEC_INT, 0);
-                                var non_backslashes = @as(VEC_INT, 0);
+                                var ctrls: WORD = 0;
+                                var non_quotes = @as(WORD, 0);
+                                var non_backslashes = @as(WORD, 0);
 
-                                inline for (0..comptime VEC_SIZE / NATIVE_VEC_SIZE) |i| {
+                                comptime assert(WORD_SIZE >= BACK_SENTINELS.len);
+                                inline for (0..comptime WORD_SIZE / NATIVE_VEC_SIZE) |i| {
                                     const chunk = blk: {
                                         const slice: *align(if (FORCE_ALIGNMENT) NATIVE_VEC_SIZE else 1) const [NATIVE_VEC_SIZE]u8 = @alignCast((if (FORCE_ALIGNMENT) next_aligned_chunk else cur)[i * NATIVE_VEC_SIZE ..][0..NATIVE_VEC_SIZE]);
 
@@ -2147,8 +2144,8 @@ const Parser = struct {
                                         }
                                     };
 
-                                    const shift: LOG_VEC_INT = if (ASSEMBLE_BITSTRINGS_BACKWARDS)
-                                        @intCast((VEC_SIZE - NATIVE_VEC_SIZE) - NATIVE_VEC_SIZE * i)
+                                    const shift: std.math.Log2Int(WORD) = if (ASSEMBLE_BITSTRINGS_BACKWARDS)
+                                        @intCast((WORD_SIZE - NATIVE_VEC_SIZE) - NATIVE_VEC_SIZE * i)
                                     else
                                         @intCast(NATIVE_VEC_SIZE * i);
 
@@ -2162,7 +2159,7 @@ const Parser = struct {
                                 // ----------------------------------------------------------------------------
                                 // This code is brought to you courtesy of simdjson, licensed
                                 // under the Apache 2.0 license which is included at the bottom of this file
-                                const ODD_BITS: VEC_INT = @bitCast(@as(@Vector(@divExact(VEC_SIZE, 8), u8), @splat(0xaa)));
+                                const ODD_BITS: WORD = @bitCast(@as(@Vector(@divExact(WORD_SIZE, 8), u8), @splat(0xaa)));
 
                                 // |                                | Mask (shows characters instead of 1's) | Depth | Instructions        |
                                 // |--------------------------------|----------------------------------------|-------|---------------------|
@@ -2225,12 +2222,12 @@ const Parser = struct {
 
                                 const escaped = escape_and_terminal_code ^ (backslash | next_is_escaped_on_demand);
                                 const escape = escape_and_terminal_code & backslash;
-                                next_is_escaped_on_demand = escape >> (VEC_SIZE - 1);
+                                next_is_escaped_on_demand = escape >> (WORD_SIZE - 1);
 
                                 non_unescaped_quotes = (non_quotes & ~ctrls) | escaped;
                                 const shifted_bitstring = ~(non_unescaped_quotes >> cur_misalignment);
                                 cur = cur[ctz(shifted_bitstring)..];
-                                next_aligned_chunk += VEC_SIZE;
+                                next_aligned_chunk += WORD_SIZE;
                                 if (if (FORCE_ALIGNMENT) cur.ptr != next_aligned_chunk else shifted_bitstring != 0) break;
                             }
 
@@ -2245,7 +2242,7 @@ const Parser = struct {
                             // const VEC_INT_MINI = std.meta.Int(.unsigned, VEC_SIZE_MINI);
                             // const VEC_MINI = @Vector(VEC_SIZE_MINI, u8);
 
-                            var next_is_escaped_on_demand: VEC_INT = 0;
+                            var next_is_escaped_on_demand: WORD = 0;
 
                             const FORCE_ALIGNMENT = true;
                             const alignment = if (FORCE_ALIGNMENT) NATIVE_VEC_SIZE else 1;
@@ -2267,7 +2264,7 @@ const Parser = struct {
                                 // ----------------------------------------------------------------------------
                                 // This code is brought to you courtesy of simdjson, licensed
                                 // under the Apache 2.0 license which is included at the bottom of this file
-                                const ODD_BYTES: VEC_INT = 0x8000800080008000;
+                                const ODD_BYTES: WORD = 0x8000800080008000;
                                 const potential_escape = backslash & ~next_is_escaped_on_demand;
                                 const maybe_escaped = potential_escape << 8;
                                 const maybe_escaped_and_odd_bits = maybe_escaped | ODD_BYTES;
@@ -2275,7 +2272,7 @@ const Parser = struct {
                                 const escape_and_terminal_code = even_series_codes_and_odd_bits ^ ODD_BYTES;
                                 const escaped = escape_and_terminal_code ^ (backslash | next_is_escaped_on_demand);
                                 const escape = escape_and_terminal_code & backslash;
-                                next_is_escaped_on_demand = escape >> (VEC_SIZE - 1 - 7);
+                                next_is_escaped_on_demand = escape >> (WORD_SIZE - 1 - 7);
                                 const non_unescaped_quotes = ((non_quotes & non_ctrls) | escaped) & 0x8080808080808080;
                                 const shifted_bitstring = ~(non_unescaped_quotes >> (@as(u6, cur_misalignment) << 3));
                                 // ----------------------------------------------------------------------------
@@ -2289,19 +2286,19 @@ const Parser = struct {
                         },
                         3 => {
                             cur = cur[1..];
-                            var next_is_escaped_on_demand: VEC_INT = 0;
+                            var next_is_escaped_on_demand: WORD = 0;
                             const FORCE_ALIGNMENT = USE_SWAR;
                             const alignment = if (FORCE_ALIGNMENT) NATIVE_VEC_SIZE else 1;
                             var next_aligned_chunk: [*]align(alignment) const u8 = @ptrFromInt(@intFromPtr(cur.ptr) / alignment * alignment); // cur.ptr when alignment mattereth not
                             var cur_misalignment: std.math.Log2Int(std.meta.Int(.unsigned, alignment)) = @truncate(@intFromPtr(cur.ptr));
-                            var non_unescaped_quotes: VEC_INT = undefined;
+                            var non_unescaped_quotes: WORD = undefined;
 
                             while (true) : (cur_misalignment = 0) {
-                                var ctrls: VEC_INT = 0;
-                                var non_quotes = @as(VEC_INT, 0);
-                                var non_backslashes = @as(VEC_INT, 0);
+                                var ctrls: WORD = 0;
+                                var non_quotes = @as(WORD, 0);
+                                var non_backslashes = @as(WORD, 0);
 
-                                inline for (0..comptime VEC_SIZE / NATIVE_VEC_SIZE) |i| {
+                                inline for (0..comptime WORD_SIZE / NATIVE_VEC_SIZE) |i| {
                                     const chunk = blk: {
                                         const slice: *align(if (FORCE_ALIGNMENT) NATIVE_VEC_SIZE else 1) const [NATIVE_VEC_SIZE]u8 = @alignCast((if (FORCE_ALIGNMENT) next_aligned_chunk else cur)[i * NATIVE_VEC_SIZE ..][0..NATIVE_VEC_SIZE]);
 
@@ -2316,8 +2313,8 @@ const Parser = struct {
                                         }
                                     };
 
-                                    const shift: LOG_VEC_INT = if (ASSEMBLE_BITSTRINGS_BACKWARDS)
-                                        @intCast((VEC_SIZE - NATIVE_VEC_SIZE) - NATIVE_VEC_SIZE * i)
+                                    const shift: std.math.Log2Int(WORD) = if (ASSEMBLE_BITSTRINGS_BACKWARDS)
+                                        @intCast((WORD_SIZE - NATIVE_VEC_SIZE) - NATIVE_VEC_SIZE * i)
                                     else
                                         @intCast(NATIVE_VEC_SIZE * i);
 
@@ -2331,7 +2328,7 @@ const Parser = struct {
                                 // ----------------------------------------------------------------------------
                                 // This code is brought to you courtesy of simdjson, licensed
                                 // under the Apache 2.0 license which is included at the bottom of this file
-                                const ODD_BITS: VEC_INT = @bitCast(@as(@Vector(@divExact(VEC_SIZE, 8), u8), @splat(0xaa)));
+                                const ODD_BITS: WORD = @bitCast(@as(@Vector(@divExact(WORD_SIZE, 8), u8), @splat(0xaa)));
 
                                 // |                                | Mask (shows characters instead of 1's) | Depth | Instructions        |
                                 // |--------------------------------|----------------------------------------|-------|---------------------|
@@ -2394,12 +2391,12 @@ const Parser = struct {
 
                                 const escaped = escape_and_terminal_code ^ (backslash | next_is_escaped_on_demand);
                                 const escape = escape_and_terminal_code & backslash;
-                                next_is_escaped_on_demand = escape >> (VEC_SIZE - 1);
+                                next_is_escaped_on_demand = escape >> (WORD_SIZE - 1);
 
                                 non_unescaped_quotes = (non_quotes & ~ctrls) | escaped;
                                 const shifted_bitstring = ~(non_unescaped_quotes >> cur_misalignment);
                                 cur = cur[ctz(shifted_bitstring)..];
-                                if (FORCE_ALIGNMENT) next_aligned_chunk += VEC_SIZE;
+                                if (FORCE_ALIGNMENT) next_aligned_chunk += WORD_SIZE;
                                 if (if (FORCE_ALIGNMENT) cur.ptr != next_aligned_chunk else shifted_bitstring != 0) break;
                             }
                         },
