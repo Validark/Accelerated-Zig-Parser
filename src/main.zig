@@ -914,78 +914,6 @@ fn swarUnMovMask(x: anytype) std.meta.Int(.unsigned, 8 * @bitSizeOf(@TypeOf(x)))
     return r;
 }
 
-// Performs a ctz operation using David Seal's method with a small twist.
-// LLVM produces a version of this code by default, but with an explicit branch on 0.
-// This code is branchless on machines that can do `@intFromBool(a == 0)` without branching.
-fn ctzBranchless(a: anytype) std.meta.Int(.unsigned, std.math.ceilPowerOfTwoPromote(u64, std.math.log2_int_ceil(u64, WORD_SIZE + 1))) {
-    const T = @TypeOf(a);
-
-    // Produce a mask of just the lowest set bit if one exists, else 0.
-    // There are `@bitSizeOf(T)+1` possibilities for `x`.
-    // We handle the `0` case separately.
-    const x = a & (~a +% 1);
-
-    const constant = switch (@bitSizeOf(T)) {
-        64 => 151050438420815295,
-        32 => 125613361,
-        // 16 => 2479,
-        // 8 => 23,
-        else => return @ctz(a),
-    };
-    const shift = @bitSizeOf(T) - @bitSizeOf(std.math.Log2Int(T));
-    const hash: std.math.Log2Int(T) = @intCast((x *% constant) >> shift);
-    comptime var lookup_table: [@bitSizeOf(T)]u8 = undefined;
-    comptime {
-        var taken_slots: T = 0;
-        for (0..@bitSizeOf(T)) |i| {
-            const x_possibility = @as(T, 1) << i;
-            const x_possibility_hash: std.math.Log2Int(T) = @intCast((x_possibility *% constant) >> shift);
-            taken_slots |= @as(T, 1) << x_possibility_hash;
-            lookup_table[x_possibility_hash] = @ctz(x_possibility);
-        }
-        assert(~taken_slots == 0); // proves it is a minimal perfect hash function and that we overwrote all the undefined values
-        // The difference between this algorithm and the mainstream algorithm is that we set the high bit here and use a bitwise AND to grab the right value.
-        lookup_table[0] |= @bitSizeOf(T);
-    }
-    const tzcnt_if_non0 = lookup_table[hash];
-
-    return switch (builtin.cpu.arch) {
-        .aarch64_32,
-        .aarch64_be,
-        .aarch64,
-        .arm,
-        .armeb,
-        .thumb,
-        .thumbeb,
-
-        .sparc,
-        .sparc64,
-        .sparcel,
-        => if (a == 0) @bitSizeOf(T) else tzcnt_if_non0,
-
-        .x86,
-        .x86_64,
-
-        .riscv32,
-        .riscv64,
-        => tzcnt_if_non0 & (@intFromBool(a == 0) +% @as(u8, @bitSizeOf(T) - 1)),
-        else => tzcnt_if_non0 & (@intFromBool(a == 0) +% @as(u8, @bitSizeOf(T) - 1)),
-    };
-}
-
-test "ctzBranchless" {
-    inline for ([_]type{ u64, u32 }) |T| {
-        inline for (0..@bitSizeOf(T) + 1) |i| {
-            const x = if (i == @bitSizeOf(T)) @as(T, 0) else @as(T, 1) << i;
-            try std.testing.expectEqual(@ctz(x), @intCast(ctzBranchless(x)));
-        }
-    }
-}
-
-fn ctz(a: anytype) std.meta.Int(.unsigned, std.math.ceilPowerOfTwoPromote(u64, std.math.log2_int_ceil(u64, WORD_SIZE + 1))) {
-    return if (SWAR_CTZ_IMPL == .ctz) @ctz(a) else ctzBranchless(a);
-}
-
 fn swarCTZPlus1Generic(x: anytype, comptime impl: @TypeOf(SWAR_CTZ_PLUS_1_IMPL)) @TypeOf(x) {
     const ones: @TypeOf(x) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(x)), 8), u8), @splat(0x01)));
     assert(x != 0 and (x & (0x7F * ones)) == 0);
@@ -1856,7 +1784,7 @@ const Parser = struct {
                     const str_len: std.meta.Int(
                         .unsigned,
                         std.math.ceilPowerOfTwoPromote(u64, std.math.log2_int_ceil(u64, WORD_SIZE + 1)),
-                    ) = if (USE_REVERSED_BITSTRINGS) @clz(inverted_bitstring) else ctz(inverted_bitstring);
+                    ) = if (USE_REVERSED_BITSTRINGS) @clz(inverted_bitstring) else @ctz(inverted_bitstring);
 
                     cur = cur[str_len..];
                     aligned_ptr = @intFromPtr(cur.ptr) / WORD_SIZE * WORD_SIZE;
@@ -2113,7 +2041,7 @@ const Parser = struct {
                                 next_is_escaped_on_demand = quote_bitmap_old[4];
                                 const offset = @intFromPtr(cur.ptr) - (quote_bitmap_old[3] - WORD_SIZE);
                                 const shifted_bitstring = ~(quote_bitmap_old[0] >> @intCast(offset));
-                                cur = cur[ctz(shifted_bitstring)..];
+                                cur = cur[@ctz(shifted_bitstring)..];
 
                                 if (@intFromPtr(cur.ptr) != quote_bitmap_old[3]) {
                                     break :sol;
@@ -2226,7 +2154,7 @@ const Parser = struct {
 
                                 non_unescaped_quotes = (non_quotes & ~ctrls) | escaped;
                                 const shifted_bitstring = ~(non_unescaped_quotes >> cur_misalignment);
-                                cur = cur[ctz(shifted_bitstring)..];
+                                cur = cur[@ctz(shifted_bitstring)..];
                                 next_aligned_chunk += WORD_SIZE;
                                 if (if (FORCE_ALIGNMENT) cur.ptr != next_aligned_chunk else shifted_bitstring != 0) break;
                             }
@@ -2395,7 +2323,7 @@ const Parser = struct {
 
                                 non_unescaped_quotes = (non_quotes & ~ctrls) | escaped;
                                 const shifted_bitstring = ~(non_unescaped_quotes >> cur_misalignment);
-                                cur = cur[ctz(shifted_bitstring)..];
+                                cur = cur[@ctz(shifted_bitstring)..];
                                 if (FORCE_ALIGNMENT) next_aligned_chunk += WORD_SIZE;
                                 if (if (FORCE_ALIGNMENT) cur.ptr != next_aligned_chunk else shifted_bitstring != 0) break;
                             }
