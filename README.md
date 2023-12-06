@@ -80,8 +80,6 @@ In the last few days, I have:
 
 - Added more tests and compile-time assertions. We're getting there!
 
-- Made the count-trailing-zeros function branchless (for machines without a built-in instruction, of course). I still use David Seal's algorithm, namely isolating the lowest set bit via `a & -a`, then multiplying the resulting value by a constant which works as a perfect hash function for the 64 possibile bitstrings with a single bit set. We shift right by 58 to get the upper 6 bits, then use that as our index in a lookup table with our precomputed answer. LLVM by default gives you a version that checks against 0 in the first instruction and jumps to a branch that loads 64 in that case. In my new code, we let 0 flow through normal execution, but then we do `@intFromBool(a == 0) +% @as(u8, 63)` and use that as a mask for the value retrieved from the lookup table. I.e. `(if (a == 0) 64 else 63) & lookup_table[...]`. Costs 2 more instructions but it eliminates the branch, so I think it is worthwhile.
-
 # Results
 
 **Currently the utf8 validator is turned off! I did a lot of performance optimization the past few days and did not finish porting my changes over yet.**
@@ -206,8 +204,6 @@ I try to achieve each of these in the following ways:
     - Some things we do unconditionally that could be hidden behind a branch, but are very inexpensive so there is no point. Other things we hide behind a branch when it's expensive and generally predictable. E.g. utf8 validation is typically just making sure all bytes are less than 128, i.e. 0x80. Once we see some non-ascii sequences, then we have to do the more computationally expensive work of making sure the byte sequence is valid.
 
     - Table lookups. I consolidate the SIMD/SWAR code into one so that we go down the exact same codepaths to find how many non_newline/identifier/non_unescaped_quote/space characters to jump over. This is probably much more efficient than having 4 separate copies of the same hot loop.
-
-    - Using a branchless count-trailing-zeros function (for machines without a built-in instruction, of course). Like LLVM, I use David Seal's algorithm, namely isolating the lowest set bit via `a & -a`, then multiplying the resulting value by a constant which works as a perfect hash function for the 64 possibile bitstrings with a single bit set. We then shift right by 58 to get the upper 6 bits, then use that as our index in a lookup table with our precomputed answer. LLVM by default gives you a version that checks against 0 in the first instruction and jumps to a branch that loads 64 in that case. In my new code, we let 0 flow through normal execution, but then we do `@intFromBool(a == 0) +% @as(u8, 63)` and use that as a mask for the value retrieved from the lookup table. I.e. `(if (a == 0) 64 else 63) & lookup_table[...]`. Costs 2 more instructions but it eliminates the branch, so I think it is worthwhile.
 
     - Inlining the SIMD/SWAR loop, even on machines that need to unroll 8 times. This turns out to be worth it in my tests, probably because it is an extremely hot loop!
 
