@@ -4,6 +4,27 @@ const std = @import("std");
 // declaratively construct a build graph that will be executed by an external
 // runner.
 pub fn build(b: *std.Build) void {
+    // const lib = b.addSharedLibrary(.{
+    //     .name = cfg.package_name,
+    //     .root_source_file = .{ .path = cfg.stub_path },
+    //     .target = target,
+    //     .optimize = optimize,
+    // });
+    // lib.root_module.addImport("exporter", b.createModule(.{
+    //     .root_source_file = .{ .path = cfg.exporter_path },
+    // }));
+    // lib.root_module.addImport("package", b.createModule(.{
+    //     .root_source_file = .{ .path = cfg.package_path },
+    // }));
+    // if (cfg.use_libc) {
+    //     lib.linkLibC();
+    // }
+    // if (cfg.target.cpu_arch == .wasm32) {
+    //     lib.use_lld = false;
+    //     lib.rdynamic = true;
+    // }
+    // b.installArtifact(lib);
+
     const path = "src/main.zig";
 
     // Standard target options allows the person running `zig build` to choose
@@ -17,8 +38,10 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
+    const num_args = if (b.args) |args| args.len else 0;
+
     const exe = b.addExecutable(.{
-        .name = "exe",
+        .name = if (num_args > 0) b.args.?[0] else "exe",
         // In this case the main source file is merely a path, however, in more
         // complicated build scripts, this could be a generated file.
         .root_source_file = .{ .path = path },
@@ -26,7 +49,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    exe.linkLibC();
+    // exe.addIncludePath(.{ .path = "c-src" }); // Look for C source files
+    // exe.linkLibC();
+
+    for ([_][]const u8{"jdz_allocator"}) |dependency_name| {
+        const dependency = b.dependency(dependency_name, .{ .target = target, .optimize = optimize });
+        exe.root_module.addImport(dependency_name, dependency.module(dependency_name));
+    }
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
@@ -47,7 +76,7 @@ pub fn build(b: *std.Build) void {
     // This allows the user to pass arguments to the application in the build
     // command itself, like this: `zig build run -- arg1 arg2 etc`
     if (b.args) |args| {
-        run_cmd.addArgs(args);
+        run_cmd.addArgs(args[1..]);
     }
 
     // This creates a build step. It will be visible in the `zig build --help` menu,

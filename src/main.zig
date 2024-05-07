@@ -1,12 +1,33 @@
 // zig fmt: off
 const SKIP_OUTLIERS        = false;
-const RUN_LEGACY_TOKENIZER = false;
+const RUN_LEGACY_TOKENIZER = true;
 const RUN_NEW_TOKENIZER    = true;
 const RUN_LEGACY_AST       = false;
-const RUN_NEW_AST          = true;
+const RUN_NEW_AST          = false;
 const REPORT_SPEED         = true;
-const INFIX_TEST           = true;
+const INFIX_TEST           = false;
 // zig fmt: on
+
+// Debug print functions
+fn printu(v: anytype) void {
+    comptime var shift = @bitSizeOf(@TypeOf(v));
+    inline while (true) {
+        shift -= 4;
+        std.debug.print("{b:0>4}{c}", .{ @as(u4, @truncate(v >> shift)), if (shift % 8 == 0) ' ' else '_' });
+        if (shift == 0) break;
+    }
+    std.debug.print("\n", .{});
+}
+
+fn printx(v: anytype) void {
+    comptime var shift = @bitSizeOf(@TypeOf(v));
+    inline while (true) {
+        shift -= 4;
+        std.debug.print("{x}{c}", .{ @as(u4, @truncate(v >> shift)), if (shift % 8 == 0) ' ' else '_' });
+        if (shift == 0) break;
+    }
+    std.debug.print("\n", .{});
+}
 
 // TODO: move the unary stuff so it is in mostly one location
 // TODO: figure out what behavior we should have for invalid vs unknown
@@ -20,6 +41,19 @@ const INFIX_TEST           = true;
 
 // I could probably reorganize the `Tag` address space and see if I can squeeze more perf out.
 
+// const arithmetic = @cImport({
+//     @cInclude("/home/niles/Documents/github/Zig-Parser-Experiment/src/arithmetic.c");
+// });
+
+// fn add(x: u64, y: u64) u64 {
+//     return arithmetic.add(x, y);
+// }
+
+// const rpmalloc = @import("rpmalloc");
+//const zimalloc = @import("zimalloc");
+const jdz_allocator = @import("jdz_allocator");
+
+// const jemalloc = @import("jemalloc");
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
@@ -28,13 +62,73 @@ const mem = std.mem;
 const Ast = std.zig.Ast;
 const Allocator = std.mem.Allocator;
 
+const HAS_ARM_NEON = switch (builtin.cpu.arch) {
+    .aarch64_32, .aarch64_be, .aarch64 => std.Target.aarch64.featureSetHas(builtin.cpu.features, .neon),
+    .arm, .armeb, .thumb, .thumbeb => std.Target.arm.featureSetHas(builtin.cpu.features, .neon),
+    else => false,
+};
+
+const HAS_CTZ = switch (builtin.cpu.arch) {
+    // rbit+clz is close enough
+    .aarch64_32, .aarch64_be, .aarch64 => std.Target.aarch64.featureSetHas(builtin.cpu.features, .v8a),
+    .arm, .armeb, .thumb, .thumbeb => std.Target.arm.featureSetHas(builtin.cpu.features, .has_v8m_main),
+    .mips, .mips64, .mips64el, .mipsel => false,
+    .powerpc, .powerpc64, .powerpc64le, .powerpcle => std.Target.powerpc.featureSetHas(builtin.cpu.features, .power9_vector),
+    .s390x => false,
+    .ve => false,
+    .avr => false,
+    .msp430 => false,
+    .riscv32, .riscv64 => std.Target.riscv.featureSetHas(builtin.cpu.features, .zbb),
+    .sparc, .sparc64, .sparcel => false,
+    .wasm32, .wasm64 => true,
+    .x86, .x86_64 => std.Target.x86.featureSetHas(builtin.cpu.features, .bmi),
+    else => false,
+};
+
+const HAS_POPCNT = switch (builtin.cpu.arch) {
+    .aarch64_32, .aarch64_be, .aarch64 => std.Target.aarch64.featureSetHas(builtin.cpu.features, .neon),
+    .mips, .mips64, .mips64el, .mipsel => std.Target.mips.featureSetHas(builtin.cpu.features, .cnmips),
+    .powerpc, .powerpc64, .powerpc64le, .powerpcle => std.Target.powerpc.featureSetHas(builtin.cpu.features, .popcntd),
+    .s390x => std.Target.s390x.featureSetHas(builtin.cpu.features, .miscellaneous_extensions_3),
+    .ve => true,
+    .avr => false,
+    .msp430 => false,
+    .riscv32, .riscv64 => std.Target.riscv.featureSetHas(builtin.cpu.features, .zbb),
+    .sparc, .sparc64, .sparcel => std.Target.sparc.featureSetHas(builtin.cpu.features, .popc),
+    .wasm32, .wasm64 => true,
+    .x86, .x86_64 => std.Target.x86.featureSetHas(builtin.cpu.features, .popcnt),
+    else => false,
+};
+
+const HAS_FAST_PDEP_AND_PEXT = blk: {
+    const cpu_name = builtin.cpu.model.llvm_name orelse builtin.cpu.model.name;
+    break :blk builtin.cpu.arch == .x86_64 and
+        std.Target.x86.featureSetHas(builtin.cpu.features, .bmi2) and
+        // pdep is microcoded (slow) on AMD architectures before Zen 3.
+        !std.mem.startsWith(u8, cpu_name, "bdver") and
+        (!std.mem.startsWith(u8, cpu_name, "znver") or cpu_name["znver".len] >= '3');
+};
+
+const HAS_FAST_VECTOR_REVERSE: bool = switch (builtin.cpu.arch) {
+    .powerpc, .powerpc64, .powerpc64le, .powerpcle => std.Target.powerpc.featureSetHas(builtin.cpu.features, .isa_v30_instructions),
+    else => false,
+};
+
+const HAS_FAST_BYTE_SWAP = switch (builtin.cpu.arch) {
+    .mips, .mips64, .mips64el, .mipsel => std.Target.mips.featureSetHas(builtin.cpu.features, .mips64r2),
+    .x86, .x86_64 => true, // we could exclude ancient hardware that lacks a bswap, i.e. everything before the 80486. Not sure whether LLVM has flags for that.
+    .riscv32, .riscv64 => std.Target.riscv.featureSetHas(builtin.cpu.features, .zbb),
+    else => false,
+};
+
 /// This is the "efficient builtin operand" size.
 /// E.g. if we support 64-bit operations, we want to be doing 64-bit count-trailing-zeros.
 /// For now, we use `usize` as our reasonable guess for what size of bitstring we can operate on efficiently.
 const uword = std.meta.Int(.unsigned, if (std.mem.endsWith(u8, @tagName(builtin.cpu.arch), "64_32")) 64 else @bitSizeOf(usize));
 
 const IS_VECTORIZER_BROKEN = builtin.cpu.arch.isSPARC() or builtin.cpu.arch.isPPC() or builtin.cpu.arch.isPPC64();
-const SUGGESTED_VEC_SIZE = if (IS_VECTORIZER_BROKEN) null else std.simd.suggestVectorLengthForCpu(u8, builtin.cpu);
+const SUGGESTED_VEC_SIZE: ?comptime_int = if (IS_VECTORIZER_BROKEN) null else if (HAS_ARM_NEON) @sizeOf(uword) * 2 else std.simd.suggestVectorLengthForCpu(u8, builtin.cpu);
+// https://github.com/llvm/llvm-project/issues/76812
 const USE_SWAR = SUGGESTED_VEC_SIZE == null;
 
 // This is the native vector size.
@@ -42,6 +136,7 @@ const NATIVE_VEC_INT = std.meta.Int(.unsigned, 8 * (SUGGESTED_VEC_SIZE orelse @s
 const NATIVE_VEC_SIZE = @sizeOf(NATIVE_VEC_INT);
 const NATIVE_CHAR_VEC = @Vector(NATIVE_VEC_SIZE, u8);
 
+const NUM_CHUNKS = @bitSizeOf(uword) / NATIVE_VEC_SIZE;
 const Chunk = if (USE_SWAR) NATIVE_VEC_INT else @Vector(NATIVE_VEC_SIZE, u8);
 
 const FRONT_SENTINELS = "\n";
@@ -50,12 +145,49 @@ const BACK_SENTINELS = "\n" ++ "\x00" ** 62 ++ " ";
 const INDEX_OF_FIRST_0_SENTINEL = std.mem.indexOfScalar(u8, BACK_SENTINELS, 0).?;
 const EXTENDED_BACK_SENTINELS_LEN = BACK_SENTINELS.len - INDEX_OF_FIRST_0_SENTINEL;
 
+const TokenInfo = struct { is_large_token: bool, kind: Tag, source: []const u8 };
+
+const TokenInfoIterator = struct {
+    cursor: [*]const u8,
+    cur_token: [*]const Token,
+    // cur_token: [*:Token{ .len = 0, .kind = .eof }]Token,
+
+    pub fn init(source: ([:0]const u8), tokens: []const Token) @This() {
+        return .{ .cursor = source.ptr, .cur_token = tokens.ptr };
+    }
+
+    pub fn current(self: *const @This()) TokenInfo {
+        const is_large_token = self.cur_token[0].len == 0;
+        const large_len: u32 = @bitCast(self.cur_token[1..3].*);
+        const len: u32 = if (is_large_token) large_len else self.cur_token[0].len;
+        const kind = self.cur_token[0].kind;
+        const source = self.cursor[0..len];
+        return .{ .is_large_token = is_large_token, .kind = kind, .source = source };
+    }
+
+    pub fn advance(self: *@This()) void {
+        const info = self.current();
+        self.cursor = self.cursor[info.source.len..];
+        self.cur_token = self.cur_token[if (info.is_large_token) 3 else 1..];
+    }
+
+    pub fn advanceToken(self: *@This()) void {
+        const info = self.current();
+        self.cur_token = self.cur_token[if (info.is_large_token) 3 else 1..];
+    }
+
+    pub fn advanceCursor(self: *@This()) void {
+        const info = self.current();
+        self.cursor = self.cursor[info.source.len..];
+    }
+};
+
 /// Returns a slice that is aligned to alignment, but `len` is set to only the "valid" memory.
 /// freed via: allocator.free(buffer[0..std.mem.alignForward(u64, buffer.len, alignment)])
 fn readFileIntoAlignedBuffer(allocator: Allocator, file: std.fs.File, comptime alignment: u32) ![:0]align(alignment) const u8 {
     const bytes_to_allocate = std.math.cast(usize, try file.getEndPos()) orelse return error.Overflow;
-    const overaligned_size = try std.math.add(usize, bytes_to_allocate, FRONT_SENTINELS.len + BACK_SENTINELS.len + (alignment - 1));
-    const buffer = try allocator.alignedAlloc(u8, alignment, std.mem.alignBackward(usize, overaligned_size, alignment));
+    const overaligned_size = std.mem.alignBackward(usize, try std.math.add(usize, bytes_to_allocate, FRONT_SENTINELS.len + BACK_SENTINELS.len + (alignment - 1)), alignment);
+    const buffer = try allocator.alignedAlloc(u8, alignment, overaligned_size);
 
     buffer[0..FRONT_SENTINELS.len].* = FRONT_SENTINELS.*;
     var cur: []u8 = buffer[FRONT_SENTINELS.len..][0..bytes_to_allocate];
@@ -71,10 +203,10 @@ fn readFileIntoAlignedBuffer(allocator: Allocator, file: std.fs.File, comptime a
     return buffer[0 .. FRONT_SENTINELS.len + bytes_to_allocate + INDEX_OF_FIRST_0_SENTINEL :0];
 }
 
-fn readFiles(gpa: Allocator) !std.ArrayListUnmanaged([:0]align(@bitSizeOf(uword)) const u8) {
+fn readFiles(gpa: Allocator) ![][:0]align(@bitSizeOf(uword)) const u8 {
     if (SKIP_OUTLIERS)
         std.debug.print("Skipping outliers!\n", .{});
-    std.debug.print("v0.7\n", .{});
+    std.debug.print("v0.8\n", .{});
     const directory = switch (INFIX_TEST) {
         true => "./src/beep",
         false => "./src/files_to_parse",
@@ -88,9 +220,9 @@ fn readFiles(gpa: Allocator) !std.ArrayListUnmanaged([:0]align(@bitSizeOf(uword)
     var num_files: usize = 0;
     var num_bytes: usize = 0;
 
-    var sources: std.ArrayListUnmanaged([:0]align(@bitSizeOf(uword)) const u8) = .{};
-    {
-        const t1 = std.time.nanoTimestamp();
+    const t1 = std.time.nanoTimestamp();
+    const sources = blk: {
+        var sources: std.ArrayListUnmanaged([:0]align(@bitSizeOf(uword)) const u8) = .{};
         var walker = try parent_dir.walk(gpa); // 12-14 ms just walking the tree
         defer walker.deinit();
 
@@ -100,9 +232,9 @@ fn readFiles(gpa: Allocator) !std.ArrayListUnmanaged([:0]align(@bitSizeOf(uword)
             switch (dir.kind) {
                 .file => if (dir.basename.len > 4 and std.mem.eql(u8, dir.basename[dir.basename.len - 4 ..][0..4], ".zig") and dir.path.len - dir.basename.len > 0) {
                     // These two are extreme outliers, omit them from our test bench
-                    if (std.mem.eql(u8, dir.basename, "normal_string_with_newline.zig") or (SKIP_OUTLIERS and
-                        (std.mem.eql(u8, dir.basename, "udivmodti4_test.zig") or
-                        std.mem.eql(u8, dir.basename, "udivmoddi4_test.zig"))))
+                    if (std.mem.eql(u8, dir.basename, "normal_string_with_newline.zig")) continue;
+
+                    if (SKIP_OUTLIERS and (std.mem.eql(u8, dir.basename, "udivmodti4_test.zig") or std.mem.eql(u8, dir.basename, "udivmoddi4_test.zig")))
                         continue;
 
                     const file = try parent_dir2.openFile(dir.path, .{});
@@ -113,35 +245,37 @@ fn readFiles(gpa: Allocator) !std.ArrayListUnmanaged([:0]align(@bitSizeOf(uword)
                     // const source = try file.readToEndAllocOptions(gpa, std.math.maxInt(u32), null, 1, 0);
                     num_bytes += source.len - 2;
 
-                    // if (sources.items.len == 13)
-                    // std.debug.print("{} {s}\n", .{ sources.items.len, dir.path });
+                    // if (sources.len == 13)
+                    // std.debug.print("{} {s}\n", .{ sources.len, dir.path });
                     (try sources.addOne(gpa)).* = source;
                 },
 
                 else => {},
             }
         }
-
-        const t2 = std.time.nanoTimestamp();
-        var lines: u64 = 0;
-        for (sources.items) |source| {
-            for (source[1 .. source.len - 1]) |c| {
-                lines += @intFromBool(c == '\n');
-            }
+        break :blk try sources.toOwnedSlice(gpa);
+    };
+    const t2 = std.time.nanoTimestamp();
+    var lines: u64 = 0;
+    for (sources) |source| {
+        for (source[1 .. source.len - 1]) |c| {
+            lines += @intFromBool(c == '\n');
         }
-        const elapsedNanos: u64 = @intCast(t2 - t1);
-        const @"MB/s" = @as(f64, @floatFromInt(num_bytes * 1000)) / @as(f64, @floatFromInt(elapsedNanos));
-
-        const stdout = std.io.getStdOut().writer();
-        if (REPORT_SPEED)
-            try stdout.print("       Read in files in {} ({d:.2} MB/s) and used {} memory with {} lines across {} files\n", .{ std.fmt.fmtDuration(elapsedNanos), @"MB/s", std.fmt.fmtIntSizeDec(num_bytes), lines, sources.items.len });
     }
+    const elapsedNanos: u64 = @intCast(t2 - t1);
+    const @"MB/s" = @as(f64, @floatFromInt(num_bytes * 1000)) / @as(f64, @floatFromInt(elapsedNanos));
+
+    const stdout = std.io.getStdOut().writer();
+    if (REPORT_SPEED)
+        try stdout.print("       Read in files in {} ({d:.2} MB/s) and used {} memory with {} lines across {} files\n", .{ std.fmt.fmtDuration(elapsedNanos), @"MB/s", std.fmt.fmtIntSizeDec(num_bytes), lines, sources.len });
+
     return sources;
+    // return sources.allocatedSlice();
 }
 
-fn vec_cmp(a: anytype, comptime cmp_type: enum { @"<", @"<=", @"==", @"!=", @">", @">=" }, x: anytype) @TypeOf(a) {
+inline fn vec_cmp(a: anytype, comptime cmp_type: enum { @"<", @"<=", @"==", @"!=", @">", @">=" }, x: anytype) @TypeOf(a) {
     const child_type = @typeInfo(@TypeOf(a)).Vector.child;
-    const true_vec = @as(@TypeOf(a), @splat(std.math.maxInt(child_type)));
+    const true_vec = @as(@TypeOf(a), @splat(std.math.maxInt(child_type) + std.math.minInt(child_type)));
     const false_vec = @as(@TypeOf(a), @splat(0));
 
     const b: @TypeOf(a) = switch (@TypeOf(x)) {
@@ -173,6 +307,7 @@ const Operators = struct {
         return @enumFromInt(unarifyBinaryOperatorRaw(@intFromEnum(tag)));
     }
 
+    // TODO: enforce this contract
     fn postifyOperatorRaw(hash: u8) u8 {
         return hash + 3;
     }
@@ -204,13 +339,13 @@ const Operators = struct {
                 .{ .ambiguous_pre_unary_or_binary, &[_]Tag{ .@".", .@"-", .@"-%", .@"*", .@"**", .@"&" } },
                 .{ .pre_unary_op, &[_]Tag{ .@"!", .@"const", .@"fn" } },
                 .{ .ambiguous_pre_unary_or_post_unary, &[_]Tag{.@"("} },
-                .{ .post_unary_op, &[_]Tag{.@"call ("} },
-                .{ .pre_unary_op, &[_]Tag{ .@"unary &", .@"unary -", .@"unary -%", .@"unary *", .@"unary **", .@"unary .", .@"unary .." } },
+                .{ .post_unary_op, &[_]Tag{ .@"call (", .@"unary .." } },
+                .{ .pre_unary_op, &[_]Tag{ .@"unary &", .@"unary -", .@"unary -%", .@"unary *", .@"unary **", .@"unary ." } },
                 .{ .binary_op, &[_]Tag{ .@"or", .@"and", .@"orelse", .@"catch" } },
                 .{ .binary_op, &[_]Tag{ .@"||", .@"|", .@"=", .@"==", .@"=>", .@"|=", .@"!=", .@"%", .@"%=", .@"..", .@"^", .@"^=", .@"+", .@"++", .@"+=", .@"+%", .@"+%=", .@"+|", .@"+|=", .@"-=", .@"-%=", .@"-|", .@"-|=", .@"*=", .@"*%", .@"*%=", .@"*|", .@"*|=", .@"/", .@"/=", .@"&=", .@"<", .@"<=", .@"<<", .@"<<=", .@"<<|", .@"<<|=", .@">", .@">=", .@">>", .@">>=", .@"...", .@":" } },
                 .{ .post_unary_op, &[_]Tag{ .@".*", .@".?" } },
-                .{ .post_unary_ctx_reset_op, &[_]Tag{ .@")", .@";" } },
-                .{ .something, &[_]Tag{ .@".**", .@"{", .@"}", .@"[", .@"]", .@"->", .@"?", .@"~", .@"//", .@"///", .@"//!", .@"\\\\", .@"," } },
+                .{ .post_unary_ctx_reset_op, &[_]Tag{ .@")", .@";", .@"," } },
+                .{ .something, &[_]Tag{ .@".**", .@"{", .@"}", .@"[", .@"]", .@"->", .@"?", .@"~", .@"//", .@"///", .@"//!", .@"\\\\" } },
             }) |data| {
                 for (data[1]) |tag| {
                     assert(table[@intFromEnum(tag)] == .something);
@@ -223,29 +358,33 @@ const Operators = struct {
         return OperatorClassifications[@intFromEnum(op_type)];
     }
 
-    fn isUnary(op_type: Tag) bool {
+    fn isUnaryClass(classification: TagClassification) bool {
         comptime for (std.meta.fields(TagClassification)) |field| {
-            if (1 == (1 & field.value)) {
-                switch (@as(TagClassification, @enumFromInt(field.value))) {
-                    .pre_unary_op,
-                    .post_unary_op,
-                    .post_unary_ctx_reset_op,
-                    .ambiguous_pre_unary_or_post_unary,
-                    => {},
-                    else => {
-                        var alternative = field.value + 1;
-                        while (true) : (alternative += 2)
-                            std.meta.intToEnum(TagClassification, alternative) catch
-                                @compileError(std.fmt.comptimePrint(
-                                "Only unary operators should have the least significant bit set in their value. Please change {s} to {}\n",
-                                .{ field.name, alternative },
-                            ));
-                    },
-                }
+            const correct_value = switch (@as(TagClassification, @enumFromInt(field.value))) {
+                .pre_unary_op,
+                .post_unary_op,
+                .post_unary_ctx_reset_op,
+                .ambiguous_pre_unary_or_post_unary,
+                => 1,
+                else => 0,
+            };
+
+            if (correct_value != (1 & field.value)) {
+                const err_msgs = [2][]const u8{
+                    "Only unary operators should have the least significant bit set in their value.\nYou could change {} to {} or update the list of unary operators at this error site.\n",
+                    "Unary operators should have the least significant bit set in their value.\nYou could change {} to {} or update the list of unary operators at this error site.\n",
+                };
+                var alternative = correct_value;
+                while (true) : (alternative += 2)
+                    _ = std.meta.intToEnum(TagClassification, alternative) catch
+                        @compileError(std.fmt.comptimePrint(err_msgs[correct_value], .{ @as(TagClassification, @enumFromInt(field.value)), alternative }));
             }
         };
+        return 1 == (1 & @intFromEnum(classification));
+    }
 
-        return 1 == (1 & @intFromEnum(classify(op_type)));
+    fn isUnary(op_type: Tag) bool {
+        return isUnaryClass(classify(op_type));
     }
 
     fn getPrecedence(tag: Tag) u8 {
@@ -271,7 +410,7 @@ const Operators = struct {
                 &[_]Tag{ .@"||", .@"*", .@"/", .@"%", .@"**", .@"*%", .@"*|" },
 
                 &[_]Tag{ .@"!", .@"unary &", .@"unary *", .@"unary **", .@"unary -", .@"unary -%", .@"unary .", .@"unary .." },
-                &[_]Tag{ .@"const", .@"fn" },
+                &[_]Tag{ .@"const", .@"fn", .@"if" },
                 &[_]Tag{ .@".*", .@".?" },
                 &[_]Tag{.@"."},
             }, 1..) |ops, i| {
@@ -774,39 +913,41 @@ const Keywords = struct {
 
 // Count-trailing-ones function. Provides better emit than `@ctz(~a)`
 // https://github.com/llvm/llvm-project/issues/82487
-fn cto(a: uword) std.meta.Int(
+fn ctz(a: uword) std.meta.Int(
     .unsigned,
     std.math.ceilPowerOfTwoPromote(u64, std.math.log2_int_ceil(u64, @bitSizeOf(uword) + 1)),
 ) {
-    if (HAS_CTZ) return @ctz(~a);
-    if (HAS_POPCNT or builtin.cpu.arch == .avr or builtin.cpu.arch == .msp430)
-        return @popCount(a & (~a -% 1));
-
     const T = @TypeOf(a);
-    const constant = switch (@bitSizeOf(T)) {
+
+    if (HAS_CTZ) return @ctz(a);
+    if (HAS_POPCNT or builtin.cpu.arch == .avr or builtin.cpu.arch == .msp430)
+        return @popCount(~a & (a -% 1));
+
+    const deBruijn: T = switch (@bitSizeOf(T)) {
         64 => 151050438420815295,
         32 => 125613361,
-        // 16 => 2479,
-        // 8 => 23,
         else => return @ctz(a),
     };
-    if (~a == 0) return @bitSizeOf(T);
+
+    if (a == 0) return @bitSizeOf(T);
 
     // Produce a mask of just the lowest set bit if one exists, else 0.
-    // There are `@bitSizeOf(T)+1` possibilities for `x`.
-    // We handle the `0` case separately.
-    const x = ~a & (a +% 1);
+    // There are `@bitSizeOf(T)` possibilities for `x`.
+    const x = a & (~a +% 1);
 
     const shift = @bitSizeOf(T) - @bitSizeOf(std.math.Log2Int(T));
-    const hash: std.math.Log2Int(T) = @intCast((x *% constant) >> shift);
-    comptime var lookup_table: [@bitSizeOf(T)]u8 = undefined;
+    const hash: std.math.Log2Int(T) = @truncate((x *% deBruijn) >> shift);
+    comptime var lookup_table: [@bitSizeOf(T)]std.meta.Int(
+        .unsigned,
+        std.math.ceilPowerOfTwoPromote(u64, std.math.log2_int_ceil(u64, @bitSizeOf(uword) + 1)),
+    ) = undefined;
+
     comptime {
         var taken_slots: T = 0;
         for (0..@bitSizeOf(T)) |i| {
-            const x_possibility = @as(T, 1) << i;
-            const x_possibility_hash: std.math.Log2Int(T) = @intCast((x_possibility *% constant) >> shift);
+            const x_possibility_hash = (deBruijn << i) >> shift;
             taken_slots |= @as(T, 1) << x_possibility_hash;
-            lookup_table[x_possibility_hash] = @ctz(x_possibility);
+            lookup_table[x_possibility_hash] = i;
         }
         assert(~taken_slots == 0); // proves it is a minimal perfect hash function and that we overwrote all the undefined values
     }
@@ -814,25 +955,25 @@ fn cto(a: uword) std.meta.Int(
     return lookup_table[hash];
 }
 
-// TODO: clean this up a bit
 fn pext(src: anytype, comptime mask: @TypeOf(src)) @TypeOf(src) {
     if (mask == 0) return 0;
-
     const num_one_groups = @popCount(mask & ~(mask << 1));
 
-    const cpu_name = builtin.cpu.model.llvm_name orelse builtin.cpu.model.name;
     if (!@inComptime() and comptime num_one_groups >= 3 and @bitSizeOf(@TypeOf(src)) <= 64 and builtin.cpu.arch == .x86_64 and
-        std.Target.x86.featureSetHas(builtin.cpu.features, .bmi2) and
-
-        // PEXT is microcoded (slow) on AMD architectures before Zen 3.
-        (!std.mem.startsWith(u8, cpu_name, "znver") or cpu_name["znver".len] >= '3'))
+        std.Target.x86.featureSetHas(builtin.cpu.features, .bmi2) and HAS_FAST_PDEP_AND_PEXT)
     {
+        const methods = struct {
+            extern fn @"llvm.x86.bmi.pext.32"(u32, u32) u32;
+            extern fn @"llvm.x86.bmi.pext.64"(u64, u64) u64;
+        };
         return switch (@TypeOf(src)) {
-            u64, u32 => asm ("pext %[mask], %[src], %[ret]"
-                : [ret] "=r" (-> @TypeOf(src)),
-                : [src] "r" (src),
-                  [mask] "r" (mask),
-            ),
+            u32 => methods.@"llvm.x86.bmi.pext.32"(src, mask),
+            u64 => methods.@"llvm.x86.bmi.pext.64"(src, mask),
+            // u64, u32 => asm ("pext %[mask], %[src], %[ret]"
+            //     : [ret] "=r" (-> @TypeOf(src)),
+            //     : [src] "r" (src),
+            //       [mask] "r" (mask),
+            // ),
             else => @intCast(pext(@as(if (@bitSizeOf(@TypeOf(src)) <= 32) u32 else u64, src), mask)),
         };
     } else if (num_one_groups >= 4) blk: {
@@ -934,56 +1075,7 @@ const Tag = blk: {
     });
 };
 
-/// If we see a len of 0, go look in the next extra_long_lens slot for the true length.
 const Token = extern struct { len: u8, kind: Tag };
-
-fn printu(v: anytype) void {
-    comptime var shift = @bitSizeOf(@TypeOf(v));
-    inline while (true) {
-        shift -= 4;
-        std.debug.print("{b:0>4}{c}", .{ @as(u4, @truncate(v >> shift)), if (shift % 8 == 0) ' ' else '_' });
-        if (shift == 0) break;
-    }
-    std.debug.print("\n", .{});
-}
-
-fn printx(v: anytype) void {
-    comptime var shift = @bitSizeOf(@TypeOf(v));
-    inline while (true) {
-        shift -= 4;
-        std.debug.print("{x}{c}", .{ @as(u4, @truncate(v >> shift)), if (shift % 8 == 0) ' ' else '_' });
-        if (shift == 0) break;
-    }
-    std.debug.print("\n", .{});
-}
-
-test "maskIdentifiersSWAR should match alphanumeric characters and underscores" {
-    var c: u8 = 0;
-    while (true) {
-        const expected: u1 = switch (c) {
-            'A'...'Z', 'a'...'z', '0'...'9', '_' => 1,
-            else => 0,
-        };
-        try std.testing.expectEqual(expected, @as(@TypeOf(expected), @intCast(swarMovMask(Parser.maskIdentifiersSWAR(c)))));
-        c +%= 1;
-        if (c == 0) break;
-    }
-}
-
-test "swarControlCharMask should match alphanumeric characters and underscores" {
-    var c: u8 = 0;
-    while (true) {
-        const expected: u1 = switch (c) {
-            0x7F, 0x0...'\t' - 1, '\t' + 1...0x1F => 1,
-            else => 0,
-        };
-        const got: u1 = @intCast(swarMovMask(Parser.swarControlCharMask(c)));
-        // std.debug.print("c: {x}, expected: {}, got: {}\n", .{ c, expected, got });
-        try std.testing.expectEqual(expected, got);
-        c +%= 1;
-        if (c == 0) break;
-    }
-}
 
 /// Finds the popCount of the least significant bit of each byte.
 ///
@@ -1018,7 +1110,7 @@ fn popCountLSb(v: anytype) @TypeOf(v) {
     return isolate >> (@bitSizeOf(@TypeOf(v)) - 8);
 }
 
-test "swar popCount" {
+test "swar popCountLSb" {
     inline for ([_]type{ u128, u64, u32, u16, u8 }) |T| {
         var c: std.meta.Int(.unsigned, @sizeOf(T)) = 0;
         while (true) {
@@ -1028,56 +1120,6 @@ test "swar popCount" {
         }
     }
 }
-
-test "mask_for_op_cont should work" {
-    var c: u8 = 0;
-    while (true) {
-        const expected: u3 = switch (c) {
-            0x21, 0x25, 0x2a, 0x2b, 0x2e, 0x2f, 0x3c, 0x3d, 0x3e, 0x3f, 0x5c, 0x7c => 1,
-            else => 0,
-        };
-        const v = std.mem.readInt(u32, &[4]u8{ c, c, 0, 0 }, .little);
-        const res = Parser.mask_for_op_cont(v) - 1;
-        // std.debug.print("0x{x:0>2} {} vs {}\n", .{ c, res, expected });
-        try std.testing.expectEqual(expected, @as(@TypeOf(expected), @intCast(res)));
-        c +%= 1;
-        if (c == 0) break;
-    }
-}
-
-// test "mask_for_op_cont should work 2" {
-//     std.debug.print("\n", .{});
-//     {
-//         const v = std.mem.readInt(u32, "//.?", .little);
-//         const res = Parser.mask_for_op_cont(v);
-//         std.debug.print("res: {}\n", .{res});
-//     }
-//     {
-//         const v = std.mem.readInt(u32, ".?.?", .little);
-//         const res = Parser.mask_for_op_cont(v);
-//         std.debug.print("res: {}\n", .{res});
-//     }
-//     {
-//         const v = std.mem.readInt(u32, "&.??", .little);
-//         const res = Parser.mask_for_op_cont(v);
-//         std.debug.print("res: {}\n", .{res});
-//     }
-//     {
-//         const v = std.mem.readInt(u32, "\\\\+=", .little);
-//         const res = Parser.mask_for_op_cont(v);
-//         std.debug.print("res: {}\n", .{res});
-//     }
-//     {
-//         const v = std.mem.readInt(u32, "\\\\.?", .little);
-//         const res = Parser.mask_for_op_cont(v);
-//         std.debug.print("res: {}\n", .{res});
-//     }
-//     {
-//         const v = std.mem.readInt(u32, "|*.?", .little);
-//         const res = Parser.mask_for_op_cont(v);
-//         std.debug.print("res: {}\n", .{res});
-//     }
-// }
 
 /// The opposite of swarMovMask. Used for tests.
 fn swarUnMovMask(x: anytype) std.meta.Int(.unsigned, 8 * @bitSizeOf(@TypeOf(x))) {
@@ -1092,6 +1134,30 @@ fn swarUnMovMask(x: anytype) std.meta.Int(.unsigned, 8 * @bitSizeOf(@TypeOf(x)))
     return r;
 }
 
+const SWAR_CTZ_PLUS_1_IMPL: enum { ctz, clz, popc, swar } = switch (builtin.cpu.arch) {
+    .aarch64_32, .aarch64_be, .aarch64, .arm, .armeb, .thumb, .thumbeb => if (std.Target.aarch64.featureSetHas(builtin.cpu.features, .v8a) or
+        (std.Target.arm.featureSetHas(builtin.cpu.features, .v6t2) and
+        !std.mem.eql(u8, builtin.cpu.model.name, "cortex_m0") and
+        !std.mem.eql(u8, builtin.cpu.model.name, "cortex_m0plus") and
+        !std.mem.eql(u8, builtin.cpu.model.name, "cortex_m1") and
+        !std.mem.eql(u8, builtin.cpu.model.name, "cortex_m23"))) .ctz else .swar,
+    .mips, .mips64, .mips64el, .mipsel => if (std.Target.mips.featureSetHas(builtin.cpu.features, .mips64)) .clz else .swar,
+    .powerpc, .powerpc64, .powerpc64le, .powerpcle => .clz,
+    .s390x => .clz,
+    .ve => .ctz,
+    .avr => .popc,
+    .msp430 => .popc,
+    .riscv32, .riscv64 => if (std.Target.riscv.featureSetHas(builtin.cpu.features, .zbb)) .ctz else .swar,
+    .sparc, .sparc64, .sparcel => if (std.Target.sparc.featureSetHas(builtin.cpu.features, .popc)) .popc else .swar,
+    .wasm32, .wasm64 => .ctz,
+    .x86, .x86_64 => if (std.Target.x86.featureSetHas(builtin.cpu.features, .bmi)) .ctz else .swar,
+    else => .swar,
+};
+
+fn swarCTZPlus1(x: u32) @TypeOf(x) {
+    return swarCTZPlus1Generic(x, SWAR_CTZ_PLUS_1_IMPL);
+}
+
 fn swarCTZPlus1Generic(x: anytype, comptime impl: @TypeOf(SWAR_CTZ_PLUS_1_IMPL)) @TypeOf(x) {
     const ones: @TypeOf(x) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(x)), 8), u8), @splat(0x01)));
     assert(x != 0 and (x & (0x7F * ones)) == 0);
@@ -1100,36 +1166,7 @@ fn swarCTZPlus1Generic(x: anytype, comptime impl: @TypeOf(SWAR_CTZ_PLUS_1_IMPL))
         .popc => @divExact(@popCount(x ^ (x -% 1)), 8),
         .clz => @sizeOf(@TypeOf(x)) -% @divExact(@clz(x ^ (x -% 1)), 8),
         .swar => popCountLSb(x -% 1),
-        // .naive => blk: { // 7 ops, 1 constant that might not be an immediate
-        //     var i = (x -% 1) & ones; // because the bitstring only contains bits in the highest set bit of each byte, the mask will only isolate from the trailing zeros
-        //     inline for (0..comptime std.math.log2_int(u64, @sizeOf(@TypeOf(x)))) |y| {
-        //         i = i +% (i >> (@bitSizeOf(@TypeOf(x)) >> (y + 1)));
-        //     }
-        //     break :blk @as(std.meta.Int(.unsigned, @sizeOf(@TypeOf(x))), @truncate(i));
-        // },
     };
-}
-
-fn swarCTZGeneric(x: anytype, comptime impl: @TypeOf(SWAR_CTZ_IMPL)) @TypeOf(x) {
-    const ones: @TypeOf(x) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(x)), 8), u8), @splat(1)));
-    assert((x & (ones * 0x7F)) == 0);
-
-    return switch (impl) {
-        .ctz => @ctz(x) >> 3,
-        .swar => popCountLSb((~x & (x -% 1)) >> 7),
-        .swar_bool => popCountLSb(x -% 1) -% @intFromBool(x != 0),
-        // .naive => blk: {
-        //     var i = ((~x & (x -% 1)) & (ones * 0x80)) >> 7;
-        //     inline for (0..comptime std.math.log2_int(u64, @sizeOf(@TypeOf(x)))) |y| {
-        //         i = i +% (i >> (@bitSizeOf(@TypeOf(x)) >> (y + 1)));
-        //     }
-        //     break :blk @as(std.meta.Int(.unsigned, @sizeOf(@TypeOf(x))), @truncate(i));
-        // },
-    };
-}
-
-fn swarCTZ(x: uword) @TypeOf(x) {
-    return swarCTZGeneric(x, SWAR_CTZ_IMPL);
 }
 
 test "swarCTZPlus1" {
@@ -1158,74 +1195,6 @@ test "swarCTZPlus1" {
     }
 }
 
-const HAS_FAST_VECTOR_REVERSE: bool = switch (builtin.cpu.arch) {
-    .powerpc, .powerpc64, .powerpc64le, .powerpcle => std.Target.powerpc.featureSetHas(builtin.cpu.features, .isa_v30_instructions),
-    else => false,
-};
-
-const HAS_FAST_BYTE_SWAP = switch (builtin.cpu.arch) {
-    .mips, .mips64, .mips64el, .mipsel => std.Target.mips.featureSetHas(builtin.cpu.features, .mips64r2),
-    .x86, .x86_64 => true, // we could probably exclude ancient hardware that lacks a bswap, i.e. everything before the 80486. Not sure the LLVM flags for that.
-    .riscv32, .riscv64 => std.Target.riscv.featureSetHas(builtin.cpu.features, .zbb),
-    else => false,
-};
-
-const SWAR_CTZ_PLUS_1_IMPL: enum { ctz, clz, popc, swar } = switch (builtin.cpu.arch) {
-    .aarch64_32, .aarch64_be, .aarch64, .arm, .armeb, .thumb, .thumbeb => if (std.Target.aarch64.featureSetHas(builtin.cpu.features, .v8a) or
-        (std.Target.arm.featureSetHas(builtin.cpu.features, .v6t2) and
-        !std.mem.eql(u8, builtin.cpu.model.name, "cortex_m0") and
-        !std.mem.eql(u8, builtin.cpu.model.name, "cortex_m0plus") and
-        !std.mem.eql(u8, builtin.cpu.model.name, "cortex_m1") and
-        !std.mem.eql(u8, builtin.cpu.model.name, "cortex_m23"))) .ctz else .swar,
-    .mips, .mips64, .mips64el, .mipsel => if (std.Target.mips.featureSetHas(builtin.cpu.features, .mips64)) .clz else .swar,
-    .powerpc, .powerpc64, .powerpc64le, .powerpcle => .clz,
-    .s390x => .clz,
-    .ve => .ctz,
-    .avr => .popc,
-    .msp430 => .popc,
-    .riscv32, .riscv64 => if (std.Target.riscv.featureSetHas(builtin.cpu.features, .zbb)) .ctz else .swar,
-    .sparc, .sparc64, .sparcel => if (std.Target.sparc.featureSetHas(builtin.cpu.features, .popc)) .popc else .swar,
-    .wasm32, .wasm64 => .ctz,
-    .x86, .x86_64 => if (std.Target.x86.featureSetHas(builtin.cpu.features, .bmi)) .ctz else .swar,
-    else => .swar,
-};
-
-fn swarCTZPlus1(x: u32) @TypeOf(x) {
-    return swarCTZPlus1Generic(x, SWAR_CTZ_PLUS_1_IMPL);
-}
-
-// fn swarCTZGeneric(x: anytype, comptime impl: @TypeOf(SWAR_CTZ_IMPL)) @TypeOf(x) {
-//     const ones: @TypeOf(x) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(x)), 8), u8), @splat(1)));
-//     assert((x & (ones * 0x7F)) == 0);
-
-//     return switch (impl) {
-//         .ctz => @ctz(x) >> 3,
-//         .swar => popCountLSb((~x & (x -% 1)) >> 7),
-//         .swar_bool => popCountLSb(x -% 1) -% @intFromBool(x != 0),
-//         .naive => blk: {
-//             var i = ((~x & (x -% 1)) & (ones * 0x80)) >> 7;
-//             inline for (0..comptime std.math.log2_int(u64, @sizeOf(@TypeOf(x)))) |y| {
-//                 i = i +% (i >> (@bitSizeOf(@TypeOf(x)) >> (y + 1)));
-//             }
-//             break :blk @as(std.meta.Int(.unsigned, @sizeOf(@TypeOf(x))), @truncate(i));
-//         },
-//     };
-// }
-
-// test "ctz popCount" {
-//     inline for (std.meta.fields(@TypeOf(SWAR_CTZ_IMPL))) |impl| {
-//         inline for ([_]type{ u64, u32, u16, u8 }) |T| {
-//             var c: std.meta.Int(.unsigned, @sizeOf(T)) = 0;
-//             while (true) {
-//                 const y = swarCTZGeneric(swarUnMovMask(c), @enumFromInt(impl.value));
-//                 try std.testing.expectEqual(@as(@TypeOf(y), @ctz(c)), y);
-//                 c +%= 1;
-//                 if (c == 0) break;
-//             }
-//         }
-//     }
-// }
-
 const SWAR_CTZ_IMPL: enum { ctz, swar, swar_bool } = switch (builtin.cpu.arch) {
     else => switch (SWAR_CTZ_PLUS_1_IMPL) {
         .ctz, .clz, .popc => .ctz,
@@ -1240,9 +1209,34 @@ const SWAR_CTZ_IMPL: enum { ctz, swar, swar_bool } = switch (builtin.cpu.arch) {
     },
 };
 
-// fn swarCTZ(x: u64) @TypeOf(x) {
-//     return swarCTZGeneric(x, SWAR_CTZ_IMPL);
-// }
+fn swarCTZGeneric(x: anytype, comptime impl: @TypeOf(SWAR_CTZ_IMPL)) @TypeOf(x) {
+    const ones: @TypeOf(x) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(x)), 8), u8), @splat(1)));
+    assert((x & (ones * 0x7F)) == 0);
+
+    return switch (impl) {
+        .ctz => @ctz(x) >> 3,
+        .swar => popCountLSb((~x & (x -% 1)) >> 7),
+        .swar_bool => popCountLSb(x -% 1) -% @intFromBool(x != 0),
+    };
+}
+
+fn swarCTZ(x: uword) @TypeOf(x) {
+    return swarCTZGeneric(x, SWAR_CTZ_IMPL);
+}
+
+test "ctz popCount" {
+    inline for (std.meta.fields(@TypeOf(SWAR_CTZ_IMPL))) |impl| {
+        inline for ([_]type{ u64, u32, u16, u8 }) |T| {
+            var c: std.meta.Int(.unsigned, @sizeOf(T)) = 0;
+            while (true) {
+                const y = swarCTZGeneric(swarUnMovMask(c), @enumFromInt(impl.value));
+                try std.testing.expectEqual(@as(@TypeOf(y), @ctz(c)), y);
+                c +%= 1;
+                if (c == 0) break;
+            }
+        }
+    }
+}
 
 /// Creates a bitstring from the most significant bit of each byte in a given bitstring.
 ///
@@ -1276,7 +1270,6 @@ fn swarMovMask(v: anytype) @TypeOf(v) {
     //   abcd....bcd.....cd......d.......
 
     // Then we simply shift to the right by `32 - 4` (bitstring size minus the number of relevant bits) to isolate the desired `abcd` bits in the least significant byte!
-
     // Inspired by: http://0x80.pl/articles/scalar-sse-movmask.html
     return (mult *% (v & msb_mask)) >> (@bitSizeOf(@TypeOf(v)) - @sizeOf(@TypeOf(v)));
 }
@@ -1320,7 +1313,6 @@ fn swarMovMaskReversed(v: anytype) @TypeOf(v) {
     // + h............................................................... << 63
 
     return (((v & msb_mask) >> (@sizeOf(T) - 1)) *% mult) >> (@bitSizeOf(T) - @sizeOf(T));
-
     // We could save an instruction by using mulhi.... but is it worth it? I think not
     // return @as(std.meta.Int(.unsigned, @sizeOf(T)), @truncate((((v & msb_mask)) *% @as(std.meta.Int(.unsigned, @bitSizeOf(T) * 2), (mult << (@sizeOf(T) - 1)))) >> (@bitSizeOf(T))));
 }
@@ -1337,87 +1329,81 @@ test "movemask reversed swar should properly isolate the highest set bits of all
     }
 }
 
-fn _lookup_chunk(a: @Vector(16, u8), b: @Vector(16, u8)) @Vector(16, u8) {
-    if (!@inComptime()) {
-        switch (builtin.cpu.arch) {
-            .aarch64, .aarch64_32, .aarch64_be => return asm (
-                \\tbl  %[out].16b, {%[a].16b}, %[b].16b
-                : [out] "=&x" (-> @Vector(16, u8)),
-                : [b] "x" (b),
-                  [a] "x" (a),
-            ),
-            else => {},
+// fn vector_shuffle(comptime T: type, a: T, b: T) T {
+//     const type_info = @typeInfo(T).Vector;
+//     var r: T = @splat(0);
+
+//     for (0..type_info.len) |i| {
+//         const c = b[i];
+//         assert(c < type_info.len);
+//         r[i] = a[c];
+//     }
+//     return r;
+// }
+
+fn pdep(a: anytype, b: anytype) if (@bitSizeOf(@TypeOf(a)) >= @bitSizeOf(@TypeOf(b))) @TypeOf(a) else @TypeOf(b) {
+    const T = if (@bitSizeOf(@TypeOf(a)) >= @bitSizeOf(@TypeOf(b))) @TypeOf(a) else @TypeOf(b);
+
+    if (@inComptime() or !HAS_FAST_PDEP_AND_PEXT) {
+        var src = a;
+        var mask = b;
+        var result: T = 0;
+
+        while (true) {
+            // 1. isolate the lowest set bit of mask
+            const lowest: T = ((~mask +% 1) & mask);
+
+            if (lowest == 0) break;
+
+            // 2. populate LSB from src
+            const LSB: T = @bitCast(@as(std.meta.Int(.signed, @bitSizeOf(T)), @bitCast(src << (@bitSizeOf(T) - 1))) >> (@bitSizeOf(T) - 1));
+
+            // 3. copy bit from mask
+            result |= LSB & lowest;
+
+            // 4. clear lowest bit
+            mask &= ~lowest;
+
+            // 5. prepare for next iteration
+            src >>= 1;
         }
+
+        return result;
     }
 
-    var r: @Vector(16, u8) = @splat(0);
-    for (0..16) |i| r[i] = a[b[i]];
-    return r;
+    const methods = struct {
+        extern fn @"llvm.x86.bmi.pdep.32"(u32, u32) u32;
+        extern fn @"llvm.x86.bmi.pdep.64"(u64, u64) u64;
+    };
+
+    return switch (T) {
+        u32 => methods.@"llvm.x86.bmi.pdep.32"(a, b),
+        u64 => methods.@"llvm.x86.bmi.pdep.64"(a, b),
+        else => @compileError("InvalidType passed to pdep"),
+    };
 }
+// inline fn pdep(src: u64, mask: u64) u64 {
+//     return asm ("pdep %[mask], %[src], %[ret]"
+//         : [ret] "=r" (-> u64),
+//         : [src] "r" (src),
+//           [mask] "r" (mask),
+//     );
+// }
 
-fn vector_shuffle(comptime T: type, a: T, b: T) T {
-    const type_info = @typeInfo(T).Vector;
-    var r: T = @splat(0);
+// Workaround until https://github.com/llvm/llvm-project/issues/79094 is solved.
+fn expand8xu8To16xu4AsByteVector(vec: @Vector(8, u8)) @Vector(16, u8) {
+    return switch (comptime builtin.cpu.arch.endian()) {
+        .little => switch (builtin.cpu.arch) {
+            // Doesn't have shifts that operate at byte granularity.
+            // To do a shift with byte-granularity, the compiler must insert an `&` operation.
+            // Therefore, it's better to do a single `&` after interlacing, and get a 2-for-1.
+            // We need to have all these bitCasts because of https://github.com/llvm/llvm-project/issues/89600
+            .x86_64 => std.simd.interlace([2]@Vector(8, u8){ vec, @bitCast(@as(@Vector(4, u16), @bitCast(vec)) >> @splat(4)) }) & @as(@Vector(16, u8), @splat(0xF)),
 
-    for (0..type_info.len) |i| {
-        const c = b[i];
-        assert(c < type_info.len);
-        r[i] = a[c];
-    }
-    return r;
-}
-
-const HAS_CTZ = switch (builtin.cpu.arch) {
-    // rbit+clz is close enough
-    .aarch64_32, .aarch64_be, .aarch64, .arm, .armeb, .thumb, .thumbeb => std.Target.aarch64.featureSetHas(builtin.cpu.features, .v8a) or
-        (std.Target.arm.featureSetHas(builtin.cpu.features, .v6t2) and
-        !std.mem.eql(u8, builtin.cpu.model.name, "cortex_m0") and
-        !std.mem.eql(u8, builtin.cpu.model.name, "cortex_m0plus") and
-        !std.mem.eql(u8, builtin.cpu.model.name, "cortex_m1") and
-        !std.mem.eql(u8, builtin.cpu.model.name, "cortex_m23")),
-    .mips, .mips64, .mips64el, .mipsel => false,
-    .powerpc, .powerpc64, .powerpc64le, .powerpcle => std.Target.powerpc.featureSetHas(builtin.cpu.features, .power9_vector),
-    .s390x => false,
-    .ve => false,
-    .avr => false,
-    .msp430 => false,
-    .riscv32, .riscv64 => std.Target.riscv.featureSetHas(builtin.cpu.features, .zbb),
-    .sparc, .sparc64, .sparcel => false,
-    .wasm32, .wasm64 => true,
-    .x86, .x86_64 => std.Target.x86.featureSetHas(builtin.cpu.features, .bmi),
-    else => false,
-};
-
-const HAS_POPCNT = switch (builtin.cpu.arch) {
-    .aarch64_32, .aarch64_be, .aarch64 => std.Target.aarch64.featureSetHas(builtin.cpu.features, .neon),
-    .mips, .mips64, .mips64el, .mipsel => std.Target.mips.featureSetHas(builtin.cpu.features, .cnmips),
-    .powerpc, .powerpc64, .powerpc64le, .powerpcle => std.Target.powerpc.featureSetHas(builtin.cpu.features, .popcntd),
-    .s390x => std.Target.s390x.featureSetHas(builtin.cpu.features, .miscellaneous_extensions_3),
-    .ve => true,
-    .avr => false,
-    .msp430 => false,
-    .riscv32, .riscv64 => std.Target.riscv.featureSetHas(builtin.cpu.features, .zbb),
-    .sparc, .sparc64, .sparcel => std.Target.sparc.featureSetHas(builtin.cpu.features, .popc),
-    .wasm32, .wasm64 => true,
-    .x86, .x86_64 => std.Target.x86.featureSetHas(builtin.cpu.features, .popcnt),
-    else => false,
-};
-
-const HAS_FAST_PDEP_AND_PEXT = blk: {
-    const cpu_name = builtin.cpu.model.llvm_name orelse builtin.cpu.model.name;
-    break :blk builtin.cpu.arch == .x86_64 and
-        std.Target.x86.featureSetHas(builtin.cpu.features, .bmi2) and
-        // pdep is microcoded (slow) on AMD architectures before Zen 3.
-        !std.mem.startsWith(u8, cpu_name, "bdver") and
-        (!std.mem.startsWith(u8, cpu_name, "znver") or cpu_name["znver".len] >= '3');
-};
-
-inline fn pdep(src: u64, mask: u64) u64 {
-    return asm ("pdep %[mask], %[src], %[ret]"
-        : [ret] "=r" (-> u64),
-        : [src] "r" (src),
-          [mask] "r" (mask),
-    );
+            else => std.simd.interlace(.{ vec & @as(@Vector(8, u8), @splat(0xF)), vec >> @splat(4) }),
+        },
+        .big => std.simd.interlace(.{ vec >> @splat(4), vec & @as(@Vector(8, u8), @splat(0xF)) }),
+    };
 }
 
 const SHUFFLE_VECTOR_IMPL: enum { x86_pdep, aarch_bdep, riscv_iota, swar, default_vec } =
@@ -1431,29 +1417,16 @@ else
     .swar;
 
 fn getShuffleVectorForByte(x: u8) @Vector(16, u8) {
-    if (builtin.mode == .ReleaseSmall)
-        return produceShuffleVectorForByteSpecifyImpl(x, if (@inComptime()) .swar else SHUFFLE_VECTOR_IMPL);
+    if (@inComptime()) return produceShuffleVectorForByteSpecifyImpl(x, .swar);
+    if (builtin.mode == .ReleaseSmall or SHUFFLE_VECTOR_IMPL != .swar) return produceShuffleVectorForByteSpecifyImpl(x, SHUFFLE_VECTOR_IMPL);
 
+    // Prefer a lookup table to a SWAR implementation
     comptime var lookup_table: [1 << 8][16]u8 = undefined;
     inline for (&lookup_table, 0..) |*slot, i| {
         slot.* = produceShuffleVectorForByteSpecifyImpl(@intCast(i), .swar);
     }
 
     return lookup_table[x];
-}
-
-fn expand8xu8To16xu4AsByteVector(vec: @Vector(8, u8)) @Vector(16, u8) {
-    return switch (comptime builtin.cpu.arch.endian()) {
-        .little => switch (builtin.cpu.arch) {
-            // Doesn't have shifts that operate at byte granularity.
-            // To do a shift with byte-granularity, the compiler must insert an `&` operation.
-            // Therefore, it's better to do a single `&` after interlacing, and get a 2-for-1.
-            .x86_64 => std.simd.interlace(.{ vec, vec >> @splat(4) }) & @as(@Vector(16, u8), @splat(0xF)),
-
-            else => std.simd.interlace(.{ vec & @as(@Vector(8, u8), @splat(0xF)), vec >> @splat(4) }),
-        },
-        .big => std.simd.interlace(.{ vec >> @splat(4), vec & @as(@Vector(8, u8), @splat(0xF)) }),
-    };
 }
 
 fn produceShuffleVectorForByteSpecifyImpl(x: u8, impl: @TypeOf(SHUFFLE_VECTOR_IMPL)) @Vector(16, u8) {
@@ -1470,13 +1443,13 @@ fn produceShuffleVectorForByteSpecifyImpl(x: u8, impl: @TypeOf(SHUFFLE_VECTOR_IM
             const nibble_indices: u64 = @bitCast(std.simd.iota(u4, 16));
             // Selects the nibble_indices, two at a time.
             const interleaved_shuffle_vector = pdep(nibble_indices, vec) | pdep(nibble_indices, ~vec);
-            // Workaround until https://github.com/ziglang/zig/issues/18631 is solved.
+            // Workaround until https://github.com/llvm/llvm-project/issues/79094 is solved.
             return expand8xu8To16xu4AsByteVector(@bitCast(interleaved_shuffle_vector));
             // return @as(@Vector(16, u4), @bitCast(interleaved_shuffle_vector));
         },
 
-        .aarch_bdep => unreachable,
-        .riscv_iota => unreachable, // This might not end up in here
+        .aarch_bdep => @compileError("Not yet implemented"),
+        .riscv_iota => @compileError("Not yet implemented"), // This might not end up in here
 
         .swar => {
             const bit_positions = @as(u64, @bitCast(byte_indices));
@@ -1488,7 +1461,7 @@ fn produceShuffleVectorForByteSpecifyImpl(x: u8, impl: @TypeOf(SHUFFLE_VECTOR_IM
             const prefix_sums1 = ((splatted_lsbs << 4) | splatted_lsbs) *% 0x1111111111111110;
             const prefix_sums2 = ((splatted_inverse_lsbs << 4) | splatted_inverse_lsbs) *% 0x1111111111111110;
             const interleaved_shuffle_vector = (selector & (prefix_sums1 ^ prefix_sums2)) ^ prefix_sums2;
-            // Workaround until https://github.com/ziglang/zig/issues/18631 is solved.
+            // Workaround until https://github.com/llvm/llvm-project/issues/79094 is solved.
             const expanded_shuffle_vector = expand8xu8To16xu4AsByteVector(@bitCast(interleaved_shuffle_vector));
             // const expanded_shuffle_vector: @Vector(16, u8) = @as(@Vector(16, u4), @bitCast(interleaved_shuffle_vector));
 
@@ -1516,7 +1489,7 @@ fn produceShuffleVectorForByteSpecifyImpl(x: u8, impl: @TypeOf(SHUFFLE_VECTOR_IM
                 else => ((splatted_lsbs * 255) & (prefix_sums1 ^ prefix_sums2)) ^ prefix_sums2,
             };
 
-            // Workaround until https://github.com/ziglang/zig/issues/18631 is solved.
+            // Workaround until https://github.com/llvm/llvm-project/issues/79094 is solved.
             const expanded_shuffle_vector = expand8xu8To16xu4AsByteVector(@bitCast(interleaved_shuffle_vector));
             // const expanded_shuffle_vector: @Vector(16, u8) = @as(@Vector(16, u4), @bitCast(interleaved_shuffle_vector));
 
@@ -1551,7 +1524,36 @@ test "produceShuffleVectorForByteSpecifyImpl" {
 }
 
 const Parser = struct {
-    fn mask_for_op_cont(v: u32) u32 {
+    fn cont_op_char_hash(e: anytype) @TypeOf(e) {
+        return @as(@TypeOf(e), @splat(0xF)) & ((e >> @splat(4)) -% (e << @splat(1)));
+    }
+
+    fn mask_for_op_cont(v_: u32) u32 {
+        const v = v_ >> 8;
+        // TODO: try to make this work.... I forgot to add some of the multicharacter tokens......
+        // std.debug.print("{c}\n", .{@as(@Vector(4, u8), @bitCast(v))});
+        const match_chars = "\x21\x25\x2a\x2b\x2e\x2f\x3c\x3d\x3e\x3f\x5c\x7c";
+        const changers: @Vector(16, u8) = (match_chars ++ "\x00" ** (16 - match_chars.len)).*;
+        const changed = comptime cont_op_char_hash(changers);
+        comptime var shuffle_vector = std.mem.zeroes([16]u8);
+        comptime var shuffle_vector_used_slots: u16 = 0;
+        comptime {
+            for (0..match_chars.len) |i| {
+                const slot: u1 = @truncate(shuffle_vector_used_slots >> changed[i]);
+                if (slot == 1) @compileError("Multiple elements were transformed into the same value");
+                shuffle_vector_used_slots |= 1 << changed[i];
+                shuffle_vector[changed[i]] = changers[i];
+            }
+        }
+
+        const VEC_SIZE = 16;
+        const e = std.simd.join(@as(@Vector(4, u8), @bitCast(v)), @as(@Vector(VEC_SIZE - 4, u8), @splat(0)));
+        const me = e != Utf8Checker.lookup_chunk(shuffle_vector, cont_op_char_hash(e));
+        const bitstr: u32 = @as(std.meta.Int(.unsigned, VEC_SIZE), @bitCast(me));
+        return @ctz(bitstr) + 1;
+    }
+
+    fn mask_for_op_cont_old(v: u32) u32 {
         // "%", "*", "+", ".", "/", "<", "=", ">", "?", "\\", "|",
         // "!", "*", ".", "/", "=", "|",
         // "="
@@ -1672,6 +1674,59 @@ const Parser = struct {
         return swarCTZPlus1(x);
     }
 
+    test "mask_for_op_cont should work" {
+        std.debug.print("\n", .{});
+        var c: u8 = 0;
+        while (true) {
+            const expected: u32 = switch (c) {
+                0x21, 0x25, 0x2a, 0x2b, 0x2e, 0x2f, 0x3c, 0x3d, 0x3e, 0x3f, 0x5c, 0x7c => 1,
+                else => 0,
+            };
+            const v = std.mem.readInt(u32, &[4]u8{ c, c, 0, 0 }, .little);
+            std.debug.print("{} | mask_for_op_cont_old\n", .{mask_for_op_cont_old(v) -% 1});
+            std.debug.print("{} | mask_for_op_cont\n\n", .{mask_for_op_cont(v)});
+            const res = Parser.mask_for_op_cont(v) -| 1;
+            // std.debug.print("0x{x:0>2} {} vs {}\n", .{ c, res, expected });
+            try std.testing.expectEqual(expected, @as(@TypeOf(expected), @intCast(res)));
+            c +%= 1;
+            if (c == 0) break;
+        }
+    }
+
+    // test "mask_for_op_cont should work 2" {
+    //     std.debug.print("\n", .{});
+    //     {
+    //         const v = std.mem.readInt(u32, "//.?", .little);
+    //         const res = Parser.mask_for_op_cont(v);
+    //         std.debug.print("res: {}\n", .{res});
+    //     }
+    //     {
+    //         const v = std.mem.readInt(u32, ".?.?", .little);
+    //         const res = Parser.mask_for_op_cont(v);
+    //         std.debug.print("res: {}\n", .{res});
+    //     }
+    //     {
+    //         const v = std.mem.readInt(u32, "&.??", .little);
+    //         const res = Parser.mask_for_op_cont(v);
+    //         std.debug.print("res: {}\n", .{res});
+    //     }
+    //     {
+    //         const v = std.mem.readInt(u32, "\\\\+=", .little);
+    //         const res = Parser.mask_for_op_cont(v);
+    //         std.debug.print("res: {}\n", .{res});
+    //     }
+    //     {
+    //         const v = std.mem.readInt(u32, "\\\\.?", .little);
+    //         const res = Parser.mask_for_op_cont(v);
+    //         std.debug.print("res: {}\n", .{res});
+    //     }
+    //     {
+    //         const v = std.mem.readInt(u32, "|*.?", .little);
+    //         const res = Parser.mask_for_op_cont(v);
+    //         std.debug.print("res: {}\n", .{res});
+    //     }
+    // }
+
     fn maskIdentifiersSWAR(v: anytype) @TypeOf(v) {
         const ones: @TypeOf(v) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(v)), 8), u8), @splat(1)));
         const mask = comptime ones * 0x7F;
@@ -1692,28 +1747,20 @@ const Parser = struct {
         return ~v & (non_0x40_or_0x60 ^ (non_digit & non_alpha & non_underscore));
     }
 
-    test "maskIdentifiersSWAR" {
-        var x: u8 = 0;
+    test "maskIdentifiersSWAR should match alphanumeric characters and underscores" {
+        var c: u8 = 0;
         while (true) {
-            const a: u1 = switch (x) {
-                'a'...'z', 'A'...'Z', '0'...'9', '_' => 1,
+            const expected: u1 = switch (c) {
+                'A'...'Z', 'a'...'z', '0'...'9', '_' => 1,
                 else => 0,
             };
-
-            const b: u1 = @truncate(maskIdentifiersSWAR(x) >> 7);
-            try std.testing.expectEqual(a, b);
-
-            x +%= 1;
-            if (x == 0) break;
+            try std.testing.expectEqual(expected, @as(u1, @intCast(swarMovMask(maskIdentifiersSWAR(c)))));
+            c +%= 1;
+            if (c == 0) break;
         }
     }
 
-    fn maskIdentifiers(v: anytype) if (USE_SWAR) NATIVE_VEC_INT else std.meta.Int(.unsigned, @sizeOf(@TypeOf(v))) {
-        if (USE_SWAR) {
-            assert(@TypeOf(v) == NATIVE_VEC_INT);
-            return maskIdentifiersSWAR(v);
-        }
-
+    fn maskIdentifiers(v: anytype) @TypeOf(v) {
         const underscores = maskChars(v, "_");
         const upper_alpha = maskCharRange(v, 'A', 'Z');
         const lower_alpha = maskCharRange(v, 'a', 'z');
@@ -1731,7 +1778,7 @@ const Parser = struct {
         return v | (non_del & non_ctrl) | ~non_tabs;
     }
 
-    fn swarControlCharMask(v: anytype) @TypeOf(v) {
+    inline fn swarControlCharMask(v: anytype) @TypeOf(v) {
         const ones: @TypeOf(v) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(v)), 8), u8), @splat(1)));
         const mask = comptime ones * 0x7F;
         const low_7_bits = v & mask;
@@ -1741,7 +1788,7 @@ const Parser = struct {
         return (~v & (del | ctrl) & non_tabs);
     }
 
-    test "swarControlCharMask and swarControlCharMaskInverse" {
+    test "swarControlCharMask and swarControlCharMaskInverse should match control characters that are not '\\t' and 0x7F (DEL) " {
         var x: u8 = 0;
         while (true) {
             const a: u1 = switch (x) {
@@ -1760,7 +1807,7 @@ const Parser = struct {
         }
     }
 
-    fn maskControls(v: anytype) if (USE_SWAR) NATIVE_VEC_INT else std.meta.Int(.unsigned, @sizeOf(@TypeOf(v))) {
+    inline fn maskControls(v: anytype) @TypeOf(v) {
         if (USE_SWAR) {
             return swarControlCharMask(v);
         }
@@ -1770,7 +1817,7 @@ const Parser = struct {
         return delete_code | other_controls;
     }
 
-    fn maskNonControls(v: anytype) if (USE_SWAR) NATIVE_VEC_INT else std.meta.Int(.unsigned, @sizeOf(@TypeOf(v))) {
+    fn maskNonControls(v: anytype) @TypeOf(v) {
         if (USE_SWAR) {
             return swarControlCharMaskInverse(v);
         }
@@ -1780,7 +1827,7 @@ const Parser = struct {
         return delete_code & other_controls;
     }
 
-    fn maskNonCharsGeneric(v: anytype, comptime str: []const u8, comptime use_swar: bool) if (USE_SWAR) NATIVE_VEC_INT else std.meta.Int(.unsigned, @sizeOf(@TypeOf(v))) {
+    fn maskNonCharsGeneric(v: anytype, comptime str: []const u8, comptime use_swar: bool) @TypeOf(v) {
         if (use_swar) {
             const ones: @TypeOf(v) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(v)), 8), u8), @splat(1)));
             const mask = comptime ones * 0x7F;
@@ -1798,11 +1845,11 @@ const Parser = struct {
         }
     }
 
-    fn maskNonChars(v: anytype, comptime str: []const u8) if (USE_SWAR) NATIVE_VEC_INT else std.meta.Int(.unsigned, @sizeOf(@TypeOf(v))) {
+    fn maskNonChars(v: anytype, comptime str: []const u8) @TypeOf(v) {
         return maskNonCharsGeneric(v, str, USE_SWAR);
     }
 
-    fn maskCharsGeneric(v: anytype, comptime str: []const u8, comptime use_swar: bool) if (USE_SWAR) NATIVE_VEC_INT else std.meta.Int(.unsigned, @sizeOf(@TypeOf(v))) {
+    fn maskCharsGeneric(v: anytype, comptime str: []const u8, comptime use_swar: bool) @TypeOf(v) {
         if (use_swar) {
             const ones: @TypeOf(v) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(v)), 8), u8), @splat(1)));
             const mask = comptime ones * 0x7F;
@@ -1818,20 +1865,20 @@ const Parser = struct {
         } else {
             var accumulator: @TypeOf(v) = @splat(0);
             inline for (str) |c| {
-                assert(c < 0x80); // Because this would break the SWAR version, we enforce it here too.
+                assert(c < 0x80); // Because this would break the SWAR version, we enforce it here too just to prevent compatibility drift.
                 accumulator |= vec_cmp(v, .@"==", c);
             }
-            return @bitCast(accumulator != @as(@TypeOf(v), @splat(0)));
+            return accumulator;
         }
     }
 
-    fn maskChars(v: anytype, comptime str: []const u8) if (USE_SWAR) NATIVE_VEC_INT else std.meta.Int(.unsigned, @sizeOf(@TypeOf(v))) {
+    fn maskChars(v: anytype, comptime str: []const u8) @TypeOf(v) {
         return maskCharsGeneric(v, str, USE_SWAR);
     }
 
-    fn maskCharRange(input_vec: anytype, comptime char1: u8, comptime char2: u8) std.meta.Int(.unsigned, @sizeOf(@TypeOf(input_vec))) {
-        const VEC_T = std.meta.Int(.unsigned, @sizeOf(@TypeOf(input_vec)));
-        return @as(VEC_T, @bitCast(@as(@TypeOf(input_vec), @splat(char1)) <= input_vec)) & @as(VEC_T, @bitCast(input_vec <= @as(@TypeOf(input_vec), @splat(char2))));
+    fn maskCharRange(input_vec: anytype, comptime char1: u8, comptime char2: u8) @TypeOf(input_vec) {
+        return vec_cmp(input_vec, .@">=", char1) &
+            vec_cmp(input_vec, .@"<=", char2);
     }
 
     // On arm and ve machines, `@ctz(x)` is implemented as `@bitReverse(@clz(x))`.
@@ -1854,13 +1901,42 @@ const Parser = struct {
     const USE_REVERSED_BITSTRINGS = (DO_BIT_REVERSE or DO_MASK_REVERSE) == (builtin.cpu.arch.endian() == .little);
     const ASSEMBLE_BITSTRINGS_BACKWARDS = !DO_BIT_REVERSE and USE_REVERSED_BITSTRINGS;
 
-    fn reverseIfCheap(b: uword) uword {
-        return if (DO_BIT_REVERSE) @bitReverse(b) else b;
-    }
+    const NEON = struct {
+        fn vsriq_n_u8(a: Chunk, b: Chunk, comptime n: u8) Chunk {
+            // LLVM fails to canonicalize all except the last instance of this function due to inlining, therefore we use an intrinsic when it's available
 
-    fn movMask(v: anytype) uword {
-        return if (USE_SWAR) (if (DO_MASK_REVERSE) swarMovMaskReversed(v) else swarMovMask(v)) else v;
-    }
+            return if (!HAS_ARM_NEON)
+                (a & @as(Chunk, @splat((@as(u8, 0xff) >> (8 - n) << (8 - n))))) | (b >> @as(@Vector(@sizeOf(Chunk), u3), @splat(n)))
+            else switch (comptime builtin.cpu.arch) {
+                .aarch64_32, .aarch64_be, .aarch64 => struct {
+                    extern fn @"llvm.aarch64.neon.vsri"(Chunk, Chunk, u32) Chunk;
+                }.@"llvm.aarch64.neon.vsri"(a, b, n),
+                .arm, .armeb, .thumb, .thumbeb => struct {
+                    // Don't ask me why this intrinsic is so weird. https://github.com/llvm/llvm-project/issues/88227#issuecomment-2046622973
+                    extern fn @"llvm.arm.neon.vshiftins"(Chunk, Chunk, Chunk) Chunk;
+                }.@"llvm.arm.neon.vshiftins"(a, b, @splat(~n +% 1)),
+                else => unreachable,
+            };
+        }
+
+        fn vshrn_n_u16(a: @Vector(@sizeOf(Chunk) / 2, u16), comptime c: u8) @Vector(@sizeOf(Chunk) / 2, u8) {
+            // Workaround for https://github.com/llvm/llvm-project/issues/88227#issuecomment-2048490807
+            const b = @shuffle(u16, a, undefined, std.simd.join(std.simd.iota(i32, @sizeOf(Chunk) / 2), @as(@Vector(@sizeOf(Chunk) / 2, i32), @splat(-1))));
+            return @bitCast(@as(std.meta.Int(.unsigned, @sizeOf(Chunk) * 4), @truncate(@as(std.meta.Int(.unsigned, @bitSizeOf(Chunk)), @bitCast(@shuffle(u8, @as(@Vector(@sizeOf(Chunk) * 2, u8), @bitCast(b >> @splat(c))), undefined, std.simd.iota(i32, @sizeOf(Chunk)) << @splat(1)))))));
+
+            // Preferred implementation:
+            //return @shuffle(u8, @as(Chunk, @bitCast(a >> @splat(c))), undefined, std.simd.iota(i32, @sizeOf(Chunk) / 2) << @splat(1));
+        }
+
+        fn vmovmaskq_u8(chunks: [4]Chunk) std.meta.Int(.unsigned, @sizeOf(Chunk) * 4) {
+            const t0 = vsriq_n_u8(chunks[1], chunks[0], 1);
+            const t1 = vsriq_n_u8(chunks[3], chunks[2], 1);
+            const t2 = vsriq_n_u8(t1, t0, 2);
+            const t3 = vsriq_n_u8(t2, t2, 4);
+            const t4 = vshrn_n_u16(@bitCast(t3), 4);
+            return @bitCast(t4);
+        }
+    };
 
     const BitmapKind = enum(u8) {
         // zig fmt: off
@@ -1974,42 +2050,92 @@ const Parser = struct {
                         // Anything in the set [A-Za-z0-9_]. Used for identifier (including keywords) and number matching.
                         var identifiers_or_numbers: uword = 0;
 
-                        // Overall, this code layout allows us to get pretty decent emit on x86-64 and SWAR-targets.
-                        // A LOT of optimization opportunities are still left for aarch64
-                        // E.g. using LD4 and doing an interleaved movmask rather than individual movmasks
-                        // and OR'ing them together. It also might be possible to do a reversed movmask on aarch64.
-                        // However, this is a problem that can only be solved in the compiler backend.
-                        inline for (0..comptime @bitSizeOf(uword) / NATIVE_VEC_SIZE) |i| {
-                            const chunk = blk: {
-                                const slice: *align(NATIVE_VEC_SIZE) const [NATIVE_VEC_SIZE]u8 = @alignCast(base_ptr[i * NATIVE_VEC_SIZE ..][0..NATIVE_VEC_SIZE]);
+                        // Control characters besides tab. (used by multiline strings, comments, eof)
+                        var ctrls_buffer: [NUM_CHUNKS]Chunk = undefined;
+                        // Anything besides space, newline, or tab. Used for skipping over whitespace.
+                        var non_spaces_buffer: [NUM_CHUNKS]Chunk = undefined;
+                        // Anything in the set [A-Za-z0-9_]. Used for identifier (including keywords) and number matching.
+                        var identifiers_or_numbers_buffer: [NUM_CHUNKS]Chunk = undefined;
 
-                                break :blk if (USE_SWAR)
+                        if (HAS_ARM_NEON) {
+                            inline for (0..NUM_CHUNKS) |i| {
+                                const ordered_chunk = blk: {
+                                    const slice: *align(NATIVE_VEC_SIZE) const [NATIVE_VEC_SIZE]u8 = @alignCast(base_ptr[i * NATIVE_VEC_SIZE ..][0..NATIVE_VEC_SIZE]);
+
+                                    break :blk if (USE_SWAR)
+                                        @as(*align(NATIVE_VEC_SIZE) const NATIVE_VEC_INT, @ptrCast(slice)).*
+                                    else
+                                        @as(@Vector(NATIVE_VEC_SIZE, u8), slice.*);
+                                };
+
+                                try utf8_checker.validateChunk(ordered_chunk);
+                            }
+                        }
+
+                        inline for (0..NUM_CHUNKS) |i| {
+                            // https://github.com/llvm/llvm-project/issues/88230
+                            const chunk = if (HAS_ARM_NEON)
+                                @shuffle(u8, base_ptr[0 .. @sizeOf(Chunk) * 4].*, undefined, (std.simd.iota(u6, @sizeOf(Chunk)) << @splat(2)) + @as(@Vector(@sizeOf(Chunk), u6), @splat(i)))
+                            else blk: {
+                                const slice: *align(NATIVE_VEC_SIZE) const [NATIVE_VEC_SIZE]u8 = @alignCast(base_ptr[i * NATIVE_VEC_SIZE ..][0..NATIVE_VEC_SIZE]);
+                                const chunk = if (USE_SWAR)
                                     @as(*align(NATIVE_VEC_SIZE) const NATIVE_VEC_INT, @ptrCast(slice)).*
                                 else
                                     @as(@Vector(NATIVE_VEC_SIZE, u8), slice.*);
+                                // try utf8_checker.validateChunk(chunk);
+                                break :blk chunk;
                             };
+
+                            const ctrls_chunk = if (USE_SWAR) maskControls(chunk) else maskNonControls(chunk);
+                            const non_spaces_chunk = if (USE_SWAR) maskNonChars(chunk, " \t\n") else blk: {
+                                // const mask = maskChars(chunk, " \t\n");
+                                // Workaround until this is fixed: https://github.com/llvm/llvm-project/issues/84967
+                                comptime var buffer = std.mem.zeroes([16]u8);
+                                buffer[0] = ' ';
+                                buffer['\t'] = '\t';
+                                buffer['\n'] = '\n';
+
+                                // x86_64 shuffle semantics: If bit 7 is 1, set to 0, otherwise use lower 4 bits for lookup
+                                const masked_chunk = if (builtin.cpu.arch == .x86_64) chunk else chunk & @as(@TypeOf(chunk), @splat(0xF));
+                                break :blk vec_cmp(chunk, .@"==", Utf8Checker.lookup_chunk(buffer, masked_chunk));
+                            };
+                            const identifiers_or_numbers_chunk = if (USE_SWAR) maskIdentifiersSWAR(chunk) else maskIdentifiers(chunk);
 
                             const shift: std.math.Log2Int(uword) = if (ASSEMBLE_BITSTRINGS_BACKWARDS)
                                 @intCast((@bitSizeOf(uword) - NATIVE_VEC_SIZE) - NATIVE_VEC_SIZE * i)
                             else
                                 @intCast(NATIVE_VEC_SIZE * i);
 
-                            ctrls |= movMask(if (USE_SWAR) maskControls(chunk) else maskNonControls(chunk)) << shift;
-                            non_spaces |= movMask(if (USE_SWAR) maskNonChars(chunk, " \t\n") else maskChars(chunk, " \t\n")) << shift;
-                            identifiers_or_numbers |= movMask(maskIdentifiers(chunk)) << shift;
-                            try utf8_checker.validateChunk(chunk);
+                            if (HAS_ARM_NEON) {
+                                ctrls_buffer[i] = ctrls_chunk;
+                                non_spaces_buffer[i] = non_spaces_chunk;
+                                identifiers_or_numbers_buffer[i] = identifiers_or_numbers_chunk;
+                            } else inline for ([_]*uword{ &ctrls, &non_spaces, &identifiers_or_numbers }, [_]Chunk{ ctrls_chunk, non_spaces_chunk, identifiers_or_numbers_chunk }) |result_ptr, data| {
+                                const chunk_info = if (USE_SWAR)
+                                    (if (DO_MASK_REVERSE) swarMovMaskReversed(data) else swarMovMask(data))
+                                else
+                                    @as(std.meta.Int(.unsigned, @sizeOf(@TypeOf(data))), @bitCast(data != @as(@TypeOf(data), @splat(0))));
+                                result_ptr.* |= @as(uword, chunk_info) << shift;
+                            }
                         }
 
                         bitmap_ptr = bitmap_ptr[1..];
                         selected_bitmap = selected_bitmap[1..];
 
-                        const inverter: uword = if (USE_SWAR) std.math.maxInt(uword) else 0;
+                        if (HAS_ARM_NEON) {
+                            ctrls = NEON.vmovmaskq_u8(ctrls_buffer);
+                            non_spaces = NEON.vmovmaskq_u8(non_spaces_buffer);
+                            identifiers_or_numbers = NEON.vmovmaskq_u8(identifiers_or_numbers_buffer);
+                        } else if (USE_SWAR) {
+                            ctrls = ~ctrls;
+                            non_spaces = ~non_spaces;
+                        }
 
                         // Optimization: when ctz is implemented with a bitReverse+clz,
                         // we speculatively bitReverse in the producer loop to avoid doing so in this loop.
-                        bitmap_ptr[0] = reverseIfCheap(ctrls ^ inverter);
-                        bitmap_ptr[1] = reverseIfCheap(identifiers_or_numbers);
-                        bitmap_ptr[2] = reverseIfCheap(non_spaces ^ inverter);
+                        bitmap_ptr[0] = if (DO_BIT_REVERSE) @bitReverse(ctrls) else ctrls;
+                        bitmap_ptr[1] = if (DO_BIT_REVERSE) @bitReverse(identifiers_or_numbers) else identifiers_or_numbers;
+                        bitmap_ptr[2] = if (DO_BIT_REVERSE) @bitReverse(non_spaces) else non_spaces;
                     }
 
                     const cur_misalignment: std.math.Log2Int(uword) = @truncate(@intFromPtr(cur.ptr));
@@ -2027,7 +2153,7 @@ const Parser = struct {
                     ) = if (USE_REVERSED_BITSTRINGS)
                         @clz(~bitstring)
                     else
-                        cto(bitstring);
+                        @call(.always_inline, ctz, .{~bitstring});
 
                     cur = cur[str_len..];
                     aligned_ptr = @intFromPtr(cur.ptr) / @bitSizeOf(uword) * @bitSizeOf(uword);
@@ -2152,8 +2278,8 @@ const Parser = struct {
                     cur = cur[@intFromBool(cur[0] == ' ')..];
                     continue;
                 } else if (cur[0] == '\r') {
-                    // TODO: unset the corresponding bit in the control-chars mask, since it should contain only newlines at the end.
                     if (cur[1] != '\n') {
+                        // TODO: unset the corresponding bit in the control-chars mask, since it should contain only newlines at the end.
                         return error.UnpairedCarriageReturn;
                     }
                     op_type = .whitespace;
@@ -2213,7 +2339,7 @@ const Parser = struct {
                             cur = cur[1..];
                             var next_is_escaped_on_demand: uword = 0;
 
-                            const QuoteChunk = @Vector(64, u8);
+                            const QuoteChunk = @Vector(@bitSizeOf(uword), u8);
                             const QuoteMask = std.meta.Int(.unsigned, @sizeOf(QuoteChunk));
 
                             while (true) {
@@ -2312,20 +2438,6 @@ const Parser = struct {
                     continue;
                 }
 
-                // cur = cur[1..];
-
-                // On my machine, this can be a big win sometimes, other times, it has no effect.
-                // According to perf stat, this supposedly increases the number of branch misses by
-                // several hundred thousand. However, we decrease the total number of branches by millions.
-                // Branch misses as a percentage are also higher, and yet, it's still faster.
-                // Haven't looked, but maybe it's just putting the branches in a more desirable order?
-                // We really need automatic profile-guided optimization in Zig so we can be certain.
-
-                // if (selected_bitmap == &bitmap_ptr.*[@as(u3, @truncate(@intFromEnum(BitmapKind.whitespace)))] and switch (cur[0]) {
-                //     ' ', '\t', '\r', '\n' => false,
-                //     else => true,
-                // }) continue;
-
                 break;
             }
         }
@@ -2339,9 +2451,15 @@ const Parser = struct {
         cur_token = cur_token[if (cur_token[0].len == 0) 3 else 1..];
         cur_token[0] = .{ .len = 1, .kind = .eof };
         cur_token = cur_token[1..];
+        // cur_token[0] = .{ .len = 0, .kind = .eof };
+        // cur_token = cur_token[1..];
+        // cur_token[0] = .{ .len = 0, .kind = .eof };
+        // cur_token = cur_token[1..];
+        // cur_token[0] = .{ .len = 0, .kind = .eof };
+        // cur_token = cur_token[1..];
 
         // TODO: we do this because of cur_token[0..4].*
-        // Prove at compiletime that 3 cannot be too much for cur_token to hold
+        // Prove at compile-time that 3 cannot be too much for cur_token to hold
         const new_chunks_data_len = 3 + (@intFromPtr(cur_token.ptr) - @intFromPtr(tokens.ptr)) / @sizeOf(Token);
 
         if (gpa.resize(tokens, new_chunks_data_len)) {
@@ -2354,14 +2472,35 @@ const Parser = struct {
     }
 };
 
+// const Rp = rpmalloc.RPMalloc(.{});
 pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
-    const gpa = std.heap.c_allocator;
+    var jdz = jdz_allocator.JdzAllocator(.{}).init();
+    defer jdz.deinit();
+
+    const gpa: Allocator = jdz.allocator();
+
+    // const gpa = jemalloc.allocator;
+    // var gpa_upper = zimalloc.Allocator(.{}){};
+    // defer gpa_upper.deinit();
+    // const gpa: Allocator = gpa_upper.allocator();
+
+    // try Rp.init(null, .{});
+    // defer Rp.deinit();
+    // const gpa = Rp.allocator();
+    // const gpa = std.heap.c_allocator;
     const sources = try readFiles(gpa);
+    defer {
+        if (builtin.mode == .Debug) {
+            for (sources) |source| gpa.free(source);
+            gpa.free(sources);
+        }
+    }
+
     var bytes: u64 = 0;
     var lines: u64 = 0;
 
-    for (sources.items) |source| {
+    for (sources) |source| {
         bytes += source.len - 2;
         for (source[1 .. source.len - 1]) |c| {
             lines += @intFromBool(c == '\n');
@@ -2370,11 +2509,11 @@ pub fn main() !void {
 
     // try stdout.print("-" ** 72 ++ "\n", .{});
     var num_tokens2: usize = 0;
-    const legacy_token_lists: if (RUN_LEGACY_TOKENIZER) []Ast.TokenList.Slice else void = if (RUN_LEGACY_TOKENIZER) try gpa.alloc(Ast.TokenList.Slice, sources.items.len);
+    const legacy_token_lists: if (RUN_LEGACY_TOKENIZER) []Ast.TokenList.Slice else void = if (RUN_LEGACY_TOKENIZER) try gpa.alloc(Ast.TokenList.Slice, sources.len);
 
     const elapsedNanos2: u64 = if (!RUN_LEGACY_TOKENIZER) 0 else blk: {
         const t3 = std.time.nanoTimestamp();
-        for (sources.items, legacy_token_lists) |sourcey, *legacy_token_list_slot| {
+        for (sources, legacy_token_lists) |sourcey, *legacy_token_list_slot| {
             const source = sourcey[1..];
             var tokens = Ast.TokenList{};
             defer tokens.deinit(gpa);
@@ -2413,9 +2552,23 @@ pub fn main() !void {
     if (RUN_NEW_TOKENIZER or INFIX_TEST) {
         const t1 = std.time.nanoTimestamp();
 
-        const source_tokens = try gpa.alloc([]Token, sources.items.len);
-        for (sources.items, source_tokens) |source, *source_token_slot| {
-            source_token_slot.* = try Parser.tokenize(gpa, source);
+        const source_tokens = try gpa.alloc([]Token, sources.len);
+        defer {
+            if (builtin.mode == .Debug) { // Just to make the leak detectors happy
+                for (source_tokens) |source_token| gpa.free(source_token);
+                gpa.free(source_tokens);
+            }
+        }
+        for (sources, source_tokens) |source, *source_token_slot| {
+            const tokens = try Parser.tokenize(gpa, source);
+            source_token_slot.* = tokens;
+
+            // var token_iter = TokenInfoIterator.init(source, tokens);
+
+            // while (token_iter.next()) |token| {
+            //     std.debug.print("'{s}' ({}) {s}\n", .{ token.source, token.source.len, @tagName(token.kind) });
+            // }
+
             // const b = try Parser.tokenize(gpa, source, 1);
 
             // var cur_a = a;
@@ -2464,7 +2617,7 @@ pub fn main() !void {
         const elapsedNanos: u64 = @intCast(t2 - t1);
 
         var num_tokens: usize = 0;
-        for (sources.items, source_tokens, 0..) |source, tokens, i| {
+        for (sources, source_tokens, 0..) |source, tokens, i| {
             _ = source;
             _ = i;
             num_tokens += tokens.len;
@@ -2481,8 +2634,16 @@ pub fn main() !void {
         }
 
         if (INFIX_TEST) {
-            for (sources.items, source_tokens) |source, tokens| {
-                _ = try infixToPrefix(gpa, source, tokens);
+            for (sources, source_tokens) |source, tokens| {
+                const parse_tree = try infixToPrefix(gpa, source, tokens);
+                _ = parse_tree;
+                // const source_start_pos = if (tokens[0].kind == .whitespace) tokens[0].len else 0;
+                // std.debug.print("\n\n\n\n", .{});
+                // const token_info_iterator = TokenInfoIterator.init(parse_tree[1..], source[source_start_pos..]);
+                // _ = parse(parse_tree[1..], source[source_start_pos..]);
+                // _ = parse2(&token_info_iterator);
+                // std.debug.print(";", .{});
+                // std.debug.print("\nvs{s}\n\n\n\n\n", .{source});
             }
         }
     }
@@ -2492,7 +2653,7 @@ pub fn main() !void {
         const legacy_asts = try gpa.alloc(Ast, legacy_token_lists.len);
 
         const t3 = std.time.nanoTimestamp();
-        for (sources.items, legacy_token_lists, legacy_asts) |source, tokens, *ast_slot| {
+        for (sources, legacy_token_lists, legacy_asts) |source, tokens, *ast_slot| {
             var parser: std.zig.Ast.Parse = .{
                 .source = source,
                 .gpa = gpa,
@@ -2725,11 +2886,32 @@ const OpString = extern struct {
 
             switch (CONCAT_IMPL) {
                 0 => {
+                    // TODO: replace this if we still want to use this strategy.
+                    const legacy_tbl = struct {
+                        fn _lookup_chunk(a: @Vector(16, u8), b: @Vector(16, u8)) @Vector(16, u8) {
+                            if (!@inComptime()) {
+                                switch (builtin.cpu.arch) {
+                                    .aarch64, .aarch64_32, .aarch64_be => return asm (
+                                        \\tbl  %[out].16b, {%[a].16b}, %[b].16b
+                                        : [out] "=&x" (-> @Vector(16, u8)),
+                                        : [b] "x" (b),
+                                          [a] "x" (a),
+                                    ),
+                                    else => {},
+                                }
+                            }
+
+                            var r: @Vector(16, u8) = @splat(0);
+                            for (0..16) |i| r[i] = a[b[i]];
+                            return r;
+                        }
+                    };
+
                     const iota = std.simd.iota(u8, BUF_SIZE);
                     const ops_len_splatted = @as(@Vector(BUF_SIZE, u8), @splat(other.ops_len));
 
                     const shifted_op_indicies = iota -| ops_len_splatted;
-                    const shifted_self_ops = _lookup_chunk(self.ops, shifted_op_indicies);
+                    const shifted_self_ops = legacy_tbl._lookup_chunk(self.ops, shifted_op_indicies);
                     self.ops = @select(u8, iota < ops_len_splatted, other.ops, shifted_self_ops);
                     self.ops_len = new_ops_len;
 
@@ -2846,8 +3028,9 @@ const OpStringBuffer = struct {
         return self;
     }
 
-    fn deinit(self: @This(), gpa: Allocator) void {
+    fn deinit(self: *@This(), gpa: Allocator) void {
         gpa.free(self.buffer);
+        self.* = undefined;
     }
 
     fn isSentinel(a: LinkedOpStringHead) bool {
@@ -2962,13 +3145,12 @@ const OpStringBuffer = struct {
         var cur = self.buffer[op_str_head.first];
 
         while (true) {
-            var i = cur.bitstr_len;
-            while (true) {
-                i -= 1;
+            var i: usize = 0;
+            while (i < cur.bitstr_len) : (i += 1) {
                 std.debug.print("{b}", .{@as(u1, @truncate(cur.bitstr >> @intCast(i)))});
-                if (i == 0) break;
             }
             std.debug.print(" | bitstring [{}]\n", .{cur.bitstr_len});
+            // std.debug.print("{}\n", .{produceShuffleVectorForByteSpecifyImpl(@as(u8, @truncate(cur.bitstr)), .x86_pdep)});
             for (cur.ops[0..cur.ops_len]) |op| {
                 std.debug.print("{s} ", .{@tagName(op.kind)});
             }
@@ -3014,8 +3196,17 @@ const OpStringBuffer = struct {
             const dest = &self.buffer[dest_slot];
             const new_bitstr = a.bitstr | (b.bitstr << @intCast(a.bitstr_len));
             const b_next = b.next;
+            const a_ops = a.ops;
             const b_ops = b.ops;
             comptime assert(@sizeOf(OpString) >= OpString.BUF_SIZE * 2);
+            for (dest.ops[0..a.ops_len], a_ops[0..a.ops_len]) |token1, token2| {
+                if (token1.kind != token2.kind or token1.len != token2.len) {
+                    std.debug.print("{{ {s} {} }} vs {{ {s} {} }}\n", .{ @tagName(token1.kind), token1.len, @tagName(token2.kind), token2.len });
+                    assert(false);
+                }
+            }
+
+            // dest.ops[0..a.ops_len].ptr[0..OpString.BUF_SIZE].*=a_ops;
             dest.ops[a.ops_len..].ptr[0..OpString.BUF_SIZE].* = b_ops;
             dest.ops_len = new_ops_len;
             dest.bitstr = new_bitstr;
@@ -3035,9 +3226,15 @@ const OpStringBuffer = struct {
             // F F => .{ .first = left.first, .last = right.last }
 
             const first = if (is_left_a_sentinel) dest_slot else left.first;
+
             return .{
                 .first = first,
-                .last = if (is_right_a_sentinel) dest_slot else if (right.first == right.last) first else right.last,
+                .last = if (is_right_a_sentinel)
+                    dest_slot
+                else if (is_left_a_sentinel)
+                    right.last
+                else // right is now out of commision
+                    left.last,
             };
         } else {
             // It is trivial to see we would not be in this else branch if both left and right were sentinels.
@@ -3129,18 +3326,130 @@ test "OpStringBuffer" {
 
 // parenthesis
 
-// a.b.c(d, e, f) => ( , d e f  )
+// a.b.c(d, e, f) => ( d,  e,  f  )
+fn printTokens(source: [:0]align(@bitSizeOf(uword)) const u8, tokens: []const Token) void {
+    var i: usize = 0;
+    var token_iterator = TokenInfoIterator.init(source, tokens);
 
-fn infixToPrefix(gpa: Allocator, source: [:0]const u8, tokens: []const Token) ![]Token {
+    std.debug.print("|-------------------------------------------------------------------------------\n", .{});
+    std.debug.print("|             kind|len| source\n", .{});
+    std.debug.print("|-------------------------------------------------------------------------------\n", .{});
+
+    comptime var max_kind_tag_length: usize = 0;
+    comptime {
+        for (std.meta.fieldNames(Tag)) |field_name| max_kind_tag_length = @max(max_kind_tag_length, field_name.len);
+    }
+    while (true) {
+        const token_info = token_iterator.current();
+
+        std.debug.print("|", .{});
+
+        for (0..max_kind_tag_length - std.fmt.count("{s}", .{@tagName(token_info.kind)})) |_| std.debug.print(" ", .{});
+        std.debug.print("{s}", .{@tagName(token_info.kind)});
+
+        std.debug.print("| {} | \u{0201C}", .{token_info.source.len});
+
+        for (token_info.source) |c| {
+            switch (c) {
+                '\t' => std.debug.print("\\t", .{}),
+                '\n' => std.debug.print("\\n", .{}),
+                else => std.debug.print("{c}", .{c}),
+            }
+        }
+
+        std.debug.print("\u{0201D}   {}\n", .{i});
+
+        if (token_info.kind == .eof) break;
+        token_iterator.advance();
+        i += 1;
+    }
+    std.debug.print("-------------------------------------------------------------------------------\n", .{});
+}
+
+fn printDebugInfo(qui: usize, cur_token: []const Token, operator_stack: std.ArrayListUnmanaged(Token), cur: [:0]const u8) void {
+    comptime var max_kind_tag_length: usize = 0;
+    comptime {
+        for (std.meta.fieldNames(Tag)) |field_name| max_kind_tag_length = @max(max_kind_tag_length, field_name.len);
+    }
+
+    if (!Parser.isOperand(cur_token[0].kind)) {
+        std.debug.print("operator_stack: ", .{});
+        for (operator_stack.items) |operator| std.debug.print("{s} ", .{@tagName(operator.kind)});
+        std.debug.print("\n", .{});
+    }
+
+    const len = if (cur_token[0].len == 0) @as(u32, @bitCast(cur_token[1..][0..2].*)) else cur_token[0].len;
+    const cur_token_str = cur[0..len];
+    std.debug.print("{}: |", .{qui});
+    for (0..max_kind_tag_length - std.fmt.count("{s}", .{@tagName(cur_token[0].kind)})) |_| std.debug.print(" ", .{});
+    std.debug.print("{s} | {} | \u{0201C}", .{ @tagName(cur_token[0].kind), len });
+
+    for (cur_token_str) |c| {
+        switch (c) {
+            '\t' => std.debug.print("\\t", .{}),
+            '\n' => std.debug.print("\\n", .{}),
+            else => std.debug.print("{c}", .{c}),
+        }
+    }
+    std.debug.print("\u{0201D}\n", .{});
+}
+
+fn infixToPrefix(gpa: Allocator, source: [:0]align(@bitSizeOf(uword)) const u8, tokens: []const Token) ![]Token {
     try infixToPrefixPrinter(gpa, source, tokens);
+    printTokens(source, tokens);
 
-    const my_token: Token = .{ .kind = .@".", .len = 1 };
-    _ = my_token;
     var op_str_buffer = try OpStringBuffer.init(gpa);
     defer op_str_buffer.deinit(gpa);
 
     const output: std.ArrayListUnmanaged(Token) = .{};
     _ = output;
+
+    // var str_buffer = std.SegmentedList(u8, 1 << 12);
+    const str_buffer = try std.heap.page_allocator.alloc(u8, 1 << 20);
+    defer std.heap.page_allocator.free(str_buffer);
+    var fixed_buffer_allocator_backer = std.heap.FixedBufferAllocator.init(str_buffer);
+    const fixed_buffer_allocator = fixed_buffer_allocator_backer.allocator();
+
+    var debug_str_representation_holder = struct {
+        const StackLocation = enum { operand_stack, operator_stack };
+
+        map: std.ArrayListUnmanaged(struct {
+            location: struct {
+                stack_location: StackLocation,
+                stack_index: usize,
+            },
+            str_representation: []const u8,
+        }) = .{},
+
+        fn append(self: *@This(), allocator: Allocator, stack_location: StackLocation, index: usize, str: []const u8) !void {
+            try self.map.append(allocator, .{
+                .location = .{
+                    .stack_location = stack_location,
+                    .stack_index = index,
+                },
+                .str_representation = str,
+            });
+        }
+
+        fn concat(_: *const @This(), allocator: Allocator, str1: []const u8, str2: []const u8) ![]const u8 {
+            const next_operand_str = try allocator.alloc(u8, str1.len + str2.len + 1);
+            @memcpy(next_operand_str[0..str1.len], str1);
+            next_operand_str[str1.len] = ' ';
+            @memcpy(next_operand_str[str1.len + 1 ..], str2);
+            return next_operand_str;
+        }
+
+        fn searchForStrRepresentation(self: *const @This(), stack_location: StackLocation, index: usize) []const u8 {
+            var i = self.map.items.len;
+            while (true) {
+                if (i == 0) unreachable;
+                i -= 1;
+                const e = self.map.items[i];
+                if (e.location.stack_location == stack_location and e.location.stack_index == index)
+                    return e.str_representation;
+            }
+        }
+    }{};
 
     var operand_list_strs = if (builtin.mode == .Debug) try std.ArrayListUnmanaged([]const u8).initCapacity(gpa, 1000);
     var operand_list = try std.ArrayListUnmanaged(Token).initCapacity(gpa, 1000);
@@ -3151,14 +3460,6 @@ fn infixToPrefix(gpa: Allocator, source: [:0]const u8, tokens: []const Token) ![
     var operand_stack: std.ArrayListUnmanaged(LinkedOpStringHead) = .{};
     var operator_stack: std.ArrayListUnmanaged(Token) = .{};
     try operator_stack.append(gpa, Token{ .len = 0, .kind = .sentinel_operator });
-
-    var cur_token = tokens[0..];
-    var cur = source;
-
-    if (tokens[0].kind == .whitespace) {
-        cur_token = cur_token[1..];
-        cur = cur[tokens[0].len..];
-    }
 
     // Algorithm ConvertInfixtoPrefix
 
@@ -3229,30 +3530,31 @@ fn infixToPrefix(gpa: Allocator, source: [:0]const u8, tokens: []const Token) ![
     // // Save the prefix expression at the top of the operand stack followed by popping // the operand stack.
 
     // print OperandStack.Top()
-
     // OperandStack.Pop()
 
     // End
 
-    // TODO: make it so we have function calls.
+    // TODO: make it so we have function calls. TODO: have an array which tells us where all the TOO LARGE tokens are
 
     var qui: usize = 0;
     var un_ctx = true;
+    var cur_token = tokens[0..];
+    var cur: [:0]const u8 = source;
 
-    while (true) : (cur_token = cur_token[1..]) {
-        qui += 1;
-        if (!Parser.isOperand(cur_token[0].kind)) {
-            std.debug.print("operator_stack: ", .{});
-            for (operator_stack.items) |operator| std.debug.print("{s} ", .{@tagName(operator.kind)});
-            std.debug.print("\n", .{});
-        }
-
-        const cur_token_str = cur[0..cur_token[0].len];
-
-        std.debug.print("cur_token: \"{s}\", kind: {}, i:{}\n", .{ std.mem.trim(u8, cur_token_str, "\n "), cur_token[0].kind, qui });
-
+    if (cur_token[0].kind == .whitespace) {
         cur = cur[if (cur_token[0].len == 0) @as(u32, @bitCast(cur_token[1..][0..2].*)) else cur_token[0].len..];
+        cur_token = cur_token[1..];
+    }
 
+    while (true) : ({
+        cur = cur[if (cur_token[0].len == 0) @as(u32, @bitCast(cur_token[1..][0..2].*)) else cur_token[0].len..];
+        cur_token = cur_token[1..];
+        qui += 1;
+    }) {
+        if (qui == 5) {
+            std.debug.print("Du-uh!\n", .{});
+        }
+        printDebugInfo(qui, cur_token, operator_stack, cur);
         const raw_class = Operators.classify(cur_token[0].kind);
 
         const cur_token_kind: Tag = switch (raw_class) {
@@ -3267,11 +3569,22 @@ fn infixToPrefix(gpa: Allocator, source: [:0]const u8, tokens: []const Token) ![
             else => |r| r,
         };
 
-        un_ctx = raw_class != .operand and raw_class != .post_unary_op;
+        un_ctx = raw_class != .operand and raw_class != .post_unary_op and cur_token_kind != .@")";
 
-        if (cur_class == .operand) {
-            try operand_list.append(gpa, cur_token[0]);
-            if (builtin.mode == .Debug) try operand_list_strs.append(gpa, cur_token_str);
+        if (cur_token_kind == .@";") {
+            std.debug.print("Finishing!\n", .{});
+        }
+
+        if (raw_class == .operand) {
+            try operand_list.ensureUnusedCapacity(gpa, 4);
+            operand_list.items.ptr[operand_list.items.len..][0..4].* = cur_token[0..4].*;
+            operand_list.items.len += if (cur_token[0].len == 0) 3 else 1;
+
+            if (builtin.mode == .Debug) {
+                const str = cur[0..if (cur_token[0].len == 0) @as(u32, @bitCast(cur_token[1..][0..2].*)) else cur_token[0].len];
+                try operand_list_strs.append(gpa, str);
+                try debug_str_representation_holder.append(gpa, .operand_stack, operand_stack.items.len, str);
+            }
             const sentinel_index = @intFromBool(cur_token[0].len == 0);
             try operand_stack.append(gpa, .{ .first = sentinel_index, .last = sentinel_index });
         } else {
@@ -3289,28 +3602,75 @@ fn infixToPrefix(gpa: Allocator, source: [:0]const u8, tokens: []const Token) ![
                 if (Operators.getPrecedence(cur_token_kind) <= Operators.getPrecedence(top_operator.kind)) {
                     // new_operand = operator_stack.pop() + left + right
                     var new_operand: LinkedOpStringHead = operand_stack.pop();
+                    var new_operand_str = debug_str_representation_holder.searchForStrRepresentation(.operand_stack, operand_stack.items.len);
+                    std.debug.print("new_operand_str: {s}\n", .{new_operand_str});
 
                     while (true) {
+                        // if (top_operator.kind == .@",")
+                        // new_operand = try op_str_buffer.prependOperatorFromStack(gpa, &operator_stack, new_operand);
                         op_str_buffer.print(new_operand);
                         if (!Operators.isUnary(top_operator.kind)) {
+                            op_str_buffer.print(operand_stack.getLast());
                             new_operand = try op_str_buffer.joinOperands(gpa, operand_stack.pop(), new_operand);
+
+                            // DEBUG
+                            const other_operand_str = debug_str_representation_holder.searchForStrRepresentation(.operand_stack, operand_stack.items.len);
+                            new_operand_str = try debug_str_representation_holder.concat(fixed_buffer_allocator, other_operand_str, new_operand_str);
+                            // DEBUG
                         }
                         op_str_buffer.print(new_operand);
+                        std.debug.print("new_operand: {s}\n", .{new_operand_str});
+
+                        // if (top_operator.kind != .@",")
                         new_operand = try op_str_buffer.prependOperatorFromStack(gpa, &operator_stack, new_operand);
+
+                        // DEBUG
+                        new_operand_str = try debug_str_representation_holder.concat(fixed_buffer_allocator, debug_str_representation_holder.searchForStrRepresentation(.operator_stack, operator_stack.items.len), new_operand_str);
+                        std.debug.print("new_operand_str: {s}\n", .{new_operand_str});
                         op_str_buffer.print(new_operand);
+                        // DEBUG
+
                         top_operator = operator_stack.getLast();
                         if (Operators.getPrecedence(cur_token_kind) > Operators.getPrecedence(top_operator.kind)) break;
                     }
 
+                    try debug_str_representation_holder.append(gpa, .operand_stack, operand_stack.items.len, new_operand_str);
                     try operand_stack.append(gpa, new_operand);
 
                     if (cur_token_kind == .@")") {
                         // TODO: can we carefully craft the precedence table to do this implicitly?
-                        const last_slot = &operand_stack.items[operand_stack.items.len - 1];
-                        last_slot.* = try op_str_buffer.prependOperatorFromStack(gpa, &operator_stack, last_slot.*);
+                        assert(operator_stack.getLast().kind == .@"(" or operator_stack.getLast().kind == .@"call (");
+
+                        // Empty operand stack
+                        while (true) {
+                            operand_stack.items.len -= 1;
+                            if (operand_stack.items.len == 0) break;
+                            op_str_buffer.print(operand_stack.getLast());
+                            new_operand = try op_str_buffer.joinOperands(gpa, operand_stack.getLast(), new_operand);
+
+                            // DEBUG
+                            const other_operand_str = debug_str_representation_holder.searchForStrRepresentation(.operand_stack, operand_stack.items.len - 1);
+                            new_operand_str = try debug_str_representation_holder.concat(fixed_buffer_allocator, other_operand_str, new_operand_str);
+                            std.debug.print("new_operand_str: {s}\n", .{new_operand_str});
+                            // DEBUG
+                        }
+
+                        const last_slot = operand_stack.addOneAssumeCapacity();
+                        // const last_slot_str = debug_str_representation_holder.searchForStrRepresentation(.operand_stack, operand_stack.items.len - 1);
+                        // std.debug.print("last_slot_str: {s}\n", .{last_slot_str});
+
+                        new_operand = try op_str_buffer.prependOperatorFromStack(gpa, &operator_stack, new_operand);
+                        op_str_buffer.print(new_operand);
+                        last_slot.* = try op_str_buffer.appendRightParen(gpa, new_operand, cur_token[0..4].*);
                         op_str_buffer.print(last_slot.*);
-                        last_slot.* = try op_str_buffer.appendRightParen(gpa, last_slot.*, cur_token[0..4].*);
-                        op_str_buffer.print(last_slot.*);
+
+                        const final_str = try debug_str_representation_holder.concat(
+                            fixed_buffer_allocator,
+                            try debug_str_representation_holder.concat(fixed_buffer_allocator, "call (", new_operand_str),
+                            ")",
+                        );
+                        try debug_str_representation_holder.append(gpa, .operand_stack, operand_stack.items.len - 1, final_str);
+                        std.debug.print("final_str: {s}\n", .{final_str});
                         continue;
                     }
                     // std.debug.print("{any}\n", .{operand_stack.items});
@@ -3323,6 +3683,10 @@ fn infixToPrefix(gpa: Allocator, source: [:0]const u8, tokens: []const Token) ![
             if (current_token.len == 0) {
                 try operator_stack.appendSlice(gpa, cur_token[1..][0..2]);
                 cur_token = cur_token[2..];
+            }
+            if (builtin.mode == .Debug) {
+                // const str = cur[0..if (cur_token[0].len == 0) @as(u32, @bitCast(cur_token[1..][0..2].*)) else cur_token[0].len];
+                try debug_str_representation_holder.append(gpa, .operator_stack, operator_stack.items.len, @tagName(cur_token_kind));
             }
             try operator_stack.append(gpa, current_token);
         }
@@ -3533,6 +3897,197 @@ fn infixToPrefixPrinter(gpa: Allocator, source: [:0]const u8, tokens: []const To
     std.debug.print("|\n", .{});
 }
 
+// a + b * c;
+// ; + a * b c
+// fn parse(parse_tree: []const Token, source: [:0]const u8) struct { Token, []const Token, [:0]const u8 } {
+//     var cur_token = parse_tree[0..];
+//     var cur = source[0..];
+
+//     // binary_op = 0,
+//     // pre_unary_op = 1,
+//     // ambiguous_pre_unary_or_binary = 2,
+//     // post_unary_op = 3,
+//     // operand = 4,
+//     // post_unary_ctx_reset_op = 5,
+//     // something = 6,
+//     // ambiguous_pre_unary_or_post_unary = 7,
+
+//     // -(-b * -c - -d.*.?) / (e + f) * g + h - -i.*.? * j * (k * (l - m) + n / o);
+//     // ; - + * / unary - ( - * unary - b unary - c unary - .? .* d ) ( + e f ) g h * * unary - .? .* i j ( + * k ( - l m ) / n o )
+//     const cur_class = Operators.classify(cur_token[0].kind);
+
+//     switch (cur_class) {
+//         .ambiguous_pre_unary_or_post_unary => { // matches (
+//             unreachable;
+//         },
+//         .operand => {
+//             // const str = cur[0..parse_tree[0].len];
+//             // std.debug.print("{s}", .{str});
+//             cur = cur[parse_tree[0].len..];
+//             return .{ cur_token[0], cur_token, cur };
+//         },
+//         .pre_unary_op => {
+//             const str = cur[0..parse_tree[0].len];
+//             cur = cur[parse_tree[0].len..];
+//             std.debug.print("{s}", .{str});
+//             const operand1: Token, cur_token, cur = parse(cur_token[1..], cur);
+
+//             _ = operand1;
+
+//             return .{ parse_tree[0], cur_token, cur };
+//         },
+//         .post_unary_op => {
+//             const operand1: Token, cur_token, cur = parse(cur_token[1..], cur);
+
+//             const str = cur[0..parse_tree[0].len];
+//             cur = cur[parse_tree[0].len..];
+//             std.debug.print("{s}", .{str});
+
+//             _ = operand1;
+
+//             return .{ parse_tree[0], cur_token, cur };
+//         },
+
+//         .ambiguous_pre_unary_or_binary, // these are binary now
+//         .binary_op,
+//         => {
+//             const operand1: Token, cur_token, cur = parse(cur_token[1..], cur);
+//             const str = cur[0..parse_tree[0].len];
+//             cur = cur[parse_tree[0].len..];
+//             std.debug.print("{s}", .{str});
+//             const operand2: Token, cur_token, cur = parse(cur_token[1..], cur);
+//             _ = operand1;
+//             _ = operand2;
+
+//             return .{ parse_tree[0], cur_token, cur };
+//         },
+//         else => |c| {
+//             // const str = cur[0..parse_tree[0].len];
+//             // cur = cur[parse_tree[0].len..];
+//             std.debug.print("{} {s}\n", .{ c, @tagName(cur_token[0].kind) });
+//             unreachable;
+//         },
+//     }
+// }
+
+// fn parse2(token_info_iterator: *TokenInfoIterator) TokenInfo {
+
+//     // binary_op = 0,
+//     // pre_unary_op = 1,
+//     // ambiguous_pre_unary_or_binary = 2,
+//     // post_unary_op = 3,
+//     // operand = 4,
+//     // post_unary_ctx_reset_op = 5,
+//     // something = 6,
+//     // ambiguous_pre_unary_or_post_unary = 7,
+
+//     // -(-b * -c - -d.*.?) / (e + f) * g + h - -i.*.? * j * (k * (l - m) + n / o);
+//     // ; - + * / unary - ( - * unary - b unary - c unary - .? .* d ) ( + e f ) g h * * unary - .? .* i j ( + * k ( - l m ) / n o )
+//     const current = token_info_iterator.current();
+//     const cur_class = Operators.classify(current.kind);
+
+//     switch (cur_class) {
+//         .ambiguous_pre_unary_or_post_unary => { // matches (
+//             unreachable;
+//         },
+//         .operand => {
+//             std.debug.print("{s}", .{current.source});
+//             token_info_iterator.advanceTokenAndCursor();
+//             return current;
+//         },
+//         .pre_unary_op => {
+//             const str = cur[0..parse_tree[0].len];
+//             cur = cur[parse_tree[0].len..];
+//             std.debug.print("{s}", .{str});
+//             const operand1: Token, cur_token, cur = parse(cur_token[1..], cur);
+
+//             _ = operand1;
+
+//             return .{ parse_tree[0], cur_token, cur };
+//         },
+//         .post_unary_op => {
+//             const operand1: Token, cur_token, cur = parse(cur_token[1..], cur);
+
+//             const str = cur[0..parse_tree[0].len];
+//             cur = cur[parse_tree[0].len..];
+//             std.debug.print("{s}", .{str});
+
+//             _ = operand1;
+
+//             return .{ parse_tree[0], cur_token, cur };
+//         },
+
+//         .ambiguous_pre_unary_or_binary, // these are binary now
+//         .binary_op,
+//         => {
+//             parse2(token_info_iterator);
+//             const operand1: Token, cur_token, cur = parse(cur_token[1..], cur);
+//             const str = cur[0..parse_tree[0].len];
+//             cur = cur[parse_tree[0].len..];
+//             std.debug.print("{s}", .{str});
+//             const operand2: Token, cur_token, cur = parse(cur_token[1..], cur);
+//             _ = operand1;
+//             _ = operand2;
+
+//             return .{ parse_tree[0], cur_token, cur };
+//         },
+//         else => |c| {
+//             // const str = cur[0..parse_tree[0].len];
+//             // cur = cur[parse_tree[0].len..];
+//             std.debug.print("{} {s}\n", .{ c, @tagName(cur_token[0].kind) });
+//             unreachable;
+//         },
+//     }
+// }
+
+fn vpshufb(table: anytype, indices: @TypeOf(table)) @TypeOf(table) {
+    const methods = struct {
+        extern fn @"llvm.x86.avx512.pshuf.b.512"(@Vector(64, u8), @Vector(64, u8)) @Vector(64, u8);
+        extern fn @"llvm.x86.avx2.pshuf.b"(@Vector(32, u8), @Vector(32, u8)) @Vector(32, u8);
+        extern fn @"llvm.x86.ssse3.pshuf.b.128"(@Vector(16, u8), @Vector(16, u8)) @Vector(16, u8);
+    };
+
+    return switch (@TypeOf(table)) {
+        @Vector(64, u8) => if (comptime std.Target.x86.featureSetHas(builtin.cpu.features, .avx512bw)) methods.@"llvm.x86.avx512.pshuf.b.512"(table, indices) else @compileError("CPU target lacks support for vpshufb512"),
+        @Vector(32, u8) => if (comptime std.Target.x86.featureSetHas(builtin.cpu.features, .avx2)) methods.@"llvm.x86.avx2.pshuf.b"(table, indices) else @compileError("CPU target lacks support for vpshufb256"),
+        @Vector(16, u8) => if (comptime std.Target.x86.featureSetHas(builtin.cpu.features, .ssse3)) methods.@"llvm.x86.ssse3.pshuf.b.128"(table, indices) else @compileError("CPU target lacks support for vpshufb128"),
+        else => @compileError(std.fmt.comptimePrint("Invalid argument type passed to vpshufb: {}\n", .{@TypeOf(table)})),
+    };
+}
+
+fn tbl1(table: anytype, indices: anytype) @TypeOf(indices) {
+    switch (@TypeOf(table)) {
+        @Vector(16, u8), @Vector(16, i8) => {},
+        else => @compileError("[aarch64.neon.tbl1] Invalid first operand. Should be @Vector(16, u8) or @Vector(16, i8)"),
+    }
+    switch (@TypeOf(indices)) {
+        @Vector(16, u8), @Vector(8, u8), @Vector(16, i8), @Vector(8, i8) => {},
+        @Vector(8, i16), @Vector(8, u16) => @compileError("[aarch64.neon.tbl1] @Vector(8, u16) is currently not supported for the second operand."),
+        else => @compileError("[aarch64.neon.tbl1] Invalid second operand. Should be @Vector(16, u8) or @Vector(8, u8)"),
+    }
+    return struct {
+        extern fn @"llvm.aarch64.neon.tbl1"(@TypeOf(table), @TypeOf(indices)) @TypeOf(indices);
+    }
+        .@"llvm.aarch64.neon.tbl1"(table, indices);
+}
+
+fn assertByteVectorLen(T: type, comptime len: comptime_int) void {
+    switch (T) {
+        @Vector(len, i8), @Vector(len, u8) => {},
+        else => @compileError(std.fmt.comptimePrint("Invalid operand. Should be @Vector({}, i8) or @Vector({}, u8)", .{ len, len })),
+    }
+}
+
+fn vtbl2(table_part_1: anytype, table_part_2: @TypeOf(table_part_1), indices: anytype) @TypeOf(table_part_1) {
+    comptime assert(builtin.cpu.arch == .arm and std.Target.arm.featureSetHas(builtin.cpu.features, .neon));
+    comptime assertByteVectorLen(@TypeOf(table_part_1), 8);
+    comptime assertByteVectorLen(@TypeOf(indices), 8);
+
+    return struct {
+        extern fn @"llvm.arm.neon.vtbl2"(@TypeOf(table_part_1), @TypeOf(table_part_2), @TypeOf(indices)) @TypeOf(table_part_1);
+    }.@"llvm.arm.neon.vtbl2"(table_part_1, table_part_2, indices);
+}
+
 // ---------------------------------------------------------------
 //
 // The code below this point is licensed under the Apache License.
@@ -3546,15 +4101,20 @@ const Utf8Checker = struct {
 
     fn prev(comptime N: comptime_int, a: Chunk, b: Chunk) Chunk {
         comptime assert(0 < N and N < @sizeOf(Chunk));
+        const a_shift = N * 8;
+        const b_shift = (@sizeOf(Chunk) - N) * 8;
+
         return if (USE_SWAR)
-            (b >> ((@sizeOf(Chunk) - N) * 8)) |
-                (a << (N * 8))
+            switch (comptime builtin.cpu.arch.endian()) {
+                .little => (a << a_shift) | (b >> b_shift),
+                .big => (a >> a_shift) | (b << b_shift),
+            }
         else
             std.simd.mergeShift(b, a, @sizeOf(Chunk) - N);
     }
 
     // end from https://gist.github.com/sharpobject/80dc1b6f3aaeeada8c0e3a04ebc4b60a
-    pub fn mm_shuffle_epi8(x: Chunk, mask: Chunk) Chunk {
+    pub fn mm_shuffle_epi8(x: anytype, mask: Chunk) Chunk {
         return asm (
             \\vpshufb %[mask], %[x], %[out]
             : [out] "=x" (-> Chunk),
@@ -3564,7 +4124,7 @@ const Utf8Checker = struct {
     }
 
     // https://developer.arm.com/architectures/instruction-sets/intrinsics/vqtbl1q_s8
-    pub fn lookup_16_aarch64(x: @Vector(16, u8), mask: @Vector(16, u8)) @Vector(16, u8) {
+    pub fn lookup_16_arm64(x: @Vector(16, u8), mask: @Vector(16, u8)) @Vector(16, u8) {
         return asm (
             \\tbl  %[out].16b, {%[mask].16b}, %[x].16b
             : [out] "=&x" (-> @Vector(16, u8)),
@@ -3573,17 +4133,28 @@ const Utf8Checker = struct {
         );
     }
 
-    fn lookup_chunk(comptime a: [16]u8, b: Chunk) Chunk {
+    pub fn lookup_8_arm32(x: Chunk, comptime table: [16]u8) Chunk {
+        return struct {
+            extern fn @"llvm.arm.neon.vtbl2"(Chunk, Chunk, Chunk) Chunk;
+        }.@"llvm.arm.neon.vtbl2"(x, table[0..8].*, table[8..][0..8].*);
+    }
+
+    // Default behavior for shuffles across architectures
+    // x86_64: If bit 7 is 1, set to 0, otherwise use lower 4 bits for lookup. We can get the arm/risc-v/wasm behavior by adding 0x70 before doing the lookup.
+    // ARM: if index is out of range (0-15), set to 0
+    // PPC64: use lower 4 bits for lookup (no out of range handling)
+    // MIPS: if bit 6 or bit 7 is 1, set to 0; otherwise use lower 4 bits for lookup (or rather use lower 5 bits for lookup into a table that has 32 elements constructed from 2 input vectors, but if both vectors are the same then it effectively means bits 4,5 are ignored)
+    // RISCV: if index is out of range (0-15), set to 0.
+    // WASM: if index is out of range (0-15), set to 0.
+    fn lookup_chunk(comptime a: [16]u8, b: anytype) @TypeOf(b) {
         switch (builtin.cpu.arch) {
-            .x86_64 => return mm_shuffle_epi8(a ** (@sizeOf(Chunk) / 16), b),
-            .aarch64, .aarch64_be => return lookup_16_aarch64(b, a ** (@sizeOf(Chunk) / 16)),
+            // if high bit is set will result in a 0, otherwise, just looks at lower 4 bits
+            .x86_64 => return vpshufb(@as(@TypeOf(b), @bitCast(a ** (@sizeOf(@TypeOf(b)) / 16))), b),
+            .aarch64, .aarch64_be => return lookup_16_arm64(b, a ** (@sizeOf(@TypeOf(b)) / 16)),
+            .arm => return lookup_8_arm32(b, a),
             else => {
-                var r: Chunk = @splat(0);
-                for (0..@sizeOf(Chunk)) |i| {
-                    const c = b[i];
-                    assert(c <= 0x0F);
-                    r[i] = a[c];
-                }
+                var r: @TypeOf(b) = @splat(0);
+                for (0..@sizeOf(@TypeOf(b))) |i| r[i] = a[b[i]];
                 return r;
 
                 // var r: Chunk = @splat(0);
@@ -3716,25 +4287,30 @@ const Utf8Checker = struct {
     }
 
     fn must_be_2_3_continuation(prev2: Chunk, prev3: Chunk) Chunk {
+        const ones: Chunk = @bitCast(@as(@Vector(@sizeOf(Chunk), u8), @splat(1)));
+        const msbs: Chunk = @bitCast(@as(@Vector(@sizeOf(Chunk), u8), @splat(0x80)));
+
         if (USE_SWAR) {
-            const ones: Chunk = @bitCast(@as(@Vector(@sizeOf(Chunk), u8), @splat(1)));
-            const msbs: Chunk = ones * 0x80;
             const is_3rd_byte = prev2 & ((prev2 | msbs) - (0b11100000 - 0x80) * ones);
             const is_4th_byte = prev3 & ((prev3 | msbs) - (0b11110000 - 0x80) * ones);
             return (is_3rd_byte | is_4th_byte) & msbs;
         } else {
             const is_3rd_byte = prev2 -| @as(Chunk, @splat(0b11100000 - 0x80));
             const is_4th_byte = prev3 -| @as(Chunk, @splat(0b11110000 - 0x80));
-            return (is_3rd_byte | is_4th_byte) & @as(Chunk, @splat(0x80));
+            return (is_3rd_byte | is_4th_byte) & msbs;
         }
     }
 
     fn isASCII(input: Chunk) bool {
+        // https://github.com/llvm/llvm-project/issues/76812
         return 0 == if (USE_SWAR)
             (input & @as(NATIVE_VEC_INT, @bitCast(@as(@Vector(@sizeOf(uword), u8), @splat(0x80)))))
+        else if (builtin.cpu.arch == .x86_64)
+            @reduce(.Or, input & @as(Chunk, @splat(0x80)))
+        else if (builtin.cpu.arch == .arm or builtin.cpu.arch == .armeb)
+            (@as(NATIVE_VEC_INT, @bitCast(input)) & @as(NATIVE_VEC_INT, @bitCast(@as(Chunk, @splat(0x80)))))
         else
-            @reduce(.Or, input & @as(Chunk, @splat(0x80)));
-        // @as(std.meta.Int(.unsigned, NATIVE_VEC_SIZE), @bitCast(input >= @as(@Vector(NATIVE_VEC_SIZE, u8), @splat(0x80))));
+            @as(std.meta.Int(.unsigned, NATIVE_VEC_SIZE), @bitCast(input >= @as(@Vector(NATIVE_VEC_SIZE, u8), @splat(0x80))));
     }
 
     fn validateChunk(utf8_checker: *Utf8Checker, input: Chunk) !void {
@@ -3762,18 +4338,15 @@ const Utf8Checker = struct {
         const err = (must23_80 ^ sc) | if (USE_SWAR) blk: {
             // Will have a zero byte in `y` if there was a '\u{2028}' or '\u{2029}'
             const x = (input ^ (0b1010_1000 * ones));
-            const y = (prev2 ^ (0b1110_0010 * ones)) |
-                (prev1 ^ (0b1000_0000 * ones)) |
-                (x & (x ^ ones));
+            const y = (prev2 ^ (0b1110_0010 * ones)) | (prev1 ^ (0b1000_0000 * ones)) | (x & (x ^ ones));
 
             // Will have a zero byte in `z` if there was a '\u{85}'
-            const z =
-                (prev1 ^ (0b1100_0010 * ones)) |
-                (input ^ (0b1000_0101 * ones));
+            const z = (prev1 ^ (0b1100_0010 * ones)) | (input ^ (0b1000_0101 * ones));
 
-            const is0x2028or0x2029 = (y -% ones) & ~y;
-            const is0x85 = (z -% ones) & ~z;
-            break :blk (is0x2028or0x2029 | is0x85) & msbs;
+            // Doesn't necessarily tell us the position, but tells us if there were any zero bytes.
+            const has0x2028or0x2029 = (y -% ones) & ~y;
+            const has0x85 = (z -% ones) & ~z;
+            break :blk (has0x2028or0x2029 | has0x85) & msbs;
         } else blk: {
             const true_vec = @as(Chunk, @splat(0xFF));
             const false_vec = @as(Chunk, @splat(0));
@@ -3790,8 +4363,15 @@ const Utf8Checker = struct {
             break :blk is0x2028or0x2029 | is0x85;
         };
 
-        if (hasError(err))
+        if ((0 != if (USE_SWAR)
+            err
+        else if (builtin.cpu.arch == .arm or builtin.cpu.arch == .armeb)
+            @as(NATIVE_VEC_INT, @bitCast(err))
+        else
+            @reduce(if (builtin.cpu.arch == .x86_64) .Or else .Max, err)))
+        {
             return error.InvalidUtf8;
+        }
 
         // If there are incomplete multibyte characters at the end of the block,
         // write that data into `self.err`.
@@ -3801,25 +4381,27 @@ const Utf8Checker = struct {
         // ... 1111____ 111_____ 11______
         utf8_checker.is_invalid_place_to_end = 0 !=
             if (USE_SWAR)
-            msbs & input & ((input | msbs) - comptime max_value: {
+            msbs & input & ((input | msbs) -% comptime max_value: {
                 var max_array = [1]u8{0} ** @sizeOf(Chunk);
                 max_array[@sizeOf(Chunk) - 3] = 0b11110000 - 0x80;
                 max_array[@sizeOf(Chunk) - 2] = 0b11100000 - 0x80;
                 max_array[@sizeOf(Chunk) - 1] = 0b11000000 - 0x80;
                 break :max_value @as(Chunk, @bitCast(max_array));
             })
-        else
-            @reduce(if (builtin.cpu.arch == .x86_64) .Or else .Max, input -| comptime max_value: {
+        else blk: {
+            const max_value = input -| comptime max_value: {
                 var max_array: Chunk = @splat(0xFF);
                 max_array[@sizeOf(Chunk) - 3] = 0b11110000 - 1;
                 max_array[@sizeOf(Chunk) - 2] = 0b11100000 - 1;
                 max_array[@sizeOf(Chunk) - 1] = 0b11000000 - 1;
                 break :max_value max_array;
-            });
-    }
+            };
 
-    fn hasError(err: Chunk) bool {
-        return (0 != if (USE_SWAR) err else @reduce(if (builtin.cpu.arch == .x86_64) .Or else .Max, err));
+            // https://github.com/llvm/llvm-project/issues/79779
+            if (builtin.cpu.arch == .arm or builtin.cpu.arch == .armeb)
+                break :blk @as(NATIVE_VEC_INT, @bitCast(max_value));
+            break :blk @reduce(if (builtin.cpu.arch == .x86_64) .Or else .Max, max_value);
+        };
     }
 
     fn errors(checker: Utf8Checker) !void {
