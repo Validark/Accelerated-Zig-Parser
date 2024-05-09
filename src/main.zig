@@ -4292,26 +4292,6 @@ const Utf8Checker = struct {
             std.simd.mergeShift(b, a, @sizeOf(Chunk) - N);
     }
 
-    // end from https://gist.github.com/sharpobject/80dc1b6f3aaeeada8c0e3a04ebc4b60a
-    pub fn mm_shuffle_epi8(x: anytype, mask: Chunk) Chunk {
-        return asm (
-            \\vpshufb %[mask], %[x], %[out]
-            : [out] "=x" (-> Chunk),
-            : [x] "+x" (x),
-              [mask] "x" (mask),
-        );
-    }
-
-    // https://developer.arm.com/architectures/instruction-sets/intrinsics/vqtbl1q_s8
-    pub fn lookup_16_arm64(x: @Vector(16, u8), mask: @Vector(16, u8)) @Vector(16, u8) {
-        return asm (
-            \\tbl  %[out].16b, {%[mask].16b}, %[x].16b
-            : [out] "=&x" (-> @Vector(16, u8)),
-            : [x] "x" (x),
-              [mask] "x" (mask),
-        );
-    }
-
     // Default behavior for shuffles across architectures
     // x86_64: If bit 7 is 1, set to 0, otherwise use lower 4 bits for lookup. We can get the arm/risc-v/wasm behavior by adding 0x70 before doing the lookup.
     // ARM: if index is out of range (0-15), set to 0
