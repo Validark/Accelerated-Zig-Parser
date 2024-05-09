@@ -1,7 +1,7 @@
 // zig fmt: off
 const WRITE_OUT_DATA       = false;
 const SKIP_OUTLIERS        = false;
-const RUN_LEGACY_TOKENIZER = false;
+const RUN_LEGACY_TOKENIZER = true;
 const RUN_NEW_TOKENIZER    = true;
 const RUN_LEGACY_AST       = false;
 const RUN_NEW_AST          = false;
@@ -153,14 +153,14 @@ const NATIVE_VEC_SIZE = @sizeOf(NATIVE_VEC_INT);
 const NATIVE_CHAR_VEC = @Vector(NATIVE_VEC_SIZE, u8);
 
 /// The number of chunks to process at once
-const BATCH_SIZE = if (HAS_ARM32_FAST_16_BYTE_VECTORS) 2 else 1;
+/// We can experiment on different machines to see what is most beneficial
+const BATCH_SIZE = if (HAS_ARM32_FAST_16_BYTE_VECTORS) 2 else if (HAS_FAST_PDEP_AND_PEXT) 4;
 const CHUNK_ALIGNMENT = BATCH_SIZE * @bitSizeOf(uword);
 
 const NUM_CHUNKS = if (HAS_ARM32_FAST_16_BYTE_VECTORS) 4 else @bitSizeOf(uword) / NATIVE_VEC_SIZE;
 const Chunk = if (USE_SWAR) NATIVE_VEC_INT else @Vector(NATIVE_VEC_SIZE, u8);
 
 const FRONT_SENTINELS = "\n";
-// const BACK_SENTINELS_OLD = "\n" ++ "\x00" ** 13 ++ " ";
 const BACK_SENTINELS = "\n" ++ "\x00" ** 62 ++ " ";
 const INDEX_OF_FIRST_0_SENTINEL = std.mem.indexOfScalar(u8, BACK_SENTINELS, 0).?;
 const EXTENDED_BACK_SENTINELS_LEN = BACK_SENTINELS.len - INDEX_OF_FIRST_0_SENTINEL;
@@ -525,8 +525,6 @@ const Operators = struct {
         break :blk bitmask;
     };
 
-    const first_mask_popcount = @popCount(masks[0]);
-
     const sorted_padded_ops = blk: {
         const max_hash_is_unused = (masks[masks.len - 1] >> 63) ^ 1;
         var buffer: [padded_ops.len + max_hash_is_unused][4]u8 = undefined;
@@ -561,7 +559,7 @@ const Operators = struct {
 
     fn mapToIndexRaw(hash_val: u7) u7 {
         const mask = (@as(u64, 1) << @truncate(hash_val)) -% 1;
-        return (if (hash_val >= 64) first_mask_popcount else 0) +
+        return (if (hash_val >= 64) (comptime @popCount(masks[0])) else 0) +
             @popCount(mask & masks[hash_val / 64]);
     }
 
@@ -647,7 +645,6 @@ const Keywords = struct {
         break :blk bitmask;
     };
 
-    const first_mask_popcount = @popCount(masks[0]);
     const max_kw_len = blk: {
         var max = 0;
         for (unpadded_kws) |kw| max = @max(kw.len, max);
@@ -748,7 +745,7 @@ const Keywords = struct {
     /// Given a hash, maps it to an index in the range [0, sorted_padded_kws.len)
     fn mapToIndex(hash: u7) u8 {
         const mask = (@as(u64, 1) << @truncate(hash)) -% 1;
-        return (if (hash >= 64) first_mask_popcount else 0) + @popCount(mask & masks[hash / 64]);
+        return (if (hash >= 64) (comptime @popCount(masks[0])) else 0) + @popCount(mask & masks[hash / 64]);
     }
 
     const min_kw_len = blk: {
@@ -2055,8 +2052,6 @@ const Parser = struct {
         const tokens = try gpa.alloc(Token, extended_source_len);
         errdefer gpa.free(tokens);
 
-        // TODO: add dynamic math here based on DO_CHAR_LITERAL_IN_SIMD and DO_QUOTE_IN_SIMD
-
         // We write our 3 bitstrings to consecutive slots in a buffer.
         // |a|b|c|
         //   |a|b|c| <- Each time, we move one slot forward
@@ -2270,7 +2265,7 @@ const Parser = struct {
             }
 
             comptime assert(BACK_SENTINELS.len - 1 > std.mem.indexOf(u8, BACK_SENTINELS, "\x00").?); // there should be at least another character
-            comptime assert(BACK_SENTINELS[BACK_SENTINELS.len - 1] == ' '); // eof reads the non_newlines bitstring, therefore we need a newline at the end
+            comptime assert(BACK_SENTINELS[0] == '\n'); // eof reads the non_newlines bitstring, therefore we need a newline at the end
             if (op_type == .eof) break :outer;
 
             while (true) {
@@ -4244,11 +4239,7 @@ fn vpshufb(table: anytype, indices: @TypeOf(table)) @TypeOf(table) {
     };
 }
 
-fn tbl1(table: anytype, indices: anytype) @TypeOf(indices) {
-    switch (@TypeOf(table)) {
-        @Vector(16, u8), @Vector(16, i8) => {},
-        else => @compileError("[aarch64.neon.tbl1] Invalid first operand. Should be @Vector(16, u8) or @Vector(16, i8)"),
-    }
+fn tbl1(table: @Vector(16, u8), indices: anytype) @TypeOf(indices) {
     switch (@TypeOf(indices)) {
         @Vector(16, u8), @Vector(8, u8), @Vector(16, i8), @Vector(8, i8) => {},
         @Vector(8, i16), @Vector(8, u16) => @compileError("[aarch64.neon.tbl1] @Vector(8, u16) is currently not supported for the second operand."),
@@ -4295,7 +4286,7 @@ const Utf8Checker = struct {
     // Default behavior for shuffles across architectures
     // x86_64: If bit 7 is 1, set to 0, otherwise use lower 4 bits for lookup. We can get the arm/risc-v/wasm behavior by adding 0x70 before doing the lookup.
     // ARM: if index is out of range (0-15), set to 0
-    // PPC64: use lower 4 bits for lookup (no out of range handling)
+    // PPC64: use lower 4 bits for lookup
     // MIPS: if bit 6 or bit 7 is 1, set to 0; otherwise use lower 4 bits for lookup (or rather use lower 5 bits for lookup into a table that has 32 elements constructed from 2 input vectors, but if both vectors are the same then it effectively means bits 4,5 are ignored)
     // RISCV: if index is out of range (0-15), set to 0.
     // WASM: if index is out of range (0-15), set to 0.
@@ -4303,7 +4294,7 @@ const Utf8Checker = struct {
         switch (builtin.cpu.arch) {
             // if high bit is set will result in a 0, otherwise, just looks at lower 4 bits
             .x86_64 => return vpshufb(@as(@TypeOf(indices), @bitCast(table ** (@sizeOf(@TypeOf(indices)) / 16))), indices),
-            .aarch64, .aarch64_be, .aarch64_32 => return tbl1(@as(@Vector(16, u8), @bitCast(table)), indices),
+            .aarch64, .aarch64_be, .aarch64_32 => return tbl1(table, indices),
             .arm, .armeb => return switch (@TypeOf(indices)) {
                 @Vector(16, u8) => std.simd.join(vtbl2(table[0..8].*, table[8..][0..8].*, std.simd.extract(indices, 0, 8)), vtbl2(table[0..8].*, table[8..][0..8].*, std.simd.extract(indices, 8, 8))),
                 @Vector(8, u8) => vtbl2(table[0..8].*, table[8..][0..8].*, indices),
