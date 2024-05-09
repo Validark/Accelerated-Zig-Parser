@@ -1,7 +1,7 @@
 // zig fmt: off
 const WRITE_OUT_DATA       = false;
 const SKIP_OUTLIERS        = false;
-const RUN_LEGACY_TOKENIZER = true;
+const RUN_LEGACY_TOKENIZER = false;
 const RUN_NEW_TOKENIZER    = true;
 const RUN_LEGACY_AST       = false;
 const RUN_NEW_AST          = false;
@@ -154,7 +154,7 @@ const NATIVE_CHAR_VEC = @Vector(NATIVE_VEC_SIZE, u8);
 
 /// The number of chunks to process at once
 /// We can experiment on different machines to see what is most beneficial
-const BATCH_SIZE = if (HAS_ARM32_FAST_16_BYTE_VECTORS) 2 else if (HAS_FAST_PDEP_AND_PEXT) 4;
+const BATCH_SIZE = if (HAS_ARM32_FAST_16_BYTE_VECTORS) 2 else if (HAS_FAST_PDEP_AND_PEXT) 4 else 1;
 const CHUNK_ALIGNMENT = BATCH_SIZE * @bitSizeOf(uword);
 
 const NUM_CHUNKS = if (HAS_ARM32_FAST_16_BYTE_VECTORS) 4 else @bitSizeOf(uword) / NATIVE_VEC_SIZE;
