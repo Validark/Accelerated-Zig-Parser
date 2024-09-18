@@ -65,13 +65,13 @@ const Ast = std.zig.Ast;
 const Allocator = std.mem.Allocator;
 
 const HAS_ARM_NEON = switch (builtin.cpu.arch) {
-    .aarch64_32, .aarch64_be, .aarch64 => std.Target.aarch64.featureSetHas(builtin.cpu.features, .neon),
-    .arm, .armeb, .thumb, .thumbeb => std.Target.arm.featureSetHas(builtin.cpu.features, .neon),
+    .aarch64, .aarch64_be => std.Target.aarch64.featureSetHas(builtin.cpu.features, .neon),
+    .arm, .armeb => std.Target.arm.featureSetHas(builtin.cpu.features, .neon),
     else => false,
 };
 
 const HAS_ARM32_FAST_16_BYTE_VECTORS = switch (builtin.cpu.arch) {
-    .arm, .armeb, .thumb, .thumbeb => std.Target.arm.featureSetHas(builtin.cpu.features, .neon) and
+    .arm, .armeb => HAS_ARM_NEON and
         (!std.mem.startsWith(u8, builtin.cpu.model.name, "cortex_a") or
         builtin.cpu.model.name.len != 9 or
         std.mem.indexOfAnyPos(u8, builtin.cpu.model.name, 8, "5789") == null),
@@ -80,7 +80,7 @@ const HAS_ARM32_FAST_16_BYTE_VECTORS = switch (builtin.cpu.arch) {
 
 const HAS_CTZ = switch (builtin.cpu.arch) {
     // rbit+clz is close enough
-    .aarch64_32, .aarch64_be, .aarch64 => std.Target.aarch64.featureSetHas(builtin.cpu.features, .v8a),
+    .aarch64, .aarch64_be => std.Target.aarch64.featureSetHas(builtin.cpu.features, .v8a),
     .arm, .armeb, .thumb, .thumbeb => std.Target.arm.featureSetHas(builtin.cpu.features, .has_v6t2),
     .mips, .mips64, .mips64el, .mipsel => false,
     .powerpc, .powerpc64, .powerpc64le, .powerpcle => std.Target.powerpc.featureSetHas(builtin.cpu.features, .power9_vector),
@@ -89,14 +89,14 @@ const HAS_CTZ = switch (builtin.cpu.arch) {
     .avr => false,
     .msp430 => false,
     .riscv32, .riscv64 => std.Target.riscv.featureSetHas(builtin.cpu.features, .zbb),
-    .sparc, .sparc64, .sparcel => false,
+    .sparc, .sparc64 => false,
     .wasm32, .wasm64 => true,
     .x86, .x86_64 => std.Target.x86.featureSetHas(builtin.cpu.features, .bmi),
     else => false,
 };
 
 const HAS_POPCNT = switch (builtin.cpu.arch) {
-    .aarch64_32, .aarch64_be, .aarch64 => std.Target.aarch64.featureSetHas(builtin.cpu.features, .neon),
+    .aarch64, .aarch64_be => std.Target.aarch64.featureSetHas(builtin.cpu.features, .neon),
     .mips, .mips64, .mips64el, .mipsel => std.Target.mips.featureSetHas(builtin.cpu.features, .cnmips),
     .powerpc, .powerpc64, .powerpc64le, .powerpcle => std.Target.powerpc.featureSetHas(builtin.cpu.features, .popcntd),
     .s390x => std.Target.s390x.featureSetHas(builtin.cpu.features, .miscellaneous_extensions_3),
@@ -104,7 +104,7 @@ const HAS_POPCNT = switch (builtin.cpu.arch) {
     .avr => false,
     .msp430 => false,
     .riscv32, .riscv64 => std.Target.riscv.featureSetHas(builtin.cpu.features, .zbb),
-    .sparc, .sparc64, .sparcel => std.Target.sparc.featureSetHas(builtin.cpu.features, .popc),
+    .sparc, .sparc64 => std.Target.sparc.featureSetHas(builtin.cpu.features, .popc),
     .wasm32, .wasm64 => true,
     .x86, .x86_64 => std.Target.x86.featureSetHas(builtin.cpu.features, .popcnt),
     else => false,
@@ -112,11 +112,12 @@ const HAS_POPCNT = switch (builtin.cpu.arch) {
 
 const HAS_FAST_PDEP_AND_PEXT = blk: {
     const cpu_name = builtin.cpu.model.llvm_name orelse builtin.cpu.model.name;
-    break :blk builtin.cpu.arch == .x86_64 and
+    break :blk (builtin.cpu.arch.isPowerPC() and std.Target.powerpc.featureSetHas(builtin.cpu.features, .isa_v31_instructions)) or
+        builtin.cpu.arch.isX86() and
         std.Target.x86.featureSetHas(builtin.cpu.features, .bmi2) and
         // pdep is microcoded (slow) on AMD architectures before Zen 3.
         !std.mem.startsWith(u8, cpu_name, "bdver") and
-        (!std.mem.startsWith(u8, cpu_name, "znver") or cpu_name["znver".len] >= '3');
+        (!std.mem.startsWith(u8, cpu_name, "znver") or !(cpu_name["znver".len] < '3' and cpu_name["znver".len..].len == 1));
 };
 
 const HAS_FAST_VECTOR_REVERSE: bool = switch (builtin.cpu.arch) {
@@ -136,7 +137,7 @@ const HAS_FAST_BYTE_SWAP = switch (builtin.cpu.arch) {
 /// For now, we use `usize` as our reasonable guess for what size of bitstring we can operate on efficiently.
 const uword = std.meta.Int(.unsigned, if (std.mem.endsWith(u8, @tagName(builtin.cpu.arch), "64_32")) 64 else @bitSizeOf(usize));
 
-const IS_VECTORIZER_BROKEN = builtin.cpu.arch.isSPARC() or builtin.cpu.arch.isPPC() or builtin.cpu.arch.isPPC64();
+const IS_VECTORIZER_BROKEN = builtin.cpu.arch.isSPARC() or builtin.cpu.arch.isPowerPC();
 const SUGGESTED_VEC_SIZE: ?comptime_int = if (IS_VECTORIZER_BROKEN)
     null
 else if (HAS_ARM_NEON)
@@ -154,7 +155,7 @@ const NATIVE_CHAR_VEC = @Vector(NATIVE_VEC_SIZE, u8);
 
 /// The number of chunks to process at once
 /// We can experiment on different machines to see what is most beneficial
-const BATCH_SIZE = if (HAS_ARM32_FAST_16_BYTE_VECTORS) 2 else if (HAS_FAST_PDEP_AND_PEXT) 4 else 1;
+const BATCH_SIZE = if (HAS_ARM32_FAST_16_BYTE_VECTORS) 2 else if (HAS_FAST_PDEP_AND_PEXT) 1 else 1;
 const CHUNK_ALIGNMENT = BATCH_SIZE * @bitSizeOf(uword);
 
 const NUM_CHUNKS = if (HAS_ARM32_FAST_16_BYTE_VECTORS) 4 else @bitSizeOf(uword) / NATIVE_VEC_SIZE;
@@ -236,7 +237,7 @@ const SourceData = struct {
         for (self.source_list.items(.file_contents)) |source| gpa.free(source);
         @constCast(&self.source_list).deinit(gpa);
         gpa.free(self.name_buffer);
-        if (builtin.mode == .Debug)
+        if (comptime builtin.mode == .Debug)
             @constCast(self).* = undefined;
     }
 };
@@ -331,7 +332,7 @@ fn readFiles(gpa: Allocator) !SourceData {
 }
 
 inline fn vec_cmp(a: anytype, comptime cmp_type: enum { @"<", @"<=", @"==", @"!=", @">", @">=" }, x: anytype) @TypeOf(a) {
-    const child_type = @typeInfo(@TypeOf(a)).Vector.child;
+    const child_type = @typeInfo(@TypeOf(a)).vector.child;
     const true_vec = @as(@TypeOf(a), @splat(std.math.maxInt(child_type) + std.math.minInt(child_type)));
     const false_vec = @as(@TypeOf(a), @splat(0));
 
@@ -444,6 +445,13 @@ const Operators = struct {
         return isUnaryClass(classify(op_type));
     }
 
+    fn getPrecedence2(tag: Tag) u8 {
+        const ans = getPrecedence(tag);
+        if (tag == .@"call (") return ans - 1;
+        if (tag == .@",") return ans - 4;
+        return ans;
+    }
+
     fn getPrecedence(tag: Tag) u8 {
         comptime var lookup_table = std.mem.zeroes([256]u8);
         comptime {
@@ -451,6 +459,8 @@ const Operators = struct {
                 &[_]Tag{.eof},
                 &[_]Tag{.sentinel_operator},
                 &[_]Tag{.@";"},
+                &[_]Tag{},
+                &[_]Tag{},
                 &[_]Tag{ .@"(", .@"call (" },
                 &[_]Tag{.@")"},
                 &[_]Tag{.@","},
@@ -607,6 +617,290 @@ const Operators = struct {
     fn isMultiCharBeginning(c: u8) bool {
         inline for (multi_char_ops) |op| if (c == op) return true;
         return false;
+    }
+
+    fn hash_shuffle(comptime hashed_chars: []const u8, v: anytype, comptime table: @Vector(16, u8)) @TypeOf(v) {
+        const e = if (@TypeOf(v) == u8) @as(@Vector(1, u8), .{v}) else v;
+
+        // all: r += e << 4; r ^= r >> 2; r += r >> 7;
+        const indices: @Vector(@sizeOf(@TypeOf(e)), u4) = @truncate(blk: {
+            var r = e >> @splat(5);
+            r -%= e >> @splat(1);
+            r ^= e << @splat(1);
+            break :blk r;
+        });
+
+        comptime var buffer: @Vector(16, u8) = @splat(0);
+
+        comptime for (hashed_chars) |c| {
+            const slot = hash_shuffle("", c, undefined);
+            if (slot == 0) @compileError(std.fmt.comptimePrint("`{c}` hashed to 0", .{c}));
+            if (buffer[slot] != 0) @compileError(std.fmt.comptimePrint("Collision between `{c}` and `{c}`", .{ buffer[slot], c }));
+            buffer[slot] = c;
+        };
+
+        //    if (hashed_chars.len > 0)
+        //        @compileLog(std.fmt.comptimePrint("{} {c}", .{hashed_chars.len, buffer}));
+
+        return if (@TypeOf(v) == u8) indices[0] else @select(u8, shuffle(buffer, indices) == v, shuffle(table, indices), @as(@TypeOf(v), @splat(0)));
+    }
+
+    fn shuffle(table: anytype, indices: anytype) @Vector(64, u8) {
+        const T_LEN = switch (@typeInfo(@TypeOf(table))) {
+            .array => |info| info.len,
+            .vector => |info| info.len,
+            else => @compileError("Invalid `table` passed to shuffle function."),
+        };
+
+        const I_LEN = switch (@typeInfo(@TypeOf(indices))) {
+            .array => |info| info.len,
+            .vector => |info| info.len,
+            else => @compileError("Invalid `indices` passed to shuffle function."),
+        };
+
+        const child_type = std.meta.Child(@TypeOf(table));
+        const final_table = std.simd.repeat(I_LEN, @as(@Vector(T_LEN, child_type), @bitCast(table)));
+        return vpshufb(final_table, @as(@Vector(I_LEN, u8), indices));
+    }
+
+    const ContinuationBitStringProducer = struct {
+
+    };
+
+    fn foo(chunk: Chunk) u64 {
+        comptime var first_chars: []const u8 = "?";
+        comptime var second_chars: []const u8 = "!";
+        comptime var third_chars: []const u8 = "";
+        comptime var fourth_chars: []const u8 = "";
+
+        comptime {
+            for (unpadded_ops) |op| {
+                if (op.len > 1) {
+                    for (([_]*[]const u8{ &first_chars, &second_chars, &third_chars, &fourth_chars })[0..op.len], 0..op.len) |chars, i| {
+                        const char = std.fmt.comptimePrint("{c}", .{op[i]});
+                        if (std.mem.indexOf(u8, chars.*, char) == null)
+                            chars.* = chars.* ++ char;
+                    }
+                }
+            }
+
+            if (std.mem.indexOfNone(u8, second_chars, first_chars)) |i| {
+                @compileError(std.fmt.comptimePrint("Found a character in second_chars not present in first_chars: {c}", .{second_chars[i]}));
+            }
+
+            if (std.mem.indexOfNone(u8, third_chars, second_chars)) |i| {
+                @compileError(std.fmt.comptimePrint("Found a character in third_chars not present in second_chars: {c}", .{third_chars[i]}));
+            }
+
+            if (std.mem.indexOfNone(u8, fourth_chars, second_chars)) |i| {
+                @compileError(std.fmt.comptimePrint("Found a character in fourth_chars not present in second_chars: {c}", .{fourth_chars[i]}));
+            }
+        }
+
+        const State = packed struct {
+            bar_mod: u1 = 0,
+            eql: u1 = 0,
+            dot: u1 = 0,
+            arrow: u1 = 0,
+            @"<": u1 = 0,
+            @">": u1 = 0,
+            dot_question: u1 = 0,
+            self: u1 = 0, // TODO: move this field to whichever slot allows us to reuse a vector
+        };
+
+        // We produce 3 shuffle vectors: The i-th shuffle vector, after looking up the textual characters (as indices into it),
+        // tells us whether that character is a valid i-th character of a multi-character symbol.
+        // E.g. the 1st shuffle vector would tell us that `+` is a valid first character of some multi-char symbol.
+        // The 2nd would tell us `|` is valid in the second position, and the 3rd would tell us that `=` is valid
+        // in the third position. By taking the mask of each of the 3 shuffles and ANDing them together, we
+        // thus know that `+|=` is valid. However, we don't want to match any arbitrary combination, so we extend this idea:
+        // Because we get 8 bits as the result of a lookup, we can make each bit a separate "channel".
+        // When we AND the results of the shuffles together, the first bit tells us whether there was a match in the first channel,
+        // the second bit tells us whether there was a match in the second channel, etc.
+        // Within a "channel", you can have any combination of the first two sets of chars, and optionally any char
+        // from the set of 3rd characters. E.g. the `bar_mod` set { "-+*", "%|", "=" } matches any char from the first string,
+        // followed by any char from the second string, optionally followed by any char from the third string.
+        //
+        // We can augment this trick, as we do for the `self` matcher. For this one, we insert an extra piece of logic not
+        // applicable to the rest of the "channels". We want the characters that match on the `self` channel to all be the same,
+        // and enforce that by zeroing out the bit corresponding to `self` if they are not the same.
+        //
+        // Note: by default, we assume that for any 3-character multi-char symbol, the first 2 characters are also a valid symbol.
+        // If this is not the case, you will need to FIXME
+
+        // These should always work as 16-byte lookup tables, because we shouldn't ever have more than 15 or 16 possible characters
+        // in a multi-character symbol due to the keys that are on a typical keyboard. We might want to use more than one vector shuffle
+        // though if we need more than 8 channels. E.g., since we get 8 bits per character, we could use two to get 16 bits per character.
+        comptime var first_char_data: @Vector(16, u8) = @splat(0);
+        comptime var second_char_data: @Vector(16, u8) = @splat(0);
+        comptime var third_char_data: @Vector(16, u8) = @splat(0);
+
+        for (std.meta.fields(State)) |o| {
+            // Note: this assumes that the prefix string of all operators defined here are also an operator.
+            // If you want a new operator that has a prefix string which is not a valid operator,
+            // you need to either check it yourself without using the vector shuffle,
+            // or just write a line that augments the logic done by the vector shuffle.
+            // The augmentation technique would look similar to what we do below for the "self" matcher.
+            for (switch (@field(std.meta.FieldEnum(State), o.name)) {
+                // 43
+                .bar_mod => [3][]const u8{ "-+*", "%|", "=" }, // Matches [-+*][%|]=?
+                .eql => [3][]const u8{ "|=!%^+*/&<>-", "=", "" }, // Matches [|=!%^+*/&<>-]=
+                .self => [3][]const u8{ "|=.+*<>/\\", "|=.+*<>/\\", "." }, // Matches ([|=.+*<>/\\])(\1)|...
+                .dot => [3][]const u8{ ".", "*", "*" }, // Matches .**|.*
+                .arrow => [3][]const u8{ "-=", ">", "" }, // Matches [-=]>
+                .@"<" => [3][]const u8{ "<", "<", "|=" }, // Matches <<[|=]
+                .@">" => [3][]const u8{ ">", ">", "=" }, // Matches >>=
+                .dot_question => [3][]const u8{ ".", "?", "" }, // Matches .?
+            }, .{ &first_char_data, &second_char_data, &third_char_data }) |string, dest_char_data| {
+                var state: State = .{};
+                @field(state, o.name) = 1;
+                for (string) |c|
+                    dest_char_data[hash_shuffle("", c, undefined)] |= @bitCast(state);
+            }
+        }
+
+        comptime var state_without_self: State = @bitCast(~@as(@typeInfo(State).@"struct".backing_integer, 0));
+        state_without_self.self = 0;
+
+        var cur: []const u8 = buf[0..];
+        var prev_vec: @Vector(64, u8) = @splat(0);
+        var prev_singleCharEnds: @Vector(64, u8) = @splat(0);
+        var prev_doubleCharEnds: @Vector(64, u8) = @splat(0);
+        var delete_triple_char_pos_carry: u64 = 0;
+        var ended_on_double_char_carry: u64 = 0;
+
+        while (true) {
+            const cur_vec: @Vector(64, u8) = cur[0..64].*;
+            defer prev_vec = cur_vec;
+            const prev1 = shift_in_prev(1, cur_vec, prev_vec);
+            const prev2 = shift_in_prev(2, cur_vec, prev_vec);
+            const singleCharEnds = hash_shuffle(first_chars, cur_vec, first_char_data);
+            defer prev_singleCharEnds = singleCharEnds;
+
+            const doubleCharEnds = hash_shuffle(second_chars, cur_vec, second_char_data) & shift_in_prev(1, singleCharEnds, prev_singleCharEnds) &
+                @select(u8, prev1 == cur_vec, @as(@Vector(64, u8), @splat(0b11111111)), @as(@Vector(64, u8), @splat(@bitCast(state_without_self))));
+            defer prev_doubleCharEnds = doubleCharEnds;
+
+            const tripleCharEnds = hash_shuffle(third_chars, cur_vec, third_char_data) & shift_in_prev(1, doubleCharEnds, prev_doubleCharEnds) &
+                @select(u8, prev2 == prev1, @as(@Vector(64, u8), @splat(0b11111111)), @as(@Vector(64, u8), @splat(@bitCast(state_without_self))));
+
+            //const singleCharEnd = @as(std.meta.Int(.unsigned, @sizeOf(@TypeOf(singleCharEnds))), @bitCast(singleCharEnds != @as(@TypeOf(singleCharEnds), @splat(0))));
+            var doubleCharEnd = @as(std.meta.Int(.unsigned, @sizeOf(@TypeOf(doubleCharEnds))), @bitCast(doubleCharEnds != @as(@TypeOf(doubleCharEnds), @splat(0))));
+            const tripleCharEnd = @as(std.meta.Int(.unsigned, @sizeOf(@TypeOf(tripleCharEnds))), @bitCast(tripleCharEnds != @as(@TypeOf(tripleCharEnds), @splat(0))));
+
+            // The rule for multi-char symbol matching is that we always want to match the longest possible symbol that we can.
+            // That means that if there is a 3-char-end in the next position from a two-char-end, we can unset the two-char-end bit.
+            // E.g.              a +|= b
+            //  doubleCharEnd <- 0001000 (we unset the 1 bit)
+            //  tripleCharEnd <- 0000100
+            doubleCharEnd &= ~(tripleCharEnd >> 1);
+            //            ^ We could use XOR, instead of ANDN, so long as all 2-char prefixes of 3-char symbols are valid.
+
+            // The idea is to iterate over a bitstring which is the bitwise-OR of `doubleCharEnd` and `tripleCharEnd`.
+            // We iteratively find the lowest 1 bit, unset that bit, then unset one, possibly two bits after that bit, and repeat.
+            // We would unset two bits after if that bit corresponds to the end of a triple-char symbol. E.g.
+            //
+            //                                   a =>>= b
+            //  doubleCharEnd | tripleCharEnd <- 00011100
+            //                                       ^ always unset this bit, because we shouldn't match `=>` and `>>`
+            //                                        ^ unset this bit if there's a potential 3-char-symbol here. We shouldn't match `=>` and `>>=`.
+            var s = doubleCharEnd | tripleCharEnd;
+            //var s = korq(kandnq(doubleCharEnd, kshiftrq(tripleCharEnd, 1)), tripleCharEnd);
+
+            // Will be a subset of `doubleCharEnd` | `tripleCharEnd`, but with the boundaries properly figured out.
+            var ends: @TypeOf(s) = 0;
+
+            // If a triple-char-symbol-end is at the beginning of the next chunk, we unset it if the last chunk ended with a multi-char symbol within two chars. E.g.:
+            //                                                                     a =>>= b
+            // ends <- 0000000000000000000000000000000000000000000000000000000000000001
+            //                                                           next chunk -> 1100000000000000000000000000000000000000000000000000000000000000
+            //                                                                          ^ unset this one since it's a triple-char-end within two positions of the previous symbol-end
+            //                                                                    a =>>= b
+            // ends <- 0000000000000000000000000000000000000000000000000000000000000010
+            //                                                           next chunk -> 1000000000000000000000000000000000000000000000000000000000000000
+            //                                                                         ^ unset this one since it's a triple-char-end within two positions of the previous symbol-end
+            //defer delete_triple_char_pos_carry = kshiftrq(ends, 62);
+
+            s &= ~(delete_triple_char_pos_carry & ~doubleCharEnd);
+            defer delete_triple_char_pos_carry = ends >> 62;
+            //s = kxorq(s, kandq(delete_triple_char_pos_carry, tripleCharEnd));
+
+            // This handles the case where a chunk ends on a double-char symbol, only to find in the next chunk that it's a triple-char symbol.
+            //                                                                     a +%= b
+            // ends <- 0000000000000000000000000000000000000000000000000000000000000001
+            //                                                           next chunk -> 100000000000000000000000000000000000000000000000000000000000000
+            //                                                                         ^ this is valid because it's a triple-char-end
+            //                                                                     a ++= b
+            // ends <- 0000000000000000000000000000000000000000000000000000000000000001
+            //                                                           next chunk -> 100000000000000000000000000000000000000000000000000000000000000
+            //                                                                         ^ unset because it's a double-char-end
+            //defer ended_on_double_char_carry = kshiftrq(kandq(ends, doubleCharEnd), 63);
+            s &= ~andn(ended_on_double_char_carry, tripleCharEnd);
+            defer ended_on_double_char_carry = (ends & doubleCharEnd) >> 63;
+            //s = kandnq(s, kandnq(ended_on_double_char_carry, tripleCharEnd));
+
+            while (true) {
+                // Optimization: Instead of iterating over a single position at once, we iterate over multiple positions at once
+                // that have at least two "spaces" (not-possible-to-be-multi-char-symbol chars) in between them. (Or at the start.)
+                // For a "pathological" input of randomly assorted 2 and 3-char symbols that overlap a lot, we have to iterate from
+                // start to finish, in order, because we cannot tell in parallel where all the symbols start.
+                // However, in real Zig code, you typically have "spaces" in between the symbols, sufficient that you can guarantee that
+                // the first character in a group is the start of a multi-char symbol.
+                const iter = s & ~(s << 1) & ~(s << 2);
+
+                ends |= iter;
+
+                // We want to unset the current bit(s) pointed to by `iter`, as well as the next bit, given by `iter << 1`,
+                // because you can't have a 2 or 3 character symbol end in the next byte after the end of a 2 or 3 character symbol.
+                // E.g.         a =>>= b
+                //      iter <- 00010000
+                //      s    <- 00011100
+                //                  ^ always unset this bit, because we can't match both `=>` and `>>` since they overlap
+
+                // We also want to zero two bits after, if that corresponds to a non-2-char symbol `(iter << 2) & ~doubleCharEnd`.
+                // E.g.                 .....
+                //              iter <- 00100
+                //              s    <- 00111
+                //     doubleCharEnd <- 00001
+                //     tripleCharEnd <- 00111
+                //                         ^ always unset
+                //                          ^ not unset because this happens to be a valid 2-char-symbol
+                // E.g.                 ......
+                //              iter <- 001000
+                //              s    <- 001111
+                //     doubleCharEnd <- 000001
+                //     tripleCharEnd <- 001111
+                //                         ^ always unset
+                //                          ^ unset because this is a valid 3-char-symbol but not a valid 2-char-symbol (due to the next char making a 3-char sequence, see `doubleCharEnd &= ...` above)
+                // E.g.         a =>>= b
+                //      iter <- 00010000
+                //      s    <- 00011100
+                //                   ^ unset this bit because there's a potential 3-char-symbol-end within two chars of one of the `iter` bits.
+                //                     I.e., we can't match both `=>` and `>>=` because they overlap.
+                s &= ~((iter +% (iter << 1)) | andn(iter << 2, doubleCharEnd));
+                //           ^ we use `+%` instead of `|`, because all 1's in `iter` must have at least two 0's
+                //             between them. The compiler gives us the shift+add in a single `lea` instruction :)
+
+                if (s == 0) break;
+
+                // We could advance each 1 bit in `iter` to the next 1 bit in `s` using `iter = s & ~(s -% iter);`,
+                // but it's pretty much impossible for this loop to branch in practice, so this optimization would be pointless.
+            }
+
+            // 3-char sequences take precedence over two-char sequences, except when they are just two characters apart.
+            const double_char_ends_final = (ends & ~tripleCharEnd) | (ends & (ends << 2));
+            const triple_char_ends_final = ends ^ double_char_ends_final;
+
+            //const triple_char_ends_final = ((ends & tripleCharEnd) & ~(ends & (ends << 2)));
+            //const double_char_ends_final = ends ^ triple_char_ends_final;
+
+            // cur_dest[0] = double_char_ends_final;
+            // cur_dest[0] = triple_char_ends_final;
+
+            cur = cur[64..];
+
+            if (cur.len == 0) break;
+        }
     }
 };
 
@@ -965,7 +1259,7 @@ const Keywords = struct {
     }
 };
 
-// Count-trailing-ones function. Provides better emit than `@ctz(~a)`
+// Count-trailing-zeroes function. Provides better emit than `@ctz(~a)`
 // https://github.com/llvm/llvm-project/issues/82487
 fn ctz(a: uword) std.meta.Int(
     .unsigned,
@@ -1120,7 +1414,7 @@ const Tag = blk: {
     }
 
     break :blk @Type(.{
-        .Enum = .{
+        .@"enum" = .{
             .tag_type = u8,
             .fields = &enumFields,
             .decls = &decls,
@@ -1136,7 +1430,7 @@ const Token = extern struct { len: u8, kind: Tag };
 /// E.g. 0b.......1 .......1 .......0 .......0 .......1 .......0 .......1 .......1 -> 5
 ///
 fn popCountLSb(v: anytype) @TypeOf(v) {
-    const ones: @TypeOf(v) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(v)), 8), u8), @splat(0x01)));
+    const ones: @TypeOf(v) = @bitCast([_]u8{0x01} ** @divExact(@bitSizeOf(@TypeOf(v)), 8));
 
     // This is a math trick.
     // Think about the gradeschool multiplication algorithm by a bitstring of broadcasted 1's:
@@ -1208,7 +1502,7 @@ fn swarCTZPlus1(x: u32) @TypeOf(x) {
 }
 
 fn swarCTZPlus1Generic(x: anytype, comptime impl: @TypeOf(SWAR_CTZ_PLUS_1_IMPL)) @TypeOf(x) {
-    const ones: @TypeOf(x) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(x)), 8), u8), @splat(0x01)));
+    const ones: @TypeOf(x) = @bitCast([_]u8{0x01} ** @divExact(@bitSizeOf(@TypeOf(x)), 8));
     assert(x != 0 and (x & (0x7F * ones)) == 0);
     return switch (impl) {
         .ctz => @ctz(x) / 8 +% 1,
@@ -1259,7 +1553,7 @@ const SWAR_CTZ_IMPL: enum { ctz, swar, swar_bool } = switch (builtin.cpu.arch) {
 };
 
 fn swarCTZGeneric(x: anytype, comptime impl: @TypeOf(SWAR_CTZ_IMPL)) @TypeOf(x) {
-    const ones: @TypeOf(x) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(x)), 8), u8), @splat(1)));
+    const ones: @TypeOf(x) = @bitCast([_]u8{0x01} ** @divExact(@bitSizeOf(@TypeOf(x)), 8));
     assert((x & (ones * 0x7F)) == 0);
 
     return switch (impl) {
@@ -1292,7 +1586,7 @@ test "ctz popCount" {
 /// E.g. 1....... 0....... 0....... 1....... 0....... 1....... 1....... 1....... => 10010111
 fn swarMovMask(v: anytype) @TypeOf(v) {
     comptime assert(@divExact(@bitSizeOf(@TypeOf(v)), 8) <= 8);
-    const ones: @TypeOf(v) = @bitCast(@as(@Vector(@sizeOf(@TypeOf(v)), u8), @splat(1)));
+    const ones: @TypeOf(v) = @bitCast([_]u8{0x01} ** @sizeOf(@TypeOf(v)));
     const msb_mask = 0x80 * ones;
 
     // We are exploiting a multiplication as a shifter and adder, and the derivation of this number is
@@ -1338,7 +1632,7 @@ test "movemask swar should properly isolate the highest set bits of all bytes in
 fn swarMovMaskReversed(v: anytype) @TypeOf(v) {
     const T = @TypeOf(v);
     comptime assert(@divExact(@bitSizeOf(T), 8) <= 8);
-    const ones: T = @bitCast(@as(@Vector(@sizeOf(T), u8), @splat(1)));
+    const ones: T = @bitCast([_]u8{0x01} ** @sizeOf(T));
     const msb_mask = 0x80 * ones;
 
     // We are exploiting a multiplication as a shifter and adder, and the derivation of this number is
@@ -1379,7 +1673,7 @@ test "movemask reversed swar should properly isolate the highest set bits of all
 }
 
 // fn vector_shuffle(comptime T: type, a: T, b: T) T {
-//     const type_info = @typeInfo(T).Vector;
+//     const type_info = @typeInfo(T).vector;
 //     var r: T = @splat(0);
 
 //     for (0..type_info.len) |i| {
@@ -1420,24 +1714,24 @@ fn pdep(a: anytype, b: anytype) if (@bitSizeOf(@TypeOf(a)) >= @bitSizeOf(@TypeOf
         return result;
     }
 
+    if (@bitSizeOf(T) > 64)
+        @compileError(std.fmt.comptimePrint("Cannot pdep a type larger than 64 bits. Got: {}", .{T}));
+
     const methods = struct {
         extern fn @"llvm.x86.bmi.pdep.32"(u32, u32) u32;
         extern fn @"llvm.x86.bmi.pdep.64"(u64, u64) u64;
+        extern fn @"llvm.ppc.pdepd"(u64, u64) u64;
     };
 
-    return switch (T) {
-        u32 => methods.@"llvm.x86.bmi.pdep.32"(a, b),
-        u64 => methods.@"llvm.x86.bmi.pdep.64"(a, b),
-        else => @compileError("InvalidType passed to pdep"),
+    return switch (builtin.cpu.arch) {
+        .powerpc64, .powerpc64le => methods.@"llvm.ppc.pdepd"(a, b),
+        .x86, .x86_64 => switch (T) {
+            u32 => methods.@"llvm.x86.bmi.pdep.32"(a, b),
+            else => methods.@"llvm.x86.bmi.pdep.64"(a, b),
+        },
+        else => unreachable,
     };
 }
-// inline fn pdep(src: u64, mask: u64) u64 {
-//     return asm ("pdep %[mask], %[src], %[ret]"
-//         : [ret] "=r" (-> u64),
-//         : [src] "r" (src),
-//           [mask] "r" (mask),
-//     );
-// }
 
 // Workaround until https://github.com/llvm/llvm-project/issues/79094 is solved.
 fn expand8xu8To16xu4AsByteVector(vec: @Vector(8, u8)) @Vector(16, u8) {
@@ -1467,7 +1761,7 @@ else
 
 fn getShuffleVectorForByte(x: u8) @Vector(16, u8) {
     if (@inComptime()) return produceShuffleVectorForByteSpecifyImpl(x, .swar);
-    if (builtin.mode == .ReleaseSmall or SHUFFLE_VECTOR_IMPL != .swar) return produceShuffleVectorForByteSpecifyImpl(x, SHUFFLE_VECTOR_IMPL);
+    if (comptime builtin.mode == .ReleaseSmall or SHUFFLE_VECTOR_IMPL != .swar) return produceShuffleVectorForByteSpecifyImpl(x, SHUFFLE_VECTOR_IMPL);
 
     // Prefer a lookup table to a SWAR implementation
     comptime var lookup_table: [1 << 8][16]u8 = undefined;
@@ -1619,7 +1913,7 @@ const Parser = struct {
         // }
         // return null;
 
-        const ones: @TypeOf(v) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(v)), 8), u8), @splat(1)));
+        const ones: @TypeOf(v) = @bitCast([_]u8{0x01} ** @divExact(@bitSizeOf(@TypeOf(v)), 8));
         const mask = comptime ones * 0x7F;
         // const dub_ones: @TypeOf(v) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(v)), 16), u16), @splat(1)));
         // const dub_mask = comptime dub_ones * 0x7FFF;
@@ -1780,7 +2074,7 @@ const Parser = struct {
     // }
 
     fn maskIdentifiersSWAR(v: anytype) @TypeOf(v) {
-        const ones: @TypeOf(v) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(v)), 8), u8), @splat(1)));
+        const ones: @TypeOf(v) = @bitCast([_]u8{0x01} ** @divExact(@bitSizeOf(@TypeOf(v)), 8));
         const mask = comptime ones * 0x7F;
         const low_7_bits = v & mask;
 
@@ -1821,7 +2115,7 @@ const Parser = struct {
     }
 
     fn swarControlCharMaskInverse(v: anytype) @TypeOf(v) {
-        const ones: @TypeOf(v) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(v)), 8), u8), @splat(1)));
+        const ones: @TypeOf(v) = @bitCast([_]u8{0x01} ** @divExact(@bitSizeOf(@TypeOf(v)), 8));
         const mask = comptime ones * 0x7F;
         const low_7_bits = v & mask;
         const non_del = ~ones - low_7_bits;
@@ -1831,7 +2125,7 @@ const Parser = struct {
     }
 
     inline fn swarControlCharMask(v: anytype) @TypeOf(v) {
-        const ones: @TypeOf(v) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(v)), 8), u8), @splat(1)));
+        const ones: @TypeOf(v) = @bitCast([_]u8{0x01} ** @divExact(@bitSizeOf(@TypeOf(v)), 8));
         const mask = comptime ones * 0x7F;
         const low_7_bits = v & mask;
         const del = ones + low_7_bits;
@@ -1881,7 +2175,7 @@ const Parser = struct {
 
     fn maskNonCharsGeneric(v: anytype, comptime str: []const u8, comptime use_swar: bool) @TypeOf(v) {
         if (use_swar) {
-            const ones: @TypeOf(v) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(v)), 8), u8), @splat(1)));
+            const ones: @TypeOf(v) = @bitCast([_]u8{0x01} ** @divExact(@bitSizeOf(@TypeOf(v)), 8));
             const mask = comptime ones * 0x7F;
             const low_7_bits = v & mask;
             var accumulator: @TypeOf(v) = std.math.maxInt(@TypeOf(v));
@@ -1903,7 +2197,7 @@ const Parser = struct {
 
     fn maskCharsGeneric(v: anytype, comptime str: []const u8, comptime use_swar: bool) @TypeOf(v) {
         if (use_swar) {
-            const ones: @TypeOf(v) = @bitCast(@as(@Vector(@divExact(@bitSizeOf(@TypeOf(v)), 8), u8), @splat(1)));
+            const ones: @TypeOf(v) = @bitCast([_]u8{0x01} ** @divExact(@bitSizeOf(@TypeOf(v)), 8));
             const mask = comptime ones * 0x7F;
             const low_7_bits = v & mask;
             var accumulator: @TypeOf(v) = 0;
@@ -1939,7 +2233,7 @@ const Parser = struct {
     // per 64-byte chunk, meaning we eliminate ~6.5 bit reverses per chunk.
     // Might backfire if the microarchitecture has a builtin ctz operation and the decoder automatically combines a bitreverse and clz.
     const DO_BIT_REVERSE = switch (builtin.cpu.arch) {
-        .aarch64_32, .aarch64_be, .aarch64, .arm, .armeb, .thumb, .thumbeb, .ve => HAS_CTZ and builtin.cpu.arch.endian() == .little,
+        .aarch64, .aarch64_be, .arm, .armeb, .thumb, .thumbeb, .ve => HAS_CTZ and builtin.cpu.arch.endian() == .little,
         else => false,
     };
 
@@ -1956,10 +2250,10 @@ const Parser = struct {
     const NEON = struct {
         fn vsriq_n_u8(a: Chunk, b: Chunk, comptime n: u8) Chunk {
             // LLVM fails to canonicalize all except the last instance of this function due to inlining, therefore we use an intrinsic when it's available
-            return if (!HAS_ARM_NEON)
+            return if (!HAS_ARM_NEON or @inComptime())
                 (a & @as(Chunk, @splat((@as(u8, 0xff) >> (8 - n) << (8 - n))))) | (b >> @as(@Vector(@sizeOf(Chunk), u3), @splat(n)))
             else switch (comptime builtin.cpu.arch) {
-                .aarch64_32, .aarch64_be, .aarch64 => struct {
+                .aarch64, .aarch64_be => struct {
                     extern fn @"llvm.aarch64.neon.vsri"(Chunk, Chunk, u32) Chunk;
                 }.@"llvm.aarch64.neon.vsri"(a, b, n),
                 .arm, .armeb, .thumb, .thumbeb => struct {
@@ -1971,16 +2265,19 @@ const Parser = struct {
         }
 
         fn vshrn_n_u16(a: @Vector(@sizeOf(Chunk) / 2, u16), comptime c: u8) @Vector(@sizeOf(Chunk) / 2, u8) {
+            if (@inComptime()) {
+                // Preferred implementation (has suboptimal assembly though)
+                return @shuffle(u8, @as(Chunk, @bitCast(a >> @splat(c))), undefined, std.simd.iota(i32, @sizeOf(Chunk) / 2) << @splat(1));
+            }
+
             // Workaround for https://github.com/llvm/llvm-project/issues/88227#issuecomment-2048490807
+
+            // TODO: submit an issue to
             const b = @shuffle(u16, a, undefined, std.simd.join(std.simd.iota(i32, @sizeOf(Chunk) / 2), @as(@Vector(@sizeOf(Chunk) / 2, i32), @splat(-1))));
             return @bitCast(@as(std.meta.Int(.unsigned, @sizeOf(Chunk) * 4), @truncate(@as(std.meta.Int(.unsigned, @bitSizeOf(Chunk)), @bitCast(@shuffle(u8, @as(@Vector(@sizeOf(Chunk) * 2, u8), @bitCast(b >> @splat(c))), undefined, std.simd.iota(i32, @sizeOf(Chunk)) << @splat(1)))))));
-
-            // Preferred implementation:
-            //return @shuffle(u8, @as(Chunk, @bitCast(a >> @splat(c))), undefined, std.simd.iota(i32, @sizeOf(Chunk) / 2) << @splat(1));
         }
 
         fn vmovmaskq_u8(chunks: [4]Chunk) std.meta.Int(.unsigned, @sizeOf(Chunk) * 4) {
-            if (DO_BIT_REVERSE) return vmovmaskq_u8_rev(chunks);
             const t0 = vsriq_n_u8(chunks[1], chunks[0], 1);
             const t1 = vsriq_n_u8(chunks[3], chunks[2], 1);
             const t2 = vsriq_n_u8(t1, t0, 2);
@@ -1989,13 +2286,30 @@ const Parser = struct {
             return @bitCast(t4);
         }
 
-        fn vmovmaskq_u8_rev(chunks: [4]Chunk) std.meta.Int(.unsigned, @sizeOf(Chunk) * 4) {
+        fn vmovmaskq_u8_reversed(chunks: [4]Chunk) std.meta.Int(.unsigned, @sizeOf(Chunk) * 4) {
             const t0 = vsriq_n_u8(chunks[0], chunks[1], 1);
             const t1 = vsriq_n_u8(chunks[2], chunks[3], 1);
             const t2 = vsriq_n_u8(t0, t1, 2);
             const t3 = vsriq_n_u8(t2, t2, 4);
             const t4 = vshrn_n_u16(@bitCast(t3), 4);
-            return @bitCast(t4);
+            return @byteSwap(@as(std.meta.Int(.unsigned, @sizeOf(Chunk) * 4), @bitCast(t4)));
+        }
+
+        fn vmovmaskq_u8_endian(chunks: anytype, comptime endian: std.builtin.Endian) std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(chunks))) {
+            const true_vec = @as(@Vector(@bitSizeOf(@TypeOf(chunks)), u8), @splat(0xFF));
+            const false_vec = @as(@Vector(@bitSizeOf(@TypeOf(chunks)), u8), @splat(0x00));
+
+            return switch (comptime builtin.cpu.arch.endian() == endian) {
+                true => vmovmaskq_u8(@bitCast(@select(u8, chunks, true_vec, false_vec))),
+                false => vmovmaskq_u8_reversed(@bitCast(@select(u8, chunks, true_vec, false_vec))),
+            };
+        }
+
+        fn vmovmaskq_u8_maybe_rev(chunks: [4]Chunk) std.meta.Int(.unsigned, @sizeOf(Chunk) * 4) {
+            return switch (DO_BIT_REVERSE) {
+                true => vmovmaskq_u8_reversed(chunks),
+                false => vmovmaskq_u8(chunks),
+            };
         }
     };
 
@@ -2082,193 +2396,233 @@ const Parser = struct {
         var bitmap_ptr: []uword = non_newlines_bitstrings;
         var op_type: Tag = .whitespace;
         var selected_bitmap: []const uword = undefined;
+        selectBitmap(&selected_bitmap, bitmap_ptr, .whitespace);
         var bitmap_index = @intFromPtr(source.ptr);
 
         var utf8_checker: Utf8Checker = .{};
+        var aligned_ptr = @intFromPtr(cur.ptr) / @bitSizeOf(uword) * @bitSizeOf(uword);
 
-        // TODO: remove these once we get https://github.com/ziglang/zig/issues/8220 ??
-        bitmap_index -%= @bitSizeOf(uword);
-        bitmap_ptr.ptr -= 1;
-        bitmap_ptr.len += 1;
-        selectBitmap(&selected_bitmap, bitmap_ptr, .whitespace);
+        sw: switch (@as(enum {
+                slurp_continuation_chars,
+                increment_bitmap_index,
+                produce_bitstrings,
+                check_eof,
+                write_out_token,
+                check_alignment,
+                next_byte,
+            }, .produce_bitstrings)) {
 
-        outer: while (true) : (cur = cur[1..]) {
-            {
-                var aligned_ptr = @intFromPtr(cur.ptr) / @bitSizeOf(uword) * @bitSizeOf(uword);
-                generate_chunks: while (true) {
-                    // https://github.com/ziglang/zig/issues/8220
-                    // TODO: once labeled switch continues are added, we can make this check run the first iteration only.
-                    // If we loop back around, there is no need to check this.
-                    // I implemented this with tail call functions but it was messy.
+            .next_byte => {
+                cur = cur[1..];
+                continue :sw .check_alignment;
+            },
 
-                    // Note: we could technically make a separate path that only does utf8/bad character checking, but
-                    // the case where we have to run this loop multiple times in a row is not something that really happens in practice.
-                    // We have this loop here just for correctness in extreme edge cases, since our character-by-character loop
-                    // could, in theory, skip over an entire chunk that has bad characters in it.
-                    while (bitmap_index != aligned_ptr) {
-                        bitmap_index +%= @bitSizeOf(uword);
-                        bitmap_ptr = bitmap_ptr[1..];
-                        selected_bitmap = selected_bitmap[1..];
+            .check_alignment => {
+                aligned_ptr = @intFromPtr(cur.ptr) / @bitSizeOf(uword) * @bitSizeOf(uword);
+                if (bitmap_index != aligned_ptr) continue :sw .increment_bitmap_index;
+                continue :sw .slurp_continuation_chars;
+            },
 
-                        const batch_misalignment: std.math.Log2Int(std.meta.Int(.unsigned, BATCH_SIZE)) = @truncate(bitmap_index / @bitSizeOf(uword));
-                        if (batch_misalignment != 0) continue;
+            .increment_bitmap_index => {
+                bitmap_index += @bitSizeOf(uword);
+                bitmap_ptr = bitmap_ptr[1..];
+                selected_bitmap = selected_bitmap[1..];
 
-                        const base_ptr = @as([*]align(CHUNK_ALIGNMENT) const u8, @ptrFromInt(bitmap_index));
+                const batch_misalignment: std.math.Log2Int(std.meta.Int(.unsigned, BATCH_SIZE)) = @truncate(bitmap_index / @bitSizeOf(uword));
+                if (batch_misalignment != 0) continue :sw .check_alignment;
+                continue :sw .produce_bitstrings;
+            },
 
-                        var ctrls_batch: @Vector(BATCH_SIZE, uword) = undefined;
-                        var non_spaces_batch: @Vector(BATCH_SIZE, uword) = undefined;
-                        var identifiers_or_numbers_batch: @Vector(BATCH_SIZE, uword) = undefined;
+            .produce_bitstrings => {
+                const base_ptr = @as([*]align(CHUNK_ALIGNMENT) const u8, @ptrFromInt(bitmap_index));
 
-                        for (0..BATCH_SIZE / if (HAS_ARM32_FAST_16_BYTE_VECTORS) 2 else 1) |k| {
-                            // tabs are allowed in multiline strings, comments, and whitespace (start-state)
-                            // carriage returns are allowed before newlines only
-                            // other control characters are not allowed ever
-                            // no control characters are allowed in strings or character literals, neither of which are handled in this loop.
+                var ctrls_batch: @Vector(BATCH_SIZE, uword) = undefined;
+                var non_spaces_batch: @Vector(BATCH_SIZE, uword) = undefined;
+                var identifiers_or_numbers_batch: @Vector(BATCH_SIZE, uword) = undefined;
 
-                            // Control characters besides tab. (used by multiline strings, comments, eof)
-                            var ctrls: uword = 0;
-                            // Anything besides space, newline, or tab. Used for skipping over whitespace.
-                            var non_spaces: uword = 0;
-                            // Anything in the set [A-Za-z0-9_]. Used for identifier (including keywords) and number matching.
-                            var identifiers_or_numbers: uword = 0;
+                for (0..BATCH_SIZE / if (HAS_ARM32_FAST_16_BYTE_VECTORS) 2 else 1) |k| {
+                    // tabs are allowed in multiline strings, comments, and whitespace (start-state)
+                    // carriage returns are allowed before newlines only
+                    // other control characters are not allowed ever
+                    // no control characters are allowed in strings or character literals, neither of which are handled in this loop.
 
-                            // Control characters besides tab. (used by multiline strings, comments, eof)
-                            var ctrls_buffer: [NUM_CHUNKS]Chunk = undefined;
-                            // Anything besides space, newline, or tab. Used for skipping over whitespace.
-                            var non_spaces_buffer: [NUM_CHUNKS]Chunk = undefined;
-                            // Anything in the set [A-Za-z0-9_]. Used for identifier (including keywords) and number matching.
-                            var identifiers_or_numbers_buffer: [NUM_CHUNKS]Chunk = undefined;
+                    var chunks: [NUM_CHUNKS]Chunk = undefined;
 
-                            if (HAS_ARM_NEON) {
-                                inline for (0..NUM_CHUNKS) |i| {
-                                    const ordered_chunk = blk: {
-                                        const slice: *align(NATIVE_VEC_SIZE) const [NATIVE_VEC_SIZE]u8 = @alignCast(base_ptr[k * NUM_CHUNKS * NATIVE_VEC_SIZE + i * NATIVE_VEC_SIZE ..][0..NATIVE_VEC_SIZE]);
+                    // if (HAS_ARM_NEON) {
+                    //     inline for (0..NUM_CHUNKS) |i| {
+                    //         const ordered_chunk = blk: {
+                    //             const slice: *align(NATIVE_VEC_SIZE) const [NATIVE_VEC_SIZE]u8 = @alignCast(base_ptr[k * NUM_CHUNKS * NATIVE_VEC_SIZE + i * NATIVE_VEC_SIZE ..][0..NATIVE_VEC_SIZE]);
+                    //             break :blk if (USE_SWAR)
+                    //                 @as(*align(NATIVE_VEC_SIZE) const NATIVE_VEC_INT, @ptrCast(slice)).*
+                    //             else
+                    //                 @as(@Vector(NATIVE_VEC_SIZE, u8), slice.*);
+                    //         };
+                    //         try utf8_checker.validateChunk(ordered_chunk);
+                    //     }
+                    // }
 
-                                        break :blk if (USE_SWAR)
-                                            @as(*align(NATIVE_VEC_SIZE) const NATIVE_VEC_INT, @ptrCast(slice)).*
-                                        else
-                                            @as(@Vector(NATIVE_VEC_SIZE, u8), slice.*);
-                                    };
-
-                                    try utf8_checker.validateChunk(ordered_chunk);
-                                }
-                            }
-
-                            inline for (0..NUM_CHUNKS) |i| {
-                                // https://github.com/llvm/llvm-project/issues/88230
-                                const chunk = if (HAS_ARM_NEON)
-                                    @shuffle(u8, base_ptr[k * NUM_CHUNKS * NATIVE_VEC_SIZE ..][0 .. @sizeOf(Chunk) * 4].*, undefined, (std.simd.iota(u6, @sizeOf(Chunk)) << @splat(2)) + @as(@Vector(@sizeOf(Chunk), u6), @splat(i)))
-                                else blk: {
-                                    const slice: *align(NATIVE_VEC_SIZE) const [NATIVE_VEC_SIZE]u8 = @alignCast(base_ptr[k * NUM_CHUNKS * NATIVE_VEC_SIZE + i * NATIVE_VEC_SIZE ..][0..NATIVE_VEC_SIZE]);
-                                    const chunk = if (USE_SWAR)
-                                        @as(*align(NATIVE_VEC_SIZE) const NATIVE_VEC_INT, @ptrCast(slice)).*
-                                    else
-                                        @as(@Vector(NATIVE_VEC_SIZE, u8), slice.*);
-                                    try utf8_checker.validateChunk(chunk);
-                                    break :blk chunk;
-                                };
-
-                                const ctrls_chunk = if (USE_SWAR) maskControls(chunk) else maskNonControls(chunk);
-                                const non_spaces_chunk = if (USE_SWAR) maskNonChars(chunk, " \t\n") else blk: {
-                                    // const mask = maskChars(chunk, " \t\n");
-                                    // Workaround until this is fixed: https://github.com/llvm/llvm-project/issues/84967
-                                    comptime var buffer = std.mem.zeroes([16]u8);
-                                    buffer[0] = ' ';
-                                    buffer['\t'] = '\t';
-                                    buffer['\n'] = '\n';
-
-                                    // x86_64 shuffle semantics: If bit 7 is 1, set to 0, otherwise use lower 4 bits for lookup
-                                    const masked_chunk = if (builtin.cpu.arch == .x86_64) chunk else chunk & @as(@TypeOf(chunk), @splat(0xF));
-                                    break :blk vec_cmp(chunk, .@"==", Utf8Checker.lookup_chunk(buffer, masked_chunk));
-                                };
-                                const identifiers_or_numbers_chunk = if (USE_SWAR) maskIdentifiersSWAR(chunk) else maskIdentifiers(chunk);
-
-                                if (HAS_ARM_NEON) {
-                                    ctrls_buffer[i] = ctrls_chunk;
-                                    non_spaces_buffer[i] = non_spaces_chunk;
-                                    identifiers_or_numbers_buffer[i] = identifiers_or_numbers_chunk;
-                                } else {
-                                    const shift: std.math.Log2Int(uword) = if (ASSEMBLE_BITSTRINGS_BACKWARDS)
-                                        @intCast((@bitSizeOf(uword) - NATIVE_VEC_SIZE) - NATIVE_VEC_SIZE * i)
-                                    else
-                                        @intCast(NATIVE_VEC_SIZE * i);
-                                    inline for (
-                                        [_]*uword{ &ctrls, &non_spaces, &identifiers_or_numbers },
-                                        [_]Chunk{ ctrls_chunk, non_spaces_chunk, identifiers_or_numbers_chunk },
-                                    ) |result_ptr, data| {
-                                        const chunk_info = if (USE_SWAR)
-                                            (if (DO_MASK_REVERSE) swarMovMaskReversed(data) else swarMovMask(data))
-                                        else
-                                            @as(std.meta.Int(.unsigned, @sizeOf(@TypeOf(data))), @bitCast(data != @as(@TypeOf(data), @splat(0))));
-
-                                        result_ptr.* |= @as(uword, chunk_info) << shift;
-                                    }
-                                }
-                            }
-
-                            if (HAS_ARM32_FAST_16_BYTE_VECTORS) {
-                                ctrls_batch = @bitCast(NEON.vmovmaskq_u8(ctrls_buffer));
-                                non_spaces_batch = @bitCast(NEON.vmovmaskq_u8(non_spaces_buffer));
-                                identifiers_or_numbers_batch = @bitCast(NEON.vmovmaskq_u8(identifiers_or_numbers_buffer));
-                            } else if (HAS_ARM_NEON) {
-                                ctrls_batch[k] = NEON.vmovmaskq_u8(ctrls_buffer);
-                                non_spaces_batch[k] = NEON.vmovmaskq_u8(non_spaces_buffer);
-                                identifiers_or_numbers_batch[k] = NEON.vmovmaskq_u8(identifiers_or_numbers_buffer);
-                            } else if (USE_SWAR) {
-                                ctrls = ~ctrls;
-                                non_spaces = ~non_spaces;
-                            } else {
-                                ctrls_batch[k] = ctrls;
-                                non_spaces_batch[k] = non_spaces;
-                                identifiers_or_numbers_batch[k] = identifiers_or_numbers;
-                            }
-                        }
-
-                        // Optimization: when ctz is implemented with a bitReverse+clz,
-                        // we speculatively bitReverse in the producer loop to avoid doing so in this loop.
-                        comptime assert(0 == @as(tag_pos_int, @truncate(@intFromEnum(Tag.unknown))));
-                        bitmap_ptr[0 * BATCH_SIZE ..][0..BATCH_SIZE].* = if (DO_BIT_REVERSE) @byteSwap(ctrls_batch) else ctrls_batch;
-
-                        comptime assert(1 == @as(tag_pos_int, @truncate(@intFromEnum(Tag.identifier))));
-                        comptime assert(1 == @as(tag_pos_int, @truncate(@intFromEnum(Tag.builtin))));
-                        comptime assert(1 == @as(tag_pos_int, @truncate(@intFromEnum(Tag.number))));
-                        bitmap_ptr[1 * BATCH_SIZE ..][0..BATCH_SIZE].* = if (DO_BIT_REVERSE) @byteSwap(identifiers_or_numbers_batch) else identifiers_or_numbers_batch;
-
-                        comptime assert(2 == @as(tag_pos_int, @truncate(@intFromEnum(Tag.whitespace))));
-                        bitmap_ptr[2 * BATCH_SIZE ..][0..BATCH_SIZE].* = if (DO_BIT_REVERSE) @byteSwap(non_spaces_batch) else non_spaces_batch;
+                    inline for (&chunks, 0..) |*chunk, i| {
+                        // https://github.com/llvm/llvm-project/issues/88230
+                        chunk.* = if (HAS_ARM_NEON)
+                            @shuffle(u8, base_ptr[k * NUM_CHUNKS * NATIVE_VEC_SIZE ..][0 .. @sizeOf(Chunk) * 4].*, undefined, (std.simd.iota(u6, @sizeOf(Chunk)) << @splat(2)) + @as(@Vector(@sizeOf(Chunk), u6), @splat(i)))
+                        else blk: {
+                            const slice: *align(NATIVE_VEC_SIZE) const [NATIVE_VEC_SIZE]u8 = @alignCast(base_ptr[k * NUM_CHUNKS * NATIVE_VEC_SIZE + i * NATIVE_VEC_SIZE ..][0..NATIVE_VEC_SIZE]);
+                            break :blk if (USE_SWAR)
+                                @as(*align(NATIVE_VEC_SIZE) const NATIVE_VEC_INT, @ptrCast(slice)).*
+                            else
+                                @as(@Vector(NATIVE_VEC_SIZE, u8), slice.*);
+                        };
                     }
 
-                    // var batch_misalignment: std.math.Log2Int(std.meta.Int(.unsigned, BATCH_SIZE)) = @truncate(@intFromPtr(cur.ptr) / @bitSizeOf(uword));
-                    const cur_misalignment: std.math.Log2Int(uword) = @truncate(@intFromPtr(cur.ptr));
-                    // while (true) {
-                    const bitstring = if (USE_REVERSED_BITSTRINGS)
-                        selected_bitmap[0] << cur_misalignment
-                    else
-                        selected_bitmap[0] >> cur_misalignment;
+                    var or_of_all_chunks: Chunk = @splat(0);
+                    inline for (chunks) |chunk| or_of_all_chunks |= chunk;
 
-                    // We invert, i.e. count 1's, because 0's are shifted in by the bitshift.
-                    // The reason we increase the type size is so LLVM does not insert an unnecessary AND
-                    const str_len: std.meta.Int(
-                        .unsigned,
-                        std.math.ceilPowerOfTwoPromote(u64, std.math.log2_int_ceil(u64, @bitSizeOf(uword) + 1)),
-                    ) = if (USE_REVERSED_BITSTRINGS)
-                        @clz(~bitstring)
-                    else
-                        @call(.always_inline, ctz, .{~bitstring});
+                    if (Utf8Checker.isASCII(or_of_all_chunks)) {
+                        // Fast path, don't do so much work if we found an ascii chunk, because most chunks are ascii.
+                        @branchHint(.likely);
+                        try utf8_checker.errors();
+                    } else if (HAS_ARM_NEON) {
+                        @branchHint(.unlikely);
+                        try utf8_checker.validateChunksArm(chunks);
+                    } else {
+                        @branchHint(.unlikely);
+                        for (chunks) |chunk| {
+                            try utf8_checker.validateChunk(chunk);
+                        }
+                    }
 
-                    cur = cur[str_len..];
+                    // Control characters besides tab. (used by multiline strings, comments, eof)
+                    var ctrls: uword = 0;
+                    // Anything besides space, newline, or tab. Used for skipping over whitespace.
+                    var non_spaces: uword = 0;
+                    // Anything in the set [A-Za-z0-9_]. Used for identifier (including keywords) and number matching.
+                    var identifiers_or_numbers: uword = 0;
 
-                    // If we made it to the end of chunk(s), wrap around, grab more bits, and start again
-                    aligned_ptr = @intFromPtr(cur.ptr) / @bitSizeOf(uword) * @bitSizeOf(uword);
-                    if (bitmap_index == aligned_ptr) break :generate_chunks;
+
+                    // Control characters besides tab. (used by multiline strings, comments, eof)
+                    var ctrls_buffer: [NUM_CHUNKS]Chunk = undefined;
+                    // Anything besides space, newline, or tab. Used for skipping over whitespace.
+                    var non_spaces_buffer: [NUM_CHUNKS]Chunk = undefined;
+                    // Anything in the set [A-Za-z0-9_]. Used for identifier (including keywords) and number matching.
+                    var identifiers_or_numbers_buffer: [NUM_CHUNKS]Chunk = undefined;
+
+                    inline for (chunks, 0..) |chunk, i| {
+                        const ctrls_chunk = if (USE_SWAR) maskControls(chunk) else maskNonControls(chunk);
+                        const non_spaces_chunk = if (USE_SWAR) maskNonChars(chunk, " \t\n") else blk: {
+                            // const mask = maskChars(chunk, " \t\n");
+                            // Workaround until this is fixed: https://github.com/llvm/llvm-project/issues/84967
+                            comptime var buffer = std.mem.zeroes([16]u8);
+                            buffer[' ' & 0xF] = ' ';
+                            buffer['\t'] = '\t';
+                            buffer['\n'] = '\n';
+
+                            // x86_64 shuffle semantics: If bit 7 is 1, set to 0, otherwise use lower 4 bits for lookup
+                            const masked_chunk = if (comptime builtin.cpu.arch == .x86_64) chunk else chunk & @as(@TypeOf(chunk), @splat(0xF));
+                            break :blk vec_cmp(chunk, .@"==", Utf8Checker.lookup_chunk(buffer, masked_chunk));
+                        };
+                        const identifiers_or_numbers_chunk = if (USE_SWAR) maskIdentifiersSWAR(chunk) else maskIdentifiers(chunk);
+
+                        if (HAS_ARM_NEON) {
+                            chunks[i] = chunk;
+                            ctrls_buffer[i] = ctrls_chunk;
+                            non_spaces_buffer[i] = non_spaces_chunk;
+                            identifiers_or_numbers_buffer[i] = identifiers_or_numbers_chunk;
+                        } else {
+                            const shift: std.math.Log2Int(uword) = if (ASSEMBLE_BITSTRINGS_BACKWARDS)
+                                @intCast((@bitSizeOf(uword) - NATIVE_VEC_SIZE) - NATIVE_VEC_SIZE * i)
+                            else
+                                @intCast(NATIVE_VEC_SIZE * i);
+                            inline for (
+                                [_]*uword{ &ctrls, &non_spaces, &identifiers_or_numbers },
+                                [_]Chunk{ ctrls_chunk, non_spaces_chunk, identifiers_or_numbers_chunk },
+                            ) |result_ptr, data| {
+                                const chunk_info = if (USE_SWAR)
+                                    (if (DO_MASK_REVERSE) swarMovMaskReversed(data) else swarMovMask(data))
+                                else
+                                    @as(std.meta.Int(.unsigned, @sizeOf(@TypeOf(data))), @bitCast(data != @as(@TypeOf(data), @splat(0))));
+
+                                result_ptr.* |= @as(uword, chunk_info) << shift;
+                            }
+                        }
+                    }
+
+                    if (HAS_ARM32_FAST_16_BYTE_VECTORS) {
+                        ctrls_batch = @bitCast(NEON.vmovmaskq_u8_maybe_rev(ctrls_buffer));
+                        non_spaces_batch = @bitCast(NEON.vmovmaskq_u8_maybe_rev(non_spaces_buffer));
+                        identifiers_or_numbers_batch = @bitCast(NEON.vmovmaskq_u8_maybe_rev(identifiers_or_numbers_buffer));
+                    } else if (HAS_ARM_NEON) {
+                        ctrls_batch[k] = NEON.vmovmaskq_u8_maybe_rev(ctrls_buffer);
+                        non_spaces_batch[k] = NEON.vmovmaskq_u8_maybe_rev(non_spaces_buffer);
+                        identifiers_or_numbers_batch[k] = NEON.vmovmaskq_u8_maybe_rev(identifiers_or_numbers_buffer);
+                    } else if (USE_SWAR) {
+                        // We produce these bitstrings as inverted from what they should be to reduce instruction count.
+                        ctrls = ~ctrls;
+                        non_spaces = ~non_spaces;
+                    } else {
+                        ctrls_batch[k] = ctrls;
+                        non_spaces_batch[k] = non_spaces;
+                        identifiers_or_numbers_batch[k] = identifiers_or_numbers;
+                    }
                 }
-            }
 
-            comptime assert(BACK_SENTINELS.len - 1 > std.mem.indexOf(u8, BACK_SENTINELS, "\x00").?); // there should be at least another character
-            comptime assert(BACK_SENTINELS[0] == '\n'); // eof reads the non_newlines bitstring, therefore we need a newline at the end
-            if (op_type == .eof) break :outer;
+                // Optimization: when ctz is implemented with a bitReverse+clz,
+                // we speculatively bitReverse in the producer loop to avoid doing so in this loop.
+                comptime assert(0 == @as(tag_pos_int, @truncate(@intFromEnum(Tag.unknown))));
+                bitmap_ptr[0 * BATCH_SIZE ..][0..BATCH_SIZE].* = ctrls_batch;
 
-            while (true) {
+                comptime assert(1 == @as(tag_pos_int, @truncate(@intFromEnum(Tag.identifier))));
+                comptime assert(1 == @as(tag_pos_int, @truncate(@intFromEnum(Tag.builtin))));
+                comptime assert(1 == @as(tag_pos_int, @truncate(@intFromEnum(Tag.number))));
+                bitmap_ptr[1 * BATCH_SIZE ..][0..BATCH_SIZE].* = identifiers_or_numbers_batch;
+
+                comptime assert(2 == @as(tag_pos_int, @truncate(@intFromEnum(Tag.whitespace))));
+                bitmap_ptr[2 * BATCH_SIZE ..][0..BATCH_SIZE].* = non_spaces_batch;
+
+
+                // Note: we could technically make a separate path that only does utf8/bad character checking, but
+                // the case where we have to run this loop multiple times in a row is not something that really happens in practice.
+                // We have this loop here just for correctness in extreme edge cases, since our character-by-character loop
+                // could, in theory, skip over an entire chunk that has bad characters in it.
+                if (bitmap_index != aligned_ptr) continue :sw .increment_bitmap_index;
+
+                continue :sw .slurp_continuation_chars;
+            },
+
+            .slurp_continuation_chars => {
+                // var batch_misalignment: std.math.Log2Int(std.meta.Int(.unsigned, BATCH_SIZE)) = @truncate(@intFromPtr(cur.ptr) / @bitSizeOf(uword));
+                const cur_misalignment: std.math.Log2Int(uword) = @truncate(@intFromPtr(cur.ptr));
+                // while (true) {
+                const bitstring = if (USE_REVERSED_BITSTRINGS)
+                    selected_bitmap[0] << cur_misalignment
+                else
+                    selected_bitmap[0] >> cur_misalignment;
+
+                // We invert, i.e. count 1's, because 0's are shifted in by the bitshift.
+                // The reason we increase the type size is so LLVM does not insert an unnecessary AND
+                const str_len: std.meta.Int(
+                    .unsigned,
+                    std.math.ceilPowerOfTwoPromote(u64, std.math.log2_int_ceil(u64, @bitSizeOf(uword) + 1)),
+                ) = if (USE_REVERSED_BITSTRINGS)
+                    @clz(~bitstring)
+                else
+                    @call(.always_inline, ctz, .{~bitstring});
+
+                cur = cur[str_len..];
+
+                // If we made it to the end of chunk(s), wrap around, grab more bits, and start again
+                aligned_ptr = @intFromPtr(cur.ptr) / @bitSizeOf(uword) * @bitSizeOf(uword);
+                if (bitmap_index == aligned_ptr) continue :sw .check_eof;
+                continue :sw .increment_bitmap_index;
+            },
+
+            .check_eof => {
+                comptime assert(BACK_SENTINELS.len - 1 > std.mem.indexOf(u8, BACK_SENTINELS, "\x00").?); // there should be at least another character
+                comptime assert(BACK_SENTINELS[0] == '\n'); // eof reads the non_newlines bitstring, therefore we need a newline at the end
+                if (op_type == .eof) break :sw;
+                continue :sw .write_out_token;
+            },
+
+            .write_out_token => {
                 var len: u32 = @intCast(@intFromPtr(cur.ptr) - @intFromPtr(prev.ptr));
                 assert(len != 0);
                 assert(op_type != .eof);
@@ -2341,6 +2695,8 @@ const Parser = struct {
                     selectBitmap(&selected_bitmap, bitmap_ptr, .whitespace);
                     op_type = Operators.hashOp(Operators.getOpWord(cur.ptr, 1));
                 } else if (Operators.isMultiCharBeginning(cur[0])) {
+                    @branchHint(.unlikely);
+
                     const op_len: u32 = mask_for_op_cont(std.mem.readInt(u32, cur[0..4], .little));
                     assert(0 < op_len and op_len <= 4);
 
@@ -2360,14 +2716,14 @@ const Parser = struct {
                         op_type = @enumFromInt(hash3);
                         if (op_type == .@"///" or op_type == .@"//!") {
                             selectBitmap(&selected_bitmap, bitmap_ptr, .unknown);
-                            break;
+                            continue :sw .next_byte;
                         }
                         cur = cur[3..];
                     } else if (op_len >= 2 and std.mem.readInt(u32, &Operators.sorted_padded_ops[Operators.mapToIndexRaw(hash2)], .little) == op_word2) {
                         op_type = @enumFromInt(hash2);
                         if (op_type == .@"//" or op_type == .@"\\\\") {
                             selectBitmap(&selected_bitmap, bitmap_ptr, .unknown);
-                            break;
+                            continue :sw .next_byte;
                         }
                         cur = cur[2..];
                     } else {
@@ -2376,7 +2732,7 @@ const Parser = struct {
                     }
 
                     cur = cur[@intFromBool(cur[0] == ' ')..];
-                    continue;
+                    continue :sw .write_out_token;
                 } else if (cur[0] == '\r') {
                     if (cur[1] != '\n') {
                         // TODO: unset the corresponding bit in the control-chars mask, since it should contain only newlines at the end.
@@ -2398,7 +2754,7 @@ const Parser = struct {
                     selectBitmap(&selected_bitmap, bitmap_ptr, op_type);
                 }
 
-                if (cur[0] != '\'' and cur[0] != '"') break;
+                if ((@intFromBool(cur[0] != '\'') & @intFromBool(cur[0] != '"')) == 1) continue :sw .next_byte;
 
                 const chr = cur[0];
                 switch (ON_DEMAND_IMPL) {
@@ -2438,42 +2794,68 @@ const Parser = struct {
                     1 => {
                         cur = cur[1..];
                         var next_is_escaped_on_demand: uword = 0;
-
                         const QuoteChunk = @Vector(@bitSizeOf(uword), u8);
-                        const QuoteMask = std.meta.Int(.unsigned, @sizeOf(QuoteChunk));
 
                         while (true) {
-                            const chunk = blk: {
-                                const vec: QuoteChunk = cur[0..@sizeOf(QuoteChunk)].*;
+                            const chunk: QuoteChunk = if (HAS_ARM_NEON)
+                                @bitCast(std.simd.deinterlace(4, cur[0..@bitSizeOf(uword)].*))
+                            else blk: {
+                                const vec: QuoteChunk = cur[0..@bitSizeOf(uword)].*;
                                 break :blk switch (comptime builtin.cpu.arch.endian()) {
                                     .little => vec,
                                     .big => std.simd.reverseOrder(vec),
                                 };
                             };
 
-                            const ctrls: QuoteMask = @bitCast(chunk < @as(QuoteChunk, @splat(' ')));
-                            const quotes: QuoteMask = @bitCast(chunk == @as(QuoteChunk, @splat(chr)));
-                            const backslash: QuoteMask = @bitCast(chunk == @as(QuoteChunk, @splat('\\')));
+                            const false_chunk: QuoteChunk = @splat(0);
+                            const true_chunk = ~false_chunk;
+
+                            const ctrls: uword = if (HAS_ARM_NEON)
+                                Parser.NEON.vmovmaskq_u8_endian(
+                                    @select(u8, chunk < @as(QuoteChunk, @splat(' ')), true_chunk, false_chunk) |
+                                        @select(u8, chunk == @as(QuoteChunk, @splat(0x7F)), true_chunk, false_chunk),
+                                    .little,
+                                )
+                            else
+                                @as(uword, @bitCast(chunk < @as(QuoteChunk, @splat(' ')))) |
+                                    @as(uword, @bitCast(chunk == @as(QuoteChunk, @splat(0x7F))));
+
+                            const quotes: uword = if (HAS_ARM_NEON)
+                                Parser.NEON.vmovmaskq_u8_endian(chunk == @as(QuoteChunk, @splat(chr)), .little)
+                            else
+                                @bitCast(chunk == @as(QuoteChunk, @splat(chr)));
+
+                            const backslashes: uword = if (HAS_ARM_NEON)
+                                Parser.NEON.vmovmaskq_u8_endian(chunk == @as(QuoteChunk, @splat('\\')), .little)
+                            else
+                                @bitCast(chunk == @as(QuoteChunk, @splat('\\')));
+
+                            //
+                            // ```
+                            // string:              | ___||||___||||_________||||__ |
+                            //                        100100100100100100100100100100100100100
+                            //                 1-aligned ^      ^ 2-aligned  ^ 3-aligned
+                            // ```
 
                             // ----------------------------------------------------------------------------
                             // This code is brought to you courtesy of simdjson, licensed
                             // under the Apache 2.0 license which is included at the bottom of this file
-                            const ODD_BITS: uword = @bitCast(@as(@Vector(@divExact(@bitSizeOf(uword), 8), u8), @splat(0xaa)));
+                            const ODD_BITS: uword = @bitCast([_]u8{0xaa} ** @divExact(@bitSizeOf(uword), 8));
 
                             // |                                | Mask (shows characters instead of 1's) | Depth | Instructions        |
                             // |--------------------------------|----------------------------------------|-------|---------------------|
                             // | string                         | `\\n_\\\n___\\\n___\\\\___\\\\__\\\`   |       |                     |
                             // |                                | `    even   odd    even   odd   odd`   |       |                     |
-                            // | potential_escape               | ` \  \\\    \\\    \\\\   \\\\  \\\`   | 1     | 1 (backslash & ~first_is_escaped)
+                            // | potential_escape               | ` \  \\\    \\\    \\\\   \\\\  \\\`   | 1     | 1 (backslashes & ~first_is_escaped)
                             // | escape_and_terminal_code       | ` \n \ \n   \ \n   \ \    \ \   \ \`   | 5     | 5 (next_escape_and_terminal_code())
                             // | escaped                        | `\    \ n    \ n    \ \    \ \   \ ` X | 6     | 7 (escape_and_terminal_code ^ (potential_escape | first_is_escaped))
-                            // | escape                         | `    \ \    \ \    \ \    \ \   \ \`   | 6     | 8 (escape_and_terminal_code & backslash)
+                            // | escape                         | `    \ \    \ \    \ \    \ \   \ \`   | 6     | 8 (escape_and_terminal_code & backslashes)
                             // | first_is_escaped               | `\                                 `   | 7 (*) | 9 (escape >> 63) ()
                             //                                                                               (*) this is not needed until the next iteration
-                            const potential_escape = backslash & ~next_is_escaped_on_demand;
+                            const potential_escape = backslashes & ~next_is_escaped_on_demand;
 
                             // If we were to just shift and mask out any odd bits, we'd actually get a *half* right answer:
-                            // any even-aligned backslash runs would be correct! Odd-aligned backslash runs would be
+                            // any even-aligned backslashes runs would be correct! Odd-aligned backslashes runs would be
                             // inverted (\\\ would be 010 instead of 101).
                             //
                             // ```
@@ -2488,7 +2870,7 @@ const Parser = struct {
                             //    odd-aligned runs.
                             // 2. XOR all odd bits, which masks out the odd bits in even-aligned runs, and brings IN the
                             //    odd bits in odd-aligned runs.
-                            // 3. & with backslash to clean up any stray bits.
+                            // 3. & with backslashes to clean up any stray bits.
                             // runs are set to 0, and then XORing with "odd":
                             //
                             // |                                | Mask (shows characters instead of 1's) | Instructions        |
@@ -2519,11 +2901,11 @@ const Parser = struct {
                             // - Resets all other bytes to 0
                             const escape_and_terminal_code = even_series_codes_and_odd_bits ^ ODD_BITS;
 
-                            const escaped = escape_and_terminal_code ^ (backslash | next_is_escaped_on_demand);
-                            const escape = escape_and_terminal_code & backslash;
+                            const escaped = escape_and_terminal_code ^ (backslashes | next_is_escaped_on_demand);
+                            const escape = escape_and_terminal_code & backslashes;
                             next_is_escaped_on_demand = escape >> (@bitSizeOf(uword) - 1);
 
-                            const bitstring = (quotes | ctrls) & ~escaped;
+                            const bitstring = (quotes & ~escaped) | ctrls;
                             cur = cur[@ctz(bitstring)..];
                             if (bitstring != 0) break;
                         }
@@ -2535,6 +2917,7 @@ const Parser = struct {
                 }
 
                 cur = cur[1..]; // skip closing " or '
+                continue :sw .write_out_token;
             }
         }
 
@@ -2568,22 +2951,12 @@ const Parser = struct {
 pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
     var jdz = jdz_allocator.JdzAllocator(.{}).init();
-    defer jdz.deinit();
-
+    // defer jdz.deinit();
     const gpa: Allocator = jdz.allocator();
-
-    // const gpa = jemalloc.allocator;
-    // var gpa_upper = zimalloc.Allocator(.{}){};
-    // defer gpa_upper.deinit();
-    // const gpa: Allocator = gpa_upper.allocator();
-
-    // try Rp.init(null, .{});
-    // defer Rp.deinit();
-    // const gpa = Rp.allocator();
     // const gpa = std.heap.page_allocator;
     const sources = try readFiles(gpa);
     defer {
-        if (builtin.mode == .Debug) sources.deinit(gpa);
+        if (comptime builtin.mode == .Debug) sources.deinit(gpa);
     }
 
     var bytes: u64 = 0;
@@ -2643,7 +3016,7 @@ pub fn main() !void {
 
         const source_tokens = try gpa.alloc([]Token, sources.source_list.len);
         defer {
-            if (builtin.mode == .Debug) { // Just to make the leak detectors happy
+            if (comptime builtin.mode == .Debug) { // Just to make the leak detectors happy
                 for (source_tokens) |source_token| gpa.free(source_token);
                 gpa.free(source_tokens);
             }
@@ -2722,6 +3095,8 @@ pub fn main() !void {
             }
         }
 
+        _ = try std.zig.Ast.parse(gpa, "comptime { a.b.c.*(i()); }", .zig);
+
         if (INFIX_TEST) {
             for (sources.source_list.items(.file_contents), source_tokens) |source, tokens| {
                 const parse_tree = try infixToPrefix(gpa, source, tokens);
@@ -2736,7 +3111,7 @@ pub fn main() !void {
             }
         }
 
-        if (builtin.mode == .Debug and WRITE_OUT_DATA) {
+        if (comptime builtin.mode == .Debug and WRITE_OUT_DATA) {
             var buffer: [1 << 12]u8 = undefined;
             const base_dir_path = "/home/niles/Documents/github/Zig-Parser-Experiment/.token_data2/";
             buffer[0..base_dir_path.len].* = base_dir_path.*;
@@ -3021,11 +3396,12 @@ fn recurse(nodes: std.zig.Ast.NodeList.Slice, index: usize, list: *std.ArrayList
 ///     need a bitstring which tracks where the operands should be inserted, but we do not need to care which operand until the end.
 const OpString = extern struct {
     pub const BUF_SIZE = 8; // std.simd.suggestVectorSize(Token) orelse 8;
+    pub const BITSTR_LEN = BUF_SIZE * 4;
     pub const buf_idx_int = std.meta.Int(.unsigned, std.math.log2_int(u64, BUF_SIZE));
     // const BUF_SIZE_MASK = std.math.maxInt(buf_idx_int);
     ops: [BUF_SIZE]Token,
-    bitstr: u64,
     next: u32,
+    bitstr: std.meta.Int(.unsigned, BITSTR_LEN),
     ops_len: u8,
     bitstr_len: u8,
 
@@ -3248,7 +3624,7 @@ const OpStringBuffer = struct {
         const bitstr_len = ops_len;
         const new_ops_len = operand.ops_len + ops_len;
         const new_bitstr_len = operand.bitstr_len + bitstr_len;
-        const can_operator_fit_in_right_last = new_ops_len <= OpString.BUF_SIZE and new_bitstr_len <= @bitSizeOf(uword);
+        const can_operator_fit_in_right_last = new_ops_len <= OpString.BUF_SIZE and new_bitstr_len <= OpString.BITSTR_LEN;
         const dest_slot = if (can_operator_fit_in_right_last) right.last else try self.getNewSlot(gpa);
         const dest = &self.buffer[dest_slot];
         const dest_next = if (can_operator_fit_in_right_last) operand.next else 0;
@@ -3290,7 +3666,7 @@ const OpStringBuffer = struct {
         const bitstr_len = ops_len;
         const new_ops_len = operand.ops_len + ops_len;
         const new_bitstr_len = operand.bitstr_len + bitstr_len;
-        const can_operator_fit_in_right_first = new_ops_len <= OpString.BUF_SIZE and new_bitstr_len <= @bitSizeOf(uword);
+        const can_operator_fit_in_right_first = new_ops_len <= OpString.BUF_SIZE and new_bitstr_len <= OpString.BITSTR_LEN;
 
         const is_right_sentinel = isSentinel(right);
         const dest_slot = if (is_right_sentinel or !can_operator_fit_in_right_first) try self.getNewSlot(gpa) else right.first;
@@ -3366,7 +3742,7 @@ const OpStringBuffer = struct {
         const new_ops_len = self.buffer[left.last].ops_len + self.buffer[right.first].ops_len;
         const new_bitstr_len = self.buffer[left.last].bitstr_len + self.buffer[right.first].bitstr_len;
 
-        if (new_ops_len <= OpString.BUF_SIZE and new_bitstr_len <= @bitSizeOf(uword)) {
+        if (new_ops_len <= OpString.BUF_SIZE and new_bitstr_len <= OpString.BITSTR_LEN) {
             const dest_slot = if (!is_left_a_sentinel)
                 left.last
             else if (!is_right_a_sentinel)
@@ -3528,7 +3904,7 @@ fn printTokens(source: [:0]align(@bitSizeOf(uword)) const u8, tokens: []const To
 
         std.debug.print("|", .{});
 
-        for (0..max_kind_tag_length - std.fmt.count("{s}", .{@tagName(token_info.kind)})) |_| std.debug.print(" ", .{});
+        for (0..max_kind_tag_length - @as(usize, @intCast(std.fmt.count("{s}", .{@tagName(token_info.kind)})))) |_| std.debug.print(" ", .{});
         std.debug.print("{s}", .{@tagName(token_info.kind)});
 
         std.debug.print("| {} | \u{0201C}", .{token_info.source.len});
@@ -3565,7 +3941,7 @@ fn printDebugInfo(qui: usize, cur_token: []const Token, operator_stack: std.Arra
     const len = if (cur_token[0].len == 0) @as(u32, @bitCast(cur_token[1..][0..2].*)) else cur_token[0].len;
     const cur_token_str = cur[0..len];
     std.debug.print("{}: |", .{qui});
-    for (0..max_kind_tag_length - std.fmt.count("{s}", .{@tagName(cur_token[0].kind)})) |_| std.debug.print(" ", .{});
+    for (0..max_kind_tag_length - @as(usize, @intCast(std.fmt.count("{s}", .{@tagName(cur_token[0].kind)})))) |_| std.debug.print(" ", .{});
     std.debug.print("{s} | {} | \u{0201C}", .{ @tagName(cur_token[0].kind), len });
 
     for (cur_token_str) |c| {
@@ -3635,7 +4011,7 @@ fn infixToPrefix(gpa: Allocator, source: [:0]align(@bitSizeOf(uword)) const u8, 
         }
     }{};
 
-    var operand_list_strs = if (builtin.mode == .Debug) try std.ArrayListUnmanaged([]const u8).initCapacity(gpa, 1000);
+    var operand_list_strs = if (comptime builtin.mode == .Debug) try std.ArrayListUnmanaged([]const u8).initCapacity(gpa, 1000);
     var operand_list = try std.ArrayListUnmanaged(Token).initCapacity(gpa, 1000);
 
     // Each operand element u32 points into `op_str_buffer`
@@ -3763,8 +4139,7 @@ fn infixToPrefix(gpa: Allocator, source: [:0]align(@bitSizeOf(uword)) const u8, 
             try operand_list.ensureUnusedCapacity(gpa, 4);
             operand_list.items.ptr[operand_list.items.len..][0..4].* = cur_token[0..4].*;
             operand_list.items.len += if (cur_token[0].len == 0) 3 else 1;
-
-            if (builtin.mode == .Debug) {
+            if (comptime builtin.mode == .Debug) {
                 const str = cur[0..if (cur_token[0].len == 0) @as(u32, @bitCast(cur_token[1..][0..2].*)) else cur_token[0].len];
                 try operand_list_strs.append(gpa, str);
                 try debug_str_representation_holder.append(gpa, .operand_stack, operand_stack.items.len, str);
@@ -3772,7 +4147,7 @@ fn infixToPrefix(gpa: Allocator, source: [:0]align(@bitSizeOf(uword)) const u8, 
             const sentinel_index = @intFromBool(cur_token[0].len == 0);
             try operand_stack.append(gpa, .{ .first = sentinel_index, .last = sentinel_index });
         } else {
-            if (cur_class != .pre_unary_op and cur_token_kind != .@"call (") {
+            if (cur_class != .pre_unary_op) {
                 // std.debug.print("::isunary::{}\n", .{Parser.isUnary(cur_token_kind)});
                 std.debug.print("::{s}\n", .{@tagName(cur_class)});
 
@@ -3783,18 +4158,16 @@ fn infixToPrefix(gpa: Allocator, source: [:0]align(@bitSizeOf(uword)) const u8, 
 
                 var top_operator = operator_stack.getLast();
 
-                if (Operators.getPrecedence(cur_token_kind) <= Operators.getPrecedence(top_operator.kind)) {
+                if (Operators.getPrecedence(cur_token_kind) <= Operators.getPrecedence2(top_operator.kind)) {
                     // new_operand = operator_stack.pop() + left + right
                     var new_operand: LinkedOpStringHead = operand_stack.pop();
                     var new_operand_str = debug_str_representation_holder.searchForStrRepresentation(.operand_stack, operand_stack.items.len);
                     std.debug.print("new_operand_str: {s}\n", .{new_operand_str});
 
                     while (true) {
-                        // if (top_operator.kind == .@",")
-                        // new_operand = try op_str_buffer.prependOperatorFromStack(gpa, &operator_stack, new_operand);
-                        op_str_buffer.print(new_operand);
+                        // op_str_buffer.print(new_operand);
                         if (!Operators.isUnary(top_operator.kind)) {
-                            op_str_buffer.print(operand_stack.getLast());
+                            // op_str_buffer.print(operand_stack.getLast());
                             new_operand = try op_str_buffer.joinOperands(gpa, operand_stack.pop(), new_operand);
 
                             // DEBUG
@@ -3802,64 +4175,68 @@ fn infixToPrefix(gpa: Allocator, source: [:0]align(@bitSizeOf(uword)) const u8, 
                             new_operand_str = try debug_str_representation_holder.concat(fixed_buffer_allocator, other_operand_str, new_operand_str);
                             // DEBUG
                         }
-                        op_str_buffer.print(new_operand);
+                        // op_str_buffer.print(new_operand);
                         std.debug.print("new_operand: {s}\n", .{new_operand_str});
 
-                        // if (top_operator.kind != .@",")
                         new_operand = try op_str_buffer.prependOperatorFromStack(gpa, &operator_stack, new_operand);
 
                         // DEBUG
                         new_operand_str = try debug_str_representation_holder.concat(fixed_buffer_allocator, debug_str_representation_holder.searchForStrRepresentation(.operator_stack, operator_stack.items.len), new_operand_str);
                         std.debug.print("new_operand_str: {s}\n", .{new_operand_str});
-                        op_str_buffer.print(new_operand);
+                        // op_str_buffer.print(new_operand);
                         // DEBUG
 
                         top_operator = operator_stack.getLast();
-                        if (Operators.getPrecedence(cur_token_kind) > Operators.getPrecedence(top_operator.kind)) break;
+                        if (Operators.getPrecedence(cur_token_kind) > Operators.getPrecedence2(top_operator.kind)) break;
                     }
 
                     try debug_str_representation_holder.append(gpa, .operand_stack, operand_stack.items.len, new_operand_str);
                     try operand_stack.append(gpa, new_operand);
+                }
 
-                    if (cur_token_kind == .@")") {
-                        // TODO: can we carefully craft the precedence table to do this implicitly?
-                        assert(operator_stack.getLast().kind == .@"(" or operator_stack.getLast().kind == .@"call (");
+                if (cur_token_kind == .@")") {
+                    // TODO: can we carefully craft the precedence table to do this implicitly?
+                    // std.debug.print("{}\n", .{operator_stack.getLast().kind});
+                    // if (1 == 1) continue;
+                    // assert(operator_stack.getLast().kind == .@"(" or operator_stack.getLast().kind == .@"call (");
 
-                        // Empty operand stack
-                        while (true) {
-                            operand_stack.items.len -= 1;
-                            if (operand_stack.items.len == 0) break;
-                            op_str_buffer.print(operand_stack.getLast());
-                            new_operand = try op_str_buffer.joinOperands(gpa, operand_stack.getLast(), new_operand);
+                    var new_operand = operand_stack.getLast();
+                    var new_operand_str = debug_str_representation_holder.searchForStrRepresentation(.operand_stack, operand_stack.items.len - 1);
 
-                            // DEBUG
-                            const other_operand_str = debug_str_representation_holder.searchForStrRepresentation(.operand_stack, operand_stack.items.len - 1);
-                            new_operand_str = try debug_str_representation_holder.concat(fixed_buffer_allocator, other_operand_str, new_operand_str);
-                            std.debug.print("new_operand_str: {s}\n", .{new_operand_str});
-                            // DEBUG
-                        }
+                    // Empty operand stack
+                    while (true) {
+                        operand_stack.items.len -= 1;
+                        if (operand_stack.items.len == 0) break;
+                        // op_str_buffer.print(operand_stack.getLast());
+                        new_operand = try op_str_buffer.joinOperands(gpa, operand_stack.getLast(), new_operand);
 
-                        const last_slot = operand_stack.addOneAssumeCapacity();
-                        // const last_slot_str = debug_str_representation_holder.searchForStrRepresentation(.operand_stack, operand_stack.items.len - 1);
-                        // std.debug.print("last_slot_str: {s}\n", .{last_slot_str});
-
-                        new_operand = try op_str_buffer.prependOperatorFromStack(gpa, &operator_stack, new_operand);
-                        op_str_buffer.print(new_operand);
-                        last_slot.* = try op_str_buffer.appendRightParen(gpa, new_operand, cur_token[0..4].*);
-                        op_str_buffer.print(last_slot.*);
-
-                        const final_str = try debug_str_representation_holder.concat(
-                            fixed_buffer_allocator,
-                            try debug_str_representation_holder.concat(fixed_buffer_allocator, "call (", new_operand_str),
-                            ")",
-                        );
-                        try debug_str_representation_holder.append(gpa, .operand_stack, operand_stack.items.len - 1, final_str);
-                        std.debug.print("final_str: {s}\n", .{final_str});
-                        continue;
+                        // DEBUG
+                        const other_operand_str = debug_str_representation_holder.searchForStrRepresentation(.operand_stack, operand_stack.items.len - 1);
+                        new_operand_str = try debug_str_representation_holder.concat(fixed_buffer_allocator, other_operand_str, new_operand_str);
+                        std.debug.print("new_operand_str: {s}\n", .{new_operand_str});
+                        // DEBUG
                     }
-                    // std.debug.print("{any}\n", .{operand_stack.items});
+
+                    const last_slot = operand_stack.addOneAssumeCapacity();
+                    // const last_slot_str = debug_str_representation_holder.searchForStrRepresentation(.operand_stack, operand_stack.items.len - 1);
+                    // std.debug.print("last_slot_str: {s}\n", .{last_slot_str});
+
+                    new_operand = try op_str_buffer.prependOperatorFromStack(gpa, &operator_stack, new_operand);
+                    // op_str_buffer.print(new_operand);
+                    last_slot.* = try op_str_buffer.appendRightParen(gpa, new_operand, cur_token[0..4].*);
+                    // op_str_buffer.print(last_slot.*);
+
+                    const final_str = try debug_str_representation_holder.concat(
+                        fixed_buffer_allocator,
+                        try debug_str_representation_holder.concat(fixed_buffer_allocator, "call (", new_operand_str),
+                        ")",
+                    );
+                    try debug_str_representation_holder.append(gpa, .operand_stack, operand_stack.items.len - 1, final_str);
+                    std.debug.print("final_str: {s}\n", .{final_str});
+                    continue;
                 }
             }
+
             // Push the current operator into the operator stack.
             // If the len field is 0, write the actual length BEFORE the current token in the stack.
             // That way, when we pop the top token, we unambiguously know whether to pop extra bytes to get the length.
@@ -3868,7 +4245,7 @@ fn infixToPrefix(gpa: Allocator, source: [:0]align(@bitSizeOf(uword)) const u8, 
                 try operator_stack.appendSlice(gpa, cur_token[1..][0..2]);
                 cur_token = cur_token[2..];
             }
-            if (builtin.mode == .Debug) {
+            if (comptime builtin.mode == .Debug) {
                 // const str = cur[0..if (cur_token[0].len == 0) @as(u32, @bitCast(cur_token[1..][0..2].*)) else cur_token[0].len];
                 try debug_str_representation_holder.append(gpa, .operator_stack, operator_stack.items.len, @tagName(cur_token_kind));
             }
@@ -3946,7 +4323,7 @@ fn infixToPrefix(gpa: Allocator, source: [:0]align(@bitSizeOf(uword)) const u8, 
                     1 => {
                         // const ret = operand_list.items[k];
                         k += 1;
-                        if (builtin.mode == .Debug) {
+                        if (comptime builtin.mode == .Debug) {
                             std.debug.print("{s} ", .{operand_list_strs.items[k - 1]});
                         } else {
                             std.debug.print("{} ", .{k});
@@ -4225,6 +4602,16 @@ fn infixToPrefixPrinter(gpa: Allocator, source: [:0]const u8, tokens: []const To
 // }
 
 fn vpshufb(table: anytype, indices: @TypeOf(table)) @TypeOf(table) {
+    if (@inComptime()) {
+        var result: @TypeOf(indices) = undefined;
+        for (0..@bitSizeOf(@TypeOf(indices)) / 8) |i| {
+            const index = indices[i];
+            result[i] = if (index >= 0x80) 0 else table[index % (@bitSizeOf(@TypeOf(table)) / 8)];
+        }
+
+        return result;
+    }
+
     const methods = struct {
         extern fn @"llvm.x86.avx512.pshuf.b.512"(@Vector(64, u8), @Vector(64, u8)) @Vector(64, u8);
         extern fn @"llvm.x86.avx2.pshuf.b"(@Vector(32, u8), @Vector(32, u8)) @Vector(32, u8);
@@ -4265,23 +4652,36 @@ fn vtbl2(table_part_1: @Vector(8, u8), table_part_2: @Vector(8, u8), indices: @V
 //
 // ---------------------------------------------------------------
 
-const Utf8Checker = struct {
-    is_invalid_place_to_end: bool = false,
-    prev_input_block: Chunk = std.mem.zeroes(Chunk),
-
-    fn prev(comptime N: comptime_int, a: Chunk, b: Chunk) Chunk {
-        comptime assert(0 < N and N < @sizeOf(Chunk));
-        const a_shift = N * 8;
+fn shift_in_prev(comptime N: comptime_int, cur: Chunk, prev: Chunk) Chunk {
+    comptime assert(0 < @as(u4, N) and N < @sizeOf(Chunk));
+    if (!@inComptime() and comptime (builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx512bw))) {
+        // Workaround for https://github.com/llvm/llvm-project/issues/79799
+        const c: Chunk = @bitCast(@shuffle(u64, @as(@Vector(@sizeOf(Chunk) / 8, u64), @bitCast(cur)), @as(@Vector(@sizeOf(Chunk) / 8, u64), @bitCast(prev)), std.simd.mergeShift(~std.simd.iota(i4, 8), std.simd.iota(i4, 8), 6)));
+        return asm (
+            \\vpalignr %[imm], %[c], %[cur], %[out]
+            : [out] "=v" (-> Chunk),
+            : [cur] "v" (cur),
+              [c] "v" (c),
+              [imm] "n" (16 - @as(u8, N)),
+        );
+    } else {
+        const a_shift = @as(comptime_int, N) * 8;
         const b_shift = (@sizeOf(Chunk) - N) * 8;
 
         return if (USE_SWAR)
             switch (comptime builtin.cpu.arch.endian()) {
-                .little => (a << a_shift) | (b >> b_shift),
-                .big => (a >> a_shift) | (b << b_shift),
+                .little => (cur << a_shift) | (prev >> b_shift),
+                .big => (cur >> a_shift) | (prev << b_shift),
             }
         else
-            std.simd.mergeShift(b, a, @sizeOf(Chunk) - N);
+            std.simd.mergeShift(prev, cur, @sizeOf(Chunk) - N);
     }
+}
+
+const Utf8Checker = struct {
+    is_invalid_place_to_end: bool = false,
+    prev_input_block: if (HAS_ARM_NEON) void else Chunk = if (HAS_ARM_NEON) {} else std.mem.zeroes(Chunk),
+    leftovers: if (HAS_ARM_NEON) [3]@Vector(16, u8) else void = if (HAS_ARM_NEON) @bitCast([_]u8{0} ** 48) else {},
 
     // Default behavior for shuffles across architectures
     // x86_64: If bit 7 is 1, set to 0, otherwise use lower 4 bits for lookup. We can get the arm/risc-v/wasm behavior by adding 0x70 before doing the lookup.
@@ -4294,7 +4694,7 @@ const Utf8Checker = struct {
         switch (builtin.cpu.arch) {
             // if high bit is set will result in a 0, otherwise, just looks at lower 4 bits
             .x86_64 => return vpshufb(@as(@TypeOf(indices), @bitCast(table ** (@sizeOf(@TypeOf(indices)) / 16))), indices),
-            .aarch64, .aarch64_be, .aarch64_32 => return tbl1(table, indices),
+            .aarch64, .aarch64_be => return tbl1(table, indices),
             .arm, .armeb => return switch (@TypeOf(indices)) {
                 @Vector(16, u8) => std.simd.join(vtbl2(table[0..8].*, table[8..][0..8].*, std.simd.extract(indices, 0, 8)), vtbl2(table[0..8].*, table[8..][0..8].*, std.simd.extract(indices, 8, 8))),
                 @Vector(8, u8) => vtbl2(table[0..8].*, table[8..][0..8].*, indices),
@@ -4420,7 +4820,7 @@ const Utf8Checker = struct {
             var result: @TypeOf(input) = 0;
             inline for (0..@sizeOf(uword)) |i| {
                 const j = i * 8;
-                const prev_ans = if (builtin.mode == .ReleaseSmall)
+                const prev_ans = if (comptime builtin.mode == .ReleaseSmall)
                     byte_1_low_tbl[@as(u4, @truncate(prev1 >> j))] & byte_1_high_tbl[@as(u4, @truncate(prev1 >> (j + 4)))]
                 else
                     byte_1_tbl[@as(u8, @truncate(prev1 >> j))];
@@ -4428,15 +4828,15 @@ const Utf8Checker = struct {
             }
             return result;
         } else {
-            return lookup_chunk(byte_1_low_tbl, prev1 & @as(@TypeOf(prev1), @splat(0x0F))) &
+            return lookup_chunk(byte_1_low_tbl, prev1 & @as(@TypeOf(prev1), @splat(0xF))) &
                 lookup_chunk(byte_1_high_tbl, prev1 >> @splat(4)) &
                 lookup_chunk(byte_2_high_tbl, input >> @splat(4));
         }
     }
 
     fn must_be_2_3_continuation(prev2: Chunk, prev3: Chunk) Chunk {
-        const ones: Chunk = @bitCast(@as(@Vector(@sizeOf(Chunk), u8), @splat(1)));
-        const msbs: Chunk = @bitCast(@as(@Vector(@sizeOf(Chunk), u8), @splat(0x80)));
+        const ones: Chunk = @bitCast([_]u8{0x01} ** @sizeOf(Chunk));
+        const msbs: Chunk = @bitCast([_]u8{0x80} ** @sizeOf(Chunk));
 
         if (USE_SWAR) {
             const is_3rd_byte = prev2 & ((prev2 | msbs) - (0b11100000 - 0x80) * ones);
@@ -4451,37 +4851,91 @@ const Utf8Checker = struct {
 
     fn isASCII(input: Chunk) bool {
         // https://github.com/llvm/llvm-project/issues/76812
-        return 0 == if (USE_SWAR)
-            (input & @as(NATIVE_VEC_INT, @bitCast(@as(@Vector(@sizeOf(uword), u8), @splat(0x80)))))
-        else if (builtin.cpu.arch == .x86_64)
-            @reduce(.Or, input & @as(Chunk, @splat(0x80)))
-        else if (builtin.cpu.arch == .arm or builtin.cpu.arch == .armeb)
-            @as(NATIVE_VEC_INT, @bitCast(input & @as(Chunk, @splat(0x80))))
+        return if (USE_SWAR)
+            0 == (input & @as(NATIVE_VEC_INT, @bitCast([_]u8{0x80} ** @sizeOf(uword))))
+        else if (comptime builtin.cpu.arch == .x86_64)
+            0 == @reduce(.Or, input & @as(Chunk, @splat(0x80)))
+        else if (comptime builtin.cpu.arch == .arm or builtin.cpu.arch == .armeb)
+            0x80 > @reduce(.Max, input)
         else
-            @as(std.meta.Int(.unsigned, NATIVE_VEC_SIZE), @bitCast(input >= @as(@Vector(NATIVE_VEC_SIZE, u8), @splat(0x80))));
+            0 == @as(std.meta.Int(.unsigned, NATIVE_VEC_SIZE), @bitCast(input >= @as(@Vector(NATIVE_VEC_SIZE, u8), @splat(0x80))));
     }
 
-    fn validateChunk(utf8_checker: *Utf8Checker, input: Chunk) !void {
-        if (isASCII(input)) {
-            // Fast path, don't do so much work if we found an ascii chunk, because most chunks are ascii.
-            try utf8_checker.errors();
-            return;
+    fn validateChunksArm(self: *Utf8Checker, prev0s: [4]Chunk) !void {
+        // Check whether the current bytes are valid UTF-8.
+
+        const true_vec = @as(Chunk, @splat(0xFF));
+        const false_vec = @as(Chunk, @splat(0));
+
+        // Rather than operating on 4 chunks separately, we operate on all at once.
+        // This is more efficient because if we operate on them separately, we have to generate
+        // prev1, prev2, and prev3 for each chunk, which is 3 `ext` instructions per chunk.
+        // However, if we do all at once, we only need 3 `ext` instructions to do 4 chunks.
+
+        //                                          prevs: 0 1 2 3
+        // -3  1  5  9 13 17 21 25 29 33 37 41 45 49 53 57       |
+        // -2  2  6 10 14 18 22 26 30 34 38 42 46 50 54 58     | |
+        // -1  3  7 11 15 19 23 27 31 35 39 43 47 51 55 59   | | |
+        //  0  4  8 12 16 20 24 28 32 36 40 44 48 52 56 60 | | | |
+        //  1  5  9 13 17 21 25 29 33 37 41 45 49 53 57 61 | | |
+        //  2  6 10 14 18 22 26 30 34 38 42 46 50 54 58 62 | |
+        //  3  7 11 15 19 23 27 31 35 39 43 47 51 55 59 63 |
+
+        //               0   1   2
+        // leftovers: { -3, -2, -1 }
+
+        const prev1s: [4]Chunk = ([_]Chunk{shift_in_prev(1, prev0s[3], self.leftovers[2])} ++ prev0s[0..3]).*;
+        const prev2s: [4]Chunk = ([_]Chunk{shift_in_prev(1, prev0s[2], self.leftovers[1])} ++ prev1s[0..3]).*;
+        const prev3s: [4]Chunk = ([_]Chunk{shift_in_prev(1, prev0s[1], self.leftovers[0])} ++ prev2s[0..3]).*;
+
+        var errs: Chunk = @splat(0);
+
+        inline for (prev0s, prev1s, prev2s, prev3s) |prev0, prev1, prev2, prev3| {
+            const sc = check_special_cases(prev0, prev1);
+            const must23_80 = must_be_2_3_continuation(prev2, prev3);
+
+            errs |= (sc ^ must23_80) | blk: {
+                const is0x2028or0x2029 =
+                    @select(u8, prev2 == @as(Chunk, @splat(0b1110_0010)), true_vec, false_vec) &
+                    @select(u8, prev1 == @as(Chunk, @splat(0b1000_0000)), true_vec, false_vec) &
+                    (@select(u8, prev0 == @as(Chunk, @splat(0b1010_1000)), true_vec, false_vec) |
+                    @select(u8, prev0 == @as(Chunk, @splat(0b1010_1001)), true_vec, false_vec));
+
+                const is0x85 =
+                    @select(u8, prev1 == @as(Chunk, @splat(0b1100_0010)), true_vec, false_vec) &
+                    @select(u8, prev0 == @as(Chunk, @splat(0b1000_0101)), true_vec, false_vec);
+                break :blk is0x2028or0x2029 | is0x85;
+            };
         }
 
+        if (0 != @reduce(.Max, errs))
+            return error.InvalidUtf8;
+
+        // If there are incomplete multibyte characters at the end of the block,
+        // write that data into `self.err`.
+        // e.g. if there is a 4-byte character, but it's 3 bytes from the end.
+        //
+        // If the previous chunk's last 3 bytes match this, they're too short (if they ended at EOF):
+        // ... 1111____ 111_____ 11______
+        self.is_invalid_place_to_end = 1 == (@intFromBool(prev0s[1][15] >= 0b11110000) | @intFromBool(prev0s[2][15] >= 0b11100000) | @intFromBool(prev0s[3][15] >= 0b11000000));
+        self.leftovers = .{ prev0s[1], prev0s[2], prev0s[3] };
+    }
+
+    fn validateChunk(self: *Utf8Checker, input: Chunk) !void {
         // Check whether the current bytes are valid UTF-8.
         // Flip prev1...prev3 so we can easily determine if they are 2+, 3+ or 4+ lead bytes
         // (2, 3, 4-byte leads become large positive numbers instead of small negative numbers)
 
-        const prev_input = utf8_checker.prev_input_block;
-        utf8_checker.prev_input_block = input;
-        const prev1 = prev(1, input, prev_input);
+        const prev_input = self.prev_input_block;
+        self.prev_input_block = input;
+        const prev1 = shift_in_prev(1, input, prev_input);
         const sc = check_special_cases(input, prev1);
-        const prev2 = prev(2, input, prev_input);
-        const prev3 = prev(3, input, prev_input);
+        const prev2 = shift_in_prev(2, input, prev_input);
+        const prev3 = shift_in_prev(3, input, prev_input);
         const must23_80 = must_be_2_3_continuation(prev2, prev3);
 
-        const ones: Chunk = @bitCast(@as(@Vector(@sizeOf(Chunk), u8), @splat(1)));
-        const msbs: Chunk = @bitCast(@as(@Vector(@sizeOf(Chunk), u8), @splat(0x80)));
+        const ones: Chunk = @bitCast([_]u8{0x01} ** @sizeOf(Chunk));
+        const msbs: Chunk = @bitCast([_]u8{0x80} ** @sizeOf(Chunk));
 
         const err = (must23_80 ^ sc) | if (USE_SWAR) blk: {
             // Will have a zero byte in `y` if there was a '\u{2028}' or '\u{2029}'
@@ -4513,10 +4967,10 @@ const Utf8Checker = struct {
 
         if ((0 != if (USE_SWAR)
             err
-        else if (builtin.cpu.arch == .arm or builtin.cpu.arch == .armeb)
+        else if (comptime builtin.cpu.arch == .arm or builtin.cpu.arch == .armeb)
             @as(NATIVE_VEC_INT, @bitCast(err))
         else
-            @reduce(if (builtin.cpu.arch == .x86_64) .Or else .Max, err)))
+            @reduce(if (comptime builtin.cpu.arch == .x86_64) .Or else .Max, err)))
         {
             return error.InvalidUtf8;
         }
@@ -4527,7 +4981,7 @@ const Utf8Checker = struct {
         //
         // If the previous input's last 3 bytes match this, they're too short (if they ended at EOF):
         // ... 1111____ 111_____ 11______
-        utf8_checker.is_invalid_place_to_end = 0 !=
+        self.is_invalid_place_to_end = 0 !=
             if (USE_SWAR)
             msbs & input & ((input | msbs) -% comptime max_value: {
                 var max_array = [1]u8{0} ** @sizeOf(Chunk);
@@ -4546,9 +5000,9 @@ const Utf8Checker = struct {
             };
 
             // https://github.com/llvm/llvm-project/issues/79779
-            if (builtin.cpu.arch == .arm or builtin.cpu.arch == .armeb)
+            if (comptime builtin.cpu.arch == .arm or builtin.cpu.arch == .armeb)
                 break :blk @as(NATIVE_VEC_INT, @bitCast(max_value));
-            break :blk @reduce(if (builtin.cpu.arch == .x86_64) .Or else .Max, max_value);
+            break :blk @reduce(if (comptime builtin.cpu.arch == .x86_64) .Or else .Max, max_value);
         };
     }
 
@@ -4759,3 +5213,50 @@ const Utf8Checker = struct {
 //    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 //    See the License for the specific language governing permissions and
 //    limitations under the License.
+
+// Forces the compiler to use the `andn` instruction on some targets.
+// Kinda unfortunate but LLVM just doesn't make good decisions regarding op-fusion that much.
+// https://github.com/llvm/llvm-project/issues/108840
+// https://github.com/llvm/llvm-project/issues/108731
+// https://github.com/llvm/llvm-project/issues/103501 (sorta)
+// https://github.com/llvm/llvm-project/issues/85857
+// https://github.com/llvm/llvm-project/issues/71389
+fn andn(src: anytype, mask: @TypeOf(src)) @TypeOf(src) {
+    switch (builtin.cpu.arch) {
+        .x86_64 => if (std.Target.x86.featureSetHas(builtin.cpu.features, .bmi2)) {
+            return asm ("andn %[src], %[mask], %[ret]"
+                : [ret] "=r" (-> @TypeOf(src)),
+                : [src] "r" (src),
+                  [mask] "r" (mask),
+            );
+        },
+
+        .riscv64 => if (std.Target.riscv.featureSetHas(builtin.cpu.features, .zbb) or std.Target.riscv.featureSetHas(builtin.cpu.features, .zbkb)) {
+            return asm ("andn %[ret], %[src], %[mask]"
+                : [ret] "=r" (-> @TypeOf(src)),
+                : [src] "r" (src),
+                  [mask] "r" (mask),
+            );
+        },
+
+        .aarch64, .aarch64_be => {
+            return asm ("bic %[ret], %[src], %[mask]"
+                : [ret] "=r" (-> @TypeOf(src)),
+                : [src] "r" (src),
+                  [mask] "r" (mask),
+            );
+        },
+
+        .powerpc64 => {
+            return asm ("andc %[ret], %[src], %[mask]"
+                : [ret] "=r" (-> @TypeOf(src)),
+                : [src] "r" (src),
+                  [mask] "r" (mask),
+            );
+        },
+
+        else => {},
+    }
+
+    return src & ~mask;
+}
