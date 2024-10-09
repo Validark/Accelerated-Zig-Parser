@@ -2615,6 +2615,17 @@ const Parser = struct {
     // TODO: move this into shuffle function
     fn vperm2(table: @Vector(128, u8), indices: @Vector(64, u8)) @Vector(64, u8) {
         if (@inComptime() or !std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vbmi))
+            return shuffle(table, indices & @as(@Vector(64, u8), @splat(0b0111_1111)));
+
+        const table_part_1, const table_part_2 = @as([2]@Vector(64, u8), @bitCast(table));
+
+        return struct {
+            extern fn @"llvm.x86.avx512.vpermi2var.qi.512"(@Vector(64, u8), @Vector(64, u8), @Vector(64, u8)) @Vector(64, u8);
+        }.@"llvm.x86.avx512.vpermi2var.qi.512"(table_part_1, indices, table_part_2);
+    }
+
+    fn vperm2z(table: @Vector(128, u8), indices: @Vector(64, u8)) @Vector(64, u8) {
+        if (@inComptime() or !std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vbmi))
             return shuffle(table, indices);
 
         const table_part_1, const table_part_2 = @as([2]@Vector(64, u8), @bitCast(table));
@@ -2819,10 +2830,22 @@ const Parser = struct {
     // Expands a vector of up to 16 bytes into a 64 byte vector based on a mask.
     // We could go bigger but we would need more vpshufb's.
     fn expandShort(expandable: anytype, fallback: @Vector(64, u8), pos_mask: u64, predicate_mask: u64) @Vector(64, u8) {
-        switch (@TypeOf(expandable)) {
-            @Vector(8, u8), @Vector(16, u8) => {},
-            else => @compileError("We haven't seen this type in expandShort yet."),
+        if (@TypeOf(expandable) == @Vector(1, u8)) {
+            // pdep(matched, alphanum_starts_larger_than_1);
+            // kinds = @select(u8, unmovemask64(comment_starts), @as(@Vector(64, u8), @splat(@intFromEnum(Tag.@"\\\\"))), kinds);
+            // kinds = expandShort(std.simd.extract(~kw_table_indices, 0, UNROLL_FACTOR), kinds, alphanum_starts_larger_than_1, cur_keyword_starts);
+            return @select(u8, unmovemask64(predicate_mask), @as(@Vector(64, u8), @splat(expandable[0])), fallback);
+        } else if (@TypeOf(expandable) == @Vector(2, u8)) {
+            // pdep(matched, alphanum_starts_larger_than_1);
+            // kinds = @select(u8, unmovemask64(comment_starts), @as(@Vector(64, u8), @splat(@intFromEnum(Tag.@"\\\\"))), kinds);
+            // kinds = expandShort(std.simd.extract(~kw_table_indices, 0, UNROLL_FACTOR), kinds, alphanum_starts_larger_than_1, cur_keyword_starts);
+
+            var ans = @select(u8, unmovemask64(predicate_mask & pos_mask & (~pos_mask +% 1)), @as(@Vector(64, u8), @splat(expandable[0])), fallback);
+            ans = @select(u8, unmovemask64(predicate_mask & (predicate_mask -% 1)), @as(@Vector(64, u8), @splat(expandable[1])), fallback);
+            return ans;
         }
+
+        if (@typeInfo(@TypeOf(expandable)).vector.child != u8) @compileError("`expandable` only works on u8's for now.");
         if (@typeInfo(@TypeOf(expandable)).vector.len > 16) @compileError("`expandable` is too large for the alternative implementations to handle. You are going to need more than one vpshufb per iteration.");
 
         var buffer: [64]u8 = undefined;
@@ -2956,17 +2979,17 @@ const Parser = struct {
 
         // Because we have so many loop-carried variables, we stuff them all into a here.
         // We think we use this to make sure we don't use a ridiculous number of registers.
-        var carry: packed struct(u64) {
-            slashes: u1 = 0,
-            backslashes: u1 = 0,
-            non_newlines: u1 = 0,
-            unescaped_quotes: u1 = 0,
-            unescaped_apostrophes: u1 = 0,
-            comment_starts: u1 = 0,
-            line_string_starts: u1 = 0,
-            inside_strings_and_comments: u1 = 0,
-            carriages: u1 = 0,
-            ats: u1 = 0,
+        var carry: struct {
+            slashes: u64 = 0,
+            backslashes: u64 = 0,
+            non_newlines: u64 = 0,
+            unescaped_quotes: u64 = 0,
+            unescaped_apostrophes: u64 = 0,
+            comment_starts: u64 = 0,
+            line_string_starts: u64 = 0,
+            inside_strings_and_comments: u64 = 0,
+            carriages: u64 = 0,
+            ats: u64 = 0,
 
             _: u54 = 0,
 
@@ -3021,26 +3044,28 @@ const Parser = struct {
 
         // \\if conste pub defer break try catch var for if if ..............................................................................
 
-        const str =
-            \\  comptime  var  "/'"  ++  if
-            \\  ++// good
-            \\ "me"  // m
-            \\
-            \\  //m
-            \\
-            \\  // m
-            \\  ++
-            \\ e  // soup
-            \\
-            \\
-            \\"\\\"\\; //\"'\\\"\"\\\"///'\"  \\ \"\\\"\\"; "'\\"
-            \\
-            \\//=///' %" "\\\"\\";
-            \\
-            \\//"'\\""\\"///'" +$ "\\\"\\";//"'\\""\\"
-            \\/
-        ;
-        @constCast(source.ptr)[0..str.len].* = str.*;
+        if (comptime builtin.mode == .Debug) {
+            const str =
+                \\  comptime  var  "/'"  ++  if
+                \\  ++// good
+                \\ "me"  // m
+                \\
+                \\  //m
+                \\
+                \\  // m
+                \\  ++
+                \\ e  // soup
+                \\
+                \\
+                \\"\\\"\\; //\"'\\\"\"\\\"///'\"  \\ \"\\\"\\"; "'\\"
+                \\
+                \\//=///' %" "\\\"\\";
+                \\
+                \\//"'\\""\\"///'" +$ "\\\"\\";//"'\\""\\"
+                \\/
+            ;
+            @constCast(source.ptr)[0..str.len].* = str.*;
+        }
 
         var super_duper_pls_delete_me_iter: u64 = 0;
         var carried_start: usize = 0;
@@ -3309,7 +3334,27 @@ const Parser = struct {
 
                 var start_indices = std.simd.extract(bitsToIndices(alphanum_starts_larger_than_1, 0), 0, 32);
                 var identifier_lens = std.simd.extract(bitsToIndices(alphanum_ends_larger_than_1, 1), 0, 32) -% start_indices;
-                var hash: @Vector(32, u7) = @truncate(((first_two_chars ^ (@as(@Vector(32, u16), identifier_lens) << @splat(14))) *% last_two_chars) >> @splat(8));
+
+                // Although we are truncating to u7's, we can keep this in a `@Vector(32, u16)`, and operate on this directly without concentrating
+                // to a @Vector(32, u8).
+                // Normally, we would have to delete the uppermost bit here, but vperm2 does not look at the uppermost bit
+                const hash: @Vector(32, u8) = @as(@Vector(32, u8), @truncate(((first_two_chars ^ (@as(@Vector(32, u16), identifier_lens) << @splat(14))) *% last_two_chars) >> @splat(8)))
+                // violently break my code if I am wrong about how vperm2 works!
+                | @as(@Vector(32, u8), @splat(if (comptime builtin.mode == .Debug) 0b1000_0000 else 0));
+
+                comptime var t: @Vector(128, u8) = undefined;
+                const BAKED_IN_MUL = 2;
+                comptime for (0..128) |i| {
+                    // Address calculation requires a multiply by 16. However, we can't fit that in here because the number of keywords times 16 is higher
+                    // than 256, as the number of keywords is higher than 15.
+                    // However, we can stuff a multiply by 2 in here. The reason is because `lea` can fold a multiply by 2, 4, or 8 into one op.
+                    t[i] = Keywords.mapToIndex(i) * BAKED_IN_MUL;
+                };
+
+                // Every other byte has an index in it. The non-index bytes are all 0. We guarantee this property:
+                assert(Keywords.mapToIndex(0) == 0);
+
+                var kw_table_indices = vperm2(t, @bitCast([2]@Vector(32, u8){ hash, undefined }));
 
                 // While we can produce the initial hash value for all identifiers in parallel, we can't map the hashes to indices all at once.
                 // We use Phil Bagwell's popcount trick for that, and we mapped to a `u7`, which means there are 128 possible slots in sparse space which need to be mapped to compressed space.
@@ -3319,47 +3364,87 @@ const Parser = struct {
                 // Max number of keywords in a 64-byte chunk is 21. Therefore we can could safely unroll the loop 3 times and be done (3 x 8).
                 // "if if if if if if if if if if if if if if if if if if if if if 1"
                 // However, that seems a tad excessive. Let's just leave the loop in the hope that the branch predictor comes in clutch...
+
+                // 0000001000000000010001000000000100000000010101100000000000000000 0000010001000101110000000000000000000000000000000000000000000000
+
+                //t[hash >> 4]
+
+                //                const masks_u16: [8]u16 = comptime @bitCast(Keywords.masks);
+                //                const sub_mask_ = (@as(@Vector(32, u16), @splat(1)) << @truncate(hash)) -% @as(@Vector(32, u64), @splat(1));
+                //                const kw_table_indices =
+                //                        @select(u16, hash >= @as(@Vector(32, u16), @splat(16*1)), comptime @as(@Vector(32, u16), @splat(@popCount(masks_u16[0]))), @as(@Vector(32, u16), @splat(0))) +
+                //                        @select(u16, hash >= @as(@Vector(32, u16), @splat(16*2)), comptime @as(@Vector(32, u16), @splat(@popCount(masks_u16[1]))), @as(@Vector(32, u16), @splat(0))) +
+                //                        @select(u16, hash >= @as(@Vector(32, u16), @splat(16*3)), comptime @as(@Vector(32, u16), @splat(@popCount(masks_u16[2]))), @as(@Vector(32, u16), @splat(0))) +
+                //                        @select(u16, hash >= @as(@Vector(32, u16), @splat(16*4)), comptime @as(@Vector(32, u16), @splat(@popCount(masks_u16[3]))), @as(@Vector(32, u16), @splat(0))) +
+                //                        @select(u16, hash >= @as(@Vector(32, u16), @splat(16*5)), comptime @as(@Vector(32, u16), @splat(@popCount(masks_u16[4]))), @as(@Vector(32, u16), @splat(0))) +
+                //                        @select(u16, hash >= @as(@Vector(32, u16), @splat(16*6)), comptime @as(@Vector(32, u16), @splat(@popCount(masks_u16[5]))), @as(@Vector(32, u16), @splat(0))) +
+                //                        @select(u16, hash >= @as(@Vector(32, u16), @splat(16*7)), comptime @as(@Vector(32, u16), @splat(@popCount(masks_u16[6]))), @as(@Vector(32, u16), @splat(0))) +
+                //// 128 vs 32
+                //                        @popCount(sub_mask & @select(u64, hash >= @as(@Vector(32, u16), @splat(64)), comptime @as(@Vector(32, u64), @splat(Keywords.masks[1])), @as(@Vector(32, u64), @splat(Keywords.masks[0]))));
+
+                const UNROLL_FACTOR = 4;
+                const BitHelper = struct {
+                    fn unset_bits(x: u64) u64 {
+                        if (UNROLL_FACTOR < 3) {
+                            var y = x;
+                            inline for (0..UNROLL_FACTOR) |_| y &= y -% 1;
+                            return y;
+                        } else {
+                            // Worst-case chunk: "if if if if if if if if if if if if if if if if if if if if if 1"
+                            const MAX_KEYWORDS_IN_CHUNK = 21;
+                            // Theoretically, everything above the lower `MAX_KEYWORDS_IN_CHUNK` bits could safely be marked as undefined, and the compiler might theoretically
+                            // be able to reuse a pre-existing constant that matches the lower `MAX_KEYWORDS_IN_CHUNK` bits. However, Zig currently does not pass this information to the backend, and it wouldn't matter
+                            // anyway since I believe LLVM does not attempt to do this sort of optimization (constant re-use was not a big priority for LLVM for a long time).
+                            const BOTTOM_BITS_UNSET = ((@as(u64, 1) << MAX_KEYWORDS_IN_CHUNK) -% 1) >> UNROLL_FACTOR << UNROLL_FACTOR;
+                            return pdep(BOTTOM_BITS_UNSET, x);
+                        }
+                    }
+
+                    fn distribute_matched_bits(matched: u64, x: u64) u64 {
+                        if (UNROLL_FACTOR == 1) {
+                            return if (matched == 0) 0 else x & (~x +% 1);
+                        } else if (UNROLL_FACTOR == 2) {
+                            const y = x & (x -% 1);
+                            return disjoint_or(x & (~x +% (matched & 1)), y & (~y +% (matched >> 1)));
+
+                            // LLVM does not understand that I want cmov instructions...
+                            //const y = x & (x -% 1);
+                            //return disjoint_or(if ((matched & 1) == 0) 0 else x & (~x +% 1), if ((matched & 2) == 0) 0 else y & (~y +% 1));
+                        } else return pdep(matched, x);
+                    }
+                };
+
                 while (true) {
-                    const sub_hash = std.simd.extract(hash, 0, 8);
-                    const sub_mask = (@as(@Vector(8, u64), @splat(1)) << @truncate(sub_hash)) -% @as(@Vector(8, u64), @splat(1));
-                    const kw_table_indices = @select(u64, sub_hash >= @as(@Vector(8, u16), @splat(64)), comptime @as(@Vector(8, u64), @splat(@popCount(Keywords.masks[0]))), @as(@Vector(8, u64), @splat(0))) +
-                        @popCount(sub_mask & @select(u64, sub_hash >= @as(@Vector(8, u16), @splat(64)), comptime @as(@Vector(8, u64), @splat(Keywords.masks[1])), @as(@Vector(8, u64), @splat(Keywords.masks[0]))));
-
-                    const table_ptrs: @Vector(8, *@Vector(Keywords.PADDING_RIGHT, u8)) = @ptrFromInt(@as(@Vector(8, usize), @bitCast(kw_table_indices)) *
-                        @as(@Vector(8, usize), @splat(Keywords.PADDING_RIGHT)) +
-                        @as(@Vector(8, usize), @splat(@intFromPtr(&Keywords.sorted_padded_kws))));
-                    const chunk_ptrs: @Vector(8, *[Keywords.PADDING_RIGHT]u8) = @ptrFromInt(std.simd.extract(start_indices, 0, 8) + @as(@Vector(8, usize), @splat(@intFromPtr(chunk_ptr))));
-
                     var matched: u64 = 0;
 
-                    inline for (0..8) |i| {
-                        const vec1 = table_ptrs[i].*; // aligned load
+                    inline for (0..UNROLL_FACTOR) |i| {
+                        assert(@typeInfo(@TypeOf(&Keywords.sorted_padded_kws)).pointer.alignment == Keywords.PADDING_RIGHT);
 
-                        const vec2: @Vector(Keywords.PADDING_RIGHT, u8) = chunk_ptrs[i].*; // unaligned load
+                        const vec1 = @as(*@Vector(Keywords.PADDING_RIGHT, u8), @ptrFromInt(@intFromPtr(&Keywords.sorted_padded_kws) + kw_table_indices[i] * (Keywords.PADDING_RIGHT / BAKED_IN_MUL))).*; // aligned load
+
+                        const vec2: @Vector(Keywords.PADDING_RIGHT, u8) = chunk_ptr[start_indices[i]..][0..Keywords.PADDING_RIGHT].*; // unaligned load
                         const len_vec: @TypeOf(vec2) = @splat(identifier_lens[i]);
                         const cd = @select(u8, len_vec > std.simd.iota(u8, Keywords.PADDING_RIGHT), vec2, len_vec);
 
                         matched = disjoint_or(matched, @as(u64, @intFromBool(std.simd.countTrues(cd != vec1) == 0)) << i);
                     }
 
-                    const cur_keyword_starts = pdep(matched, alphanum_starts_larger_than_1);
+                    const cur_keyword_starts = BitHelper.distribute_matched_bits(matched, alphanum_starts_larger_than_1);
+                    //const cur_keyword_starts = pdep(matched, alphanum_starts_larger_than_1);
                     all_keyword_starts |= cur_keyword_starts;
                     all_keyword_ends |= pdep(matched, alphanum_ends_larger_than_1);
                     // std.debug.print("{any}\n", .{@as([64]Tag, @bitCast(kinds))});
-                    kinds = expandShort(~@as(@Vector(8, u8), @intCast(kw_table_indices)), kinds, alphanum_starts_larger_than_1, cur_keyword_starts);
+                    kinds = expandShort(std.simd.extract(~kw_table_indices, 0, UNROLL_FACTOR), kinds, alphanum_starts_larger_than_1, cur_keyword_starts);
                     // std.debug.print("{any}\n", .{@as([64]Tag, @bitCast(kinds))});
 
-                    // Max number of keywords in a 64-byte chunk is 21.
-                    // "if if if if if if if if if if if if if if if if if if if if if 1"
-                    // 0x1FFF00 is 13 1's followed by 8 0's. Theoretically, everything above the lower 21 bits could safely be marked as undefined, and the compiler might theoretically
-                    // be able to reuse a pre-existing constant that matches the lower 21 bits. However, Zig currently does not pass this information to the backend, and it wouldn't matter
-                    // anyway since I believe LLVM does not attempt to do this sort of optimization (constant re-use was not a big priority for LLVM for a long time).
-                    alphanum_starts_larger_than_1 = pdep(0x1FFF00, alphanum_starts_larger_than_1); // could also have done pdep(0x00FF00, ...) and pdep(0x1F0000, ...) for fully unrolled version
-                    alphanum_ends_larger_than_1 = pdep(0x1FFF00, alphanum_ends_larger_than_1); // could also have done pdep(0x00FF00, ...) and pdep(0x1F0000, ...) for fully unrolled version
+                    if (UNROLL_FACTOR == 21) break;
 
-                    hash = std.simd.shiftElementsLeft(hash, 8, undefined);
-                    start_indices = std.simd.shiftElementsLeft(start_indices, 8, undefined);
-                    identifier_lens = std.simd.shiftElementsLeft(identifier_lens, 8, undefined);
+                    alphanum_starts_larger_than_1 = BitHelper.unset_bits(alphanum_starts_larger_than_1);
+                    alphanum_ends_larger_than_1 = BitHelper.unset_bits(alphanum_ends_larger_than_1);
+                    kw_table_indices = std.simd.shiftElementsLeft(kw_table_indices, UNROLL_FACTOR, undefined);
+                    start_indices = std.simd.shiftElementsLeft(start_indices, UNROLL_FACTOR, undefined);
+                    identifier_lens = std.simd.shiftElementsLeft(identifier_lens, UNROLL_FACTOR, undefined);
+
                     if (alphanum_starts_larger_than_1 == 0) {
                         @branchHint(.likely);
                         break;
@@ -3446,6 +3531,8 @@ const Parser = struct {
                 // Step 3. Merge comments followed by whitespace.
                 const whitespace_ends = whitespace & ~(whitespace >> 1);
                 // printb(whitespace_ends, "whitespace_ends");
+                // ........................1.........1............1.......1.....1.. ⟵ right_extended_comment_ends
+                // ........................1.........1..........................1.. ⟵ right_extended_comment_ends
                 const right_extended_comment_ends = whitespace_ends & ~(whitespace_ends -% (comment_ends & ~left_extended_comment_starts_with_mergables));
                 printb(comment_ends & ~left_extended_comment_starts_with_mergables, "comment_ends & ~left_extended_comment_starts_with_mergables");
                 printb(left_extended_comment_starts, "left_extended_comment_starts");
@@ -3538,6 +3625,7 @@ const Parser = struct {
                 // printb(reversedSubtraction(left_boundaries, extendable_sym_kw_starts), "reversedSubtraction(left_boundaries, extendable_sym_kw_starts)");
                 // printb(left_boundaries & ~reversedSubtraction(left_boundaries, extendable_sym_kw_starts), "left_boundaries & ~reversedSubtraction(left_boundaries, extendable_sym_kw_starts)");
                 // printb(whitespace_afters, "whitespace_afters");
+
                 // printb(comments_extendable_left, "comments_extendable_left {.}");
                 // printb(all_ends, "all_ends {.}");
                 // printb(comment_starts, "comment_starts {.}");
@@ -3581,9 +3669,10 @@ const Parser = struct {
 
             chunk_ptr += 64;
             if (@intFromPtr(chunk_ptr) >= @intFromPtr(final_chunk_ptr)) break;
-
-            super_duper_pls_delete_me_iter += 1;
-            if (super_duper_pls_delete_me_iter == 2) break;
+            if (comptime builtin.mode == .Debug) {
+                super_duper_pls_delete_me_iter += 1;
+                if (super_duper_pls_delete_me_iter == 2) break;
+            }
         }
 
         const num_tokens = (@intFromPtr(cur_token.ptr) - @intFromPtr(tokens.ptr)) / @sizeOf(Token);
@@ -4224,13 +4313,13 @@ const Parser = struct {
 // const Rp = rpmalloc.RPMalloc(.{});
 pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
-    var jdz = jdz_allocator.JdzAllocator(.{
-        .split_large_spans_to_one = true,
-        .split_large_spans_to_large = true,
-    }).init();
+    //var jdz = jdz_allocator.JdzAllocator(.{
+    //    .split_large_spans_to_one = true,
+    //    .split_large_spans_to_large = true,
+    //}).init();
     // defer jdz.deinit();
-    const gpa: Allocator = jdz.allocator();
-    // const gpa = std.heap.page_allocator;
+    //const gpa: Allocator = jdz.allocator();
+    const gpa = std.heap.page_allocator;
     const sources = try readFiles(gpa);
     defer {
         // Leak memory in ReleaseFast because the OS is going to clean it up on program exit.
