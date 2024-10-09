@@ -1,5 +1,7 @@
 zig-cache
+.zig-cache
 zig-out
+zig-out-old
 *.js
 .token_data1
 .token_data2
