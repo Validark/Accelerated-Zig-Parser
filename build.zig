@@ -47,7 +47,22 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path(path),
         .target = target,
         .optimize = optimize,
+        // .linkage = .dynamic,
+        .single_threaded = true,
     });
+
+    // exe.root_module.single_threaded = true;
+
+    // exe.linkLibC();
+
+    // exe.link_z_common_page_size = 1 << 21;
+    // exe.link_z_lazy = true;
+    // exe.root_module.single_threaded = true;
+    // exe.linkSystemLibrary("lppreload");
+    // exe.linkLibC();
+    // exe.linkLibrary(library: *Compile)
+
+    // exe.linkage = .dynamic;
 
     // exe.addIncludePath(.{ .path = "c-src" }); // Look for C source files
     // exe.linkLibC();
