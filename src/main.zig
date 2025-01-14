@@ -40,7 +40,7 @@ fn printb(v: anytype, str: []const u8) void {
             0 => std.debug.print("\x1b[95m.\x1b[0m", .{}),
         }
     }
-    std.debug.print("\x1b[30m ⟵ {s}\x1b[0m\n", .{str});
+    std.debug.print("\x1b[0m ⟵  {s}\n", .{str});
 }
 
 fn printStr(str: []const u8) void {
@@ -1151,8 +1151,6 @@ const Keywords = struct {
 
     const kw_slices_raw = blk: {
         @setEvalBranchQuota(std.math.maxInt(u16));
-
-        const max_hash_is_unused = (masks[masks.len - 1] >> 63) ^ 1;
         var buffer = std.mem.zeroes([std.math.maxInt(u7) + 1]kw_slice);
 
         for (unpadded_kws) |kw|
@@ -1160,11 +1158,6 @@ const Keywords = struct {
                 .start_index = std.mem.indexOf(u8, kw_buffer, kw) orelse @compileError(std.fmt.comptimePrint("Please include the keyword \"{s}\" inside of `kw_buffer`.\n\n`kw_buffer` is currently:\n{s}\n", .{ kw, kw_buffer })),
                 .len = kw.len,
             };
-
-        if (max_hash_is_unused == 1) {
-            // We add one extra filler item just in case we hash a value greater than the greatest hashed value
-            buffer[unpadded_kws.len] = std.mem.zeroes(kw_slice);
-        }
 
         break :blk buffer;
     };
@@ -1458,23 +1451,26 @@ fn pextComptime(src: anytype, comptime mask: @TypeOf(src)) @TypeOf(src) {
     if (mask == 0) return 0;
     const num_one_groups = @popCount(mask & ~(mask << 1));
 
-    if (!@inComptime() and comptime num_one_groups >= 3 and @bitSizeOf(@TypeOf(src)) <= 64 and builtin.cpu.arch == .x86_64 and
-        std.Target.x86.featureSetHas(builtin.cpu.features, .bmi2) and HAS_FAST_PDEP_AND_PEXT)
-    {
+    if (!@inComptime() and comptime num_one_groups >= 2 and @bitSizeOf(@TypeOf(src)) <= 64 and HAS_FAST_PDEP_AND_PEXT) {
         const methods = struct {
             extern fn @"llvm.x86.bmi.pext.32"(u32, u32) u32;
             extern fn @"llvm.x86.bmi.pext.64"(u64, u64) u64;
+            extern fn @"llvm.ppc.pextd"(u64, u64) u64;
         };
-        return switch (@TypeOf(src)) {
-            u32 => methods.@"llvm.x86.bmi.pext.32"(src, mask),
-            u64 => methods.@"llvm.x86.bmi.pext.64"(src, mask),
-            // u64, u32 => asm ("pext %[mask], %[src], %[ret]"
-            //     : [ret] "=r" (-> @TypeOf(src)),
-            //     : [src] "r" (src),
-            //       [mask] "r" (mask),
-            // ),
-            else => @intCast(pextComptime(@as(if (@bitSizeOf(@TypeOf(src)) <= 32) u32 else u64, src), mask)),
-        };
+
+        return @intCast(switch (builtin.cpu.arch) {
+            .powerpc64, .powerpc64le => methods.@"llvm.ppc.pextd"(src, mask),
+            .x86, .x86_64 => if (@bitSizeOf(@TypeOf(src)) <= 32)
+                methods.@"llvm.x86.bmi.pext.32"(src, mask)
+            else
+                methods.@"llvm.x86.bmi.pext.64"(src, mask),
+            else => unreachable,
+        });
+        //return switch (@TypeOf(src)) {
+        //u32 => methods.@"llvm.x86.bmi.pext.32"(src, mask),
+        //u64 => methods.@"llvm.x86.bmi.pext.64"(src, mask),
+        //else => @intCast(pextComptime(@as(if (@bitSizeOf(@TypeOf(src)) <= 32) u32 else u64, src), mask)),
+        //};
     } else if (num_one_groups >= 4) blk: {
         // Attempt to produce a `global_shift` value such that
         // the return statement at the end of this block moves the desired bits into the least significant
@@ -2612,20 +2608,115 @@ const Parser = struct {
         }
     }
 
-    // TODO: move this into shuffle function
-    fn vperm2(table: @Vector(128, u8), indices: @Vector(64, u8)) @Vector(64, u8) {
-        if (@inComptime() or !std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vbmi))
-            return shuffle(table, indices & @as(@Vector(64, u8), @splat(0b0111_1111)));
+    fn vperm(table: @Vector(64, u8), indices: anytype) @TypeOf(indices) {
+        if (@inComptime() or comptime !std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vbmi))
+            return shuffle(table, indices & @as(@TypeOf(indices), @splat(0b0011_1111)));
 
-        const table_part_1, const table_part_2 = @as([2]@Vector(64, u8), @bitCast(table));
+        const padding_len = 64 - @typeInfo(@TypeOf(indices)).vector.len;
+        const extended_indices = if (padding_len == 0) indices else std.simd.join(indices, @as(@Vector(padding_len, u8), @splat(undefined)));
+        return std.simd.extract(struct {
+            extern fn @"llvm.x86.avx512.permvar.qi.512"(@Vector(64, u8), @Vector(64, u8)) @Vector(64, u8);
+        }.@"llvm.x86.avx512.permvar.qi.512"(table, extended_indices), 0, @typeInfo(@TypeOf(indices)).vector.len);
+    }
+
+    fn vpermWithFallback(table: @Vector(64, u8), indices: @Vector(64, u8), fallback: @Vector(64, u8), mask: u64) @Vector(64, u8) {
+        if (@inComptime() or comptime !std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vbmi))
+            return @select(u8, @as(@Vector(64, bool), @bitCast(mask)), vperm(table, indices), fallback);
 
         return struct {
+            extern fn @"llvm.x86.avx512.mask.permvar.qi.512"(@Vector(64, u8), @Vector(64, u8), @Vector(64, u8), u64) @Vector(64, u8);
+        }.@"llvm.x86.avx512.mask.permvar.qi.512"(table, indices, fallback, mask);
+    }
+
+    fn padWithUndefineds(T: type, value: anytype) if (@sizeOf(@TypeOf(value)) > @sizeOf(T)) @TypeOf(value) else T {
+        const padding_len = @typeInfo(T).vector.len - @typeInfo(@TypeOf(value)).vector.len;
+        return if (padding_len <= 0) value else std.simd.join(value, @as(@Vector(padding_len, @typeInfo(T).vector.child), @splat(undefined)));
+    }
+
+    fn vpbroadcast(T: type, a: anytype) T {
+        // if ( != u8) @compileError("This workaround is just for byte vectors, home slice.");
+        //    if (@inComptime() or comptime (builtin.cpu.arch != .x86_64))
+        //        return @splat(@as(@Vector(@sizeOf(T) / @sizeOf(@typeInfo(T).vector.child), @typeInfo(@TypeOf(a)).vector.child), @bitCast(a))[0]);
+        //@compileLog(std.simd.extract(a, 0, @sizeOf(@typeInfo(T).vector.child)));
+        return @bitCast(std.simd.repeat(@sizeOf(T), asm ("vpbroadcast" ++ switch (@typeInfo(T).vector.child) {
+                u8 => "b",
+                u16 => "w",
+                u32 => "d",
+                u64 => "q",
+                else => @compileError("[broadcast] Invalid vector type. `child` must be a u8, u16, u32, or u64."),
+            } ++ " %[a], %[ret]"
+            : [ret] "=v" (-> NATIVE_CHAR_VEC),
+            : [a] "v" (padWithUndefineds(@Vector(16, u8), std.simd.extract(a, 0, @sizeOf(@typeInfo(T).vector.child)))),
+        )));
+    }
+
+    fn splat(a: anytype) @Vector(64, u8) {
+        if (@typeInfo(@TypeOf(a)).vector.child != u8) @compileError("This workaround is just for byte vectors, home slice.");
+        if (@inComptime() or comptime builtin.cpu.arch != .x86_64)
+            return @splat(a[0]);
+
+        const ret = asm ("vpbroadcastb %[a], %[ret]"
+            : [ret] "=v" (-> @Vector(NATIVE_VEC_SIZE, u8)),
+            : [a] "v" (padWithUndefineds(@Vector(16, u8), a)),
+        );
+
+        return switch (NATIVE_VEC_SIZE) {
+            32 => std.simd.join(ret, ret),
+            64 => ret,
+            else => @compileError(std.fmt.comptimePrint("NATIVE_VEC_SIZE of {} not supported.", .{NATIVE_VEC_SIZE})),
+        };
+    }
+
+    fn splat16(a: anytype) @Vector(16, u8) {
+        if (@typeInfo(@TypeOf(a)).vector.child != u8) @compileError("This workaround is just for byte vectors, home slice.");
+        if (@inComptime() or comptime builtin.cpu.arch != .x86_64)
+            return @splat(a[0]);
+
+        return asm ("vpbroadcastb %[a], %[ret]"
+            : [ret] "=v" (-> @Vector(16, u8)),
+            : [a] "v" (padWithUndefineds(@Vector(16, u8), a)),
+        );
+    }
+
+    //    fn vpermFallback(table: @Vector(64, u8), indices: @Vector(64, u8), fallback: @Vector(16, u8), mask: @Vector(16, bool)) @TypeOf(indices) {
+    //        if (@inComptime() or comptime !std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vbmi))
+    //            return shuffle(table, indices & @as(@TypeOf(indices), @splat(0b0011_1111)));
+    //
+    //        return std.simd.extract(struct {
+    //            extern fn @"llvm.x86.avx512.mask.permvar.qi.512"(@Vector(64, u8), @Vector(64, u8), @Vector(64, u8), u64) @Vector(64, u8);
+    //        }.@"llvm.x86.avx512.mask.permvar.qi.512"(table, padWithUndefineds(@Vector(64, u8), indices), padWithUndefineds(@Vector(64, u8), fallback), @as(u16, @bitCast(mask))), 0, @typeInfo(@TypeOf(indices)).vector.len);
+    //    }
+
+    fn vperm2(table: @Vector(128, u8), indices: anytype) @TypeOf(indices) {
+        if (@inComptime() or comptime !std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vbmi))
+            return shuffle(table, indices & @as(@TypeOf(indices), @splat(0b0111_1111)));
+
+        const table_part_1, const table_part_2 = @as([2]@Vector(64, u8), @bitCast(table));
+        return std.simd.extract(struct {
             extern fn @"llvm.x86.avx512.vpermi2var.qi.512"(@Vector(64, u8), @Vector(64, u8), @Vector(64, u8)) @Vector(64, u8);
-        }.@"llvm.x86.avx512.vpermi2var.qi.512"(table_part_1, indices, table_part_2);
+        }.@"llvm.x86.avx512.vpermi2var.qi.512"(table_part_1, padWithUndefineds(@Vector(64, u8), indices), table_part_2), 0, @typeInfo(@TypeOf(indices)).vector.len);
+    }
+
+    fn vperm4(table: @Vector(256, u8), indices: anytype) @TypeOf(indices) {
+        if (@inComptime() or comptime !std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vbmi))
+            return shuffle(table, indices);
+
+        const table_part_1, const table_part_2, const table_part_3, const table_part_4 = @as([4]@Vector(64, u8), @bitCast(table));
+        const padded_indices = padWithUndefineds(@Vector(64, u8), indices);
+        const Intrinsic = struct {
+            extern fn @"llvm.x86.avx512.vpermi2var.qi.512"(@Vector(64, u8), @Vector(64, u8), @Vector(64, u8)) @Vector(64, u8);
+        };
+
+        return std.simd.extract(@select(
+            u8,
+            padWithUndefineds(@Vector(64, bool), indices < @as(@TypeOf(indices), @splat(128))),
+            Intrinsic.@"llvm.x86.avx512.vpermi2var.qi.512"(table_part_1, padded_indices, table_part_2),
+            Intrinsic.@"llvm.x86.avx512.vpermi2var.qi.512"(table_part_3, padded_indices, table_part_4),
+        ), 0, @typeInfo(@TypeOf(indices)).vector.len);
     }
 
     fn vperm2z(table: @Vector(128, u8), indices: @Vector(64, u8)) @Vector(64, u8) {
-        if (@inComptime() or !std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vbmi))
+        if (@inComptime() or comptime !std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vbmi))
             return shuffle(table, indices);
 
         const table_part_1, const table_part_2 = @as([2]@Vector(64, u8), @bitCast(table));
@@ -2797,7 +2888,9 @@ const Parser = struct {
         if (!@inComptime() and comptime std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vbmi2)) {
             return struct {
                 extern fn @"llvm.x86.avx512.mask.compress.b"(@Vector(64, u8), @Vector(64, u8), u64) @Vector(64, u8);
-            }.@"llvm.x86.avx512.mask.compress.b"(std.simd.iota(u8, 64) + @as(@Vector(64, u8), @splat(start_index)), undefined, mask);
+            }.@"llvm.x86.avx512.mask.compress.b"(std.simd.iota(u8, 64), @splat(0), mask) + @as(@Vector(64, u8), @splat(start_index));
+            // Alternatively:
+            // }.@"llvm.x86.avx512.mask.compress.b"(std.simd.iota(u8, 64) + @as(@Vector(64, u8), @splat(start_index)), @splat(0), mask);
         } else if (HAS_FAST_PDEP_AND_PEXT) {
             const iota: u64 = @bitCast(std.simd.iota(u4, 16));
             var buffer = [_]u8{0} ** 64;
@@ -2827,47 +2920,55 @@ const Parser = struct {
         }
     }
 
-    // Expands a vector of up to 16 bytes into a 64 byte vector based on a mask.
+    // Expands a vector of up to max_index bytes into a 64 byte vector based on a mask.
     // We could go bigger but we would need more vpshufb's.
-    fn expandShort(expandable: anytype, fallback: @Vector(64, u8), pos_mask: u64, predicate_mask: u64) @Vector(64, u8) {
-        if (@TypeOf(expandable) == @Vector(1, u8)) {
-            // pdep(matched, alphanum_starts_larger_than_1);
-            // kinds = @select(u8, unmovemask64(comment_starts), @as(@Vector(64, u8), @splat(@intFromEnum(Tag.@"\\\\"))), kinds);
-            // kinds = expandShort(std.simd.extract(~kw_table_indices, 0, UNROLL_FACTOR), kinds, alphanum_starts_larger_than_1, cur_keyword_starts);
-            return @select(u8, unmovemask64(predicate_mask), @as(@Vector(64, u8), @splat(expandable[0])), fallback);
-        } else if (@TypeOf(expandable) == @Vector(2, u8)) {
-            // pdep(matched, alphanum_starts_larger_than_1);
-            // kinds = @select(u8, unmovemask64(comment_starts), @as(@Vector(64, u8), @splat(@intFromEnum(Tag.@"\\\\"))), kinds);
-            // kinds = expandShort(std.simd.extract(~kw_table_indices, 0, UNROLL_FACTOR), kinds, alphanum_starts_larger_than_1, cur_keyword_starts);
-
-            var ans = @select(u8, unmovemask64(predicate_mask & pos_mask & (~pos_mask +% 1)), @as(@Vector(64, u8), @splat(expandable[0])), fallback);
-            ans = @select(u8, unmovemask64(predicate_mask & (predicate_mask -% 1)), @as(@Vector(64, u8), @splat(expandable[1])), fallback);
-            return ans;
-        }
+    fn expand(expandable: anytype, fallback: @Vector(64, u8), pos_mask: u64) @Vector(64, u8) {
+        //if (@TypeOf(expandable) == @Vector(1, u8)) {
+        //    return @select(u8, unmovemask64(predicate_mask), @as(@Vector(64, u8), @splat(expandable[0])), fallback);
+        //} else if (@TypeOf(expandable) == @Vector(2, u8)) {
+        //    var ans = @select(u8, unmovemask64(predicate_mask & pos_mask & (~pos_mask +% 1)), @as(@Vector(64, u8), @splat(expandable[0])), fallback);
+        //    ans = @select(u8, unmovemask64(predicate_mask & (predicate_mask -% 1)), @as(@Vector(64, u8), @splat(expandable[1])), fallback);
+        //    return ans;
+        //}
+        // return @select(u8, unmovemask64(predicate_mask), @as(@Vector(64, u8), @bitCast(buffer)), fallback);
 
         if (@typeInfo(@TypeOf(expandable)).vector.child != u8) @compileError("`expandable` only works on u8's for now.");
-        if (@typeInfo(@TypeOf(expandable)).vector.len > 16) @compileError("`expandable` is too large for the alternative implementations to handle. You are going to need more than one vpshufb per iteration.");
 
-        var buffer: [64]u8 = undefined;
         if (!@inComptime() and comptime std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vbmi2)) {
-            const expandable_vec = std.simd.join(expandable, @as(@Vector(64 - @typeInfo(@TypeOf(expandable)).vector.len, u8), @splat(0)));
-            buffer = struct {
+            return struct {
                 extern fn @"llvm.x86.avx512.mask.expand.b"(@Vector(64, u8), @Vector(64, u8), u64) @Vector(64, u8);
-            }.@"llvm.x86.avx512.mask.expand.b"(expandable_vec, @splat(0), pos_mask);
+            }.@"llvm.x86.avx512.mask.expand.b"(padWithUndefineds(@Vector(64, u8), expandable), fallback, pos_mask);
         } else if (HAS_FAST_PDEP_AND_PEXT) {
-            buffer = [_]u8{0} ** 64;
-            const expandable_vec = std.simd.join(expandable, @as(@Vector(16 - @typeInfo(@TypeOf(expandable)).vector.len, u8), @splat(0)));
+            var indices_arr: [4]@Vector(16, u8) = undefined;
 
-            inline for (0..4) |i| {
-                buffer[i * 16 ..][0..16].* =
-                    vpshufb(expandable_vec, expand8xu8To16xu4AsByteVector(@bitCast(pdep(pos_mask >> (i * 16), 0x1111111111111111) *% 0x1111111111111110)) + @as(@Vector(16, u8), @splat(@popCount(@as(std.meta.Int(.unsigned, i * 16), @truncate(pos_mask))))));
+            inline for (&indices_arr, 0..) |*indices_slot, i| {
+                indices_slot.* =
+                    expand8xu8To16xu4AsByteVector(@bitCast(pdep(pos_mask >> (i * 16), 0x1111111111111111) *% 0x1111111111111110)) + @as(@Vector(16, u8), @splat(@popCount(@as(std.meta.Int(.unsigned, i * 16), @truncate(pos_mask)))));
             }
 
-            // std.debug.print("{d: >2} | buffer\n", .{buffer});
-            // printb(pos_mask, "mask");
-        }
+            const indices: @Vector(64, u8) = @bitCast(indices_arr);
 
-        return @select(u8, unmovemask64(predicate_mask), @as(@Vector(64, u8), @bitCast(buffer)), fallback);
+            return shuffle(padWithUndefineds(@Vector(16, u8), expandable), indices);
+
+            //inline for (0..4) |i| {
+            //    // shuffle(table: anytype, indices: anytype)
+            //    const raw_indices =
+            //
+            //
+            //    if (iters == 1) {
+            //        buffer[i * 16 ..][0..16].* = vpshufb(std.simd.extract(expandable_vec, 0, 16), raw_indices);
+            //    } else {
+            //        var result: @TypeOf(vpshufb(expandable_vec, raw_indices)) = undefined;
+            //        inline for (0..@min(i + 1, iters)) |j| {
+            //            result |= vpshufb(expandable_vec, raw_indices -% @as(@Vector(16, u8), @splat(j * 0x10)) +| @as(@Vector(16, u8), @splat(0x70)));
+            //        }
+            //
+            //        buffer[i * 16 ..][0..16].* = result;
+            //    }
+            //}
+        } else {
+            unreachable;
+        }
     }
 
     fn tokenizeWithCompressEmpty(gpa: Allocator, source: [:0]align(CHUNK_ALIGNMENT) const u8) ![]Token {
@@ -2891,6 +2992,52 @@ const Parser = struct {
         }
 
         return tokens;
+    }
+
+    // Worst-case chunk: "if if if if if if if if if if if if if if if if if if if if if 1"
+    const MAX_KEYWORDS_IN_CHUNK = 64 / "if ".len;
+
+    fn unset_lowest_set_bits(x: u64, comptime amt: comptime_int) u64 {
+        if (amt < 3) {
+            var y = x;
+            inline for (0..amt) |_| y &= y -% 1;
+            return y;
+        } else {
+            // Theoretically, everything above the lower `MAX_KEYWORDS_IN_CHUNK` bits could safely be marked as undefined, and the compiler might theoretically
+            // be able to reuse a pre-existing constant that matches the lower `MAX_KEYWORDS_IN_CHUNK` bits. However, Zig currently does not pass this information to the backend, and it wouldn't matter
+            // anyway since I believe LLVM does not attempt to do this sort of optimization (constant re-use was not a big priority for LLVM for a long time).
+            // One day, a compiler will be capable of such an optimization. Mark my words!
+            const BOTTOM_BITS_UNSET = ((@as(u64, 1) << MAX_KEYWORDS_IN_CHUNK) -% 1) >> amt << amt;
+            return pdep(BOTTOM_BITS_UNSET, x);
+        }
+    }
+
+    fn distribute_matched_bits(matched: u64, x: u64, comptime max_popcnt: comptime_int) u64 {
+        if (max_popcnt == 1) {
+            return if (matched == 0) 0 else x & (~x +% 1);
+        }
+        //else if (max_popcnt == 2) {
+        //    // LLVM does not understand that I want cmov instructions...
+        //    // TODO: file an issue for this, if we can figure out how to reproduce the non-cmov impl out of context
+        //    //const y = x & (x -% 1);
+        //    //return disjoint_or(if ((matched & 1) == 0) 0 else x & (~x +% 1), if ((matched & 2) == 0) 0 else y & (~y +% 1));
+        //}
+        else return pdep(matched, x);
+    }
+
+    const GATHER_NUM_ELEMENTS_TO_LOAD = 8;
+    const GATHER_ELEMENT = u64;
+
+    fn gather(ptrs: @Vector(GATHER_NUM_ELEMENTS_TO_LOAD, *GATHER_ELEMENT), mask: std.meta.Int(.unsigned, GATHER_NUM_ELEMENTS_TO_LOAD)) @Vector(GATHER_NUM_ELEMENTS_TO_LOAD, GATHER_ELEMENT) {
+        return struct {
+            extern fn @"llvm.masked.gather"(@Vector(GATHER_NUM_ELEMENTS_TO_LOAD, *GATHER_ELEMENT), u32, @Vector(GATHER_NUM_ELEMENTS_TO_LOAD, u1), @Vector(GATHER_NUM_ELEMENTS_TO_LOAD, GATHER_ELEMENT)) callconv(.Unspecified) @Vector(GATHER_NUM_ELEMENTS_TO_LOAD, GATHER_ELEMENT);
+        }.@"llvm.masked.gather"(ptrs, @alignOf(@TypeOf(ptrs)), @bitCast(mask), @splat(0));
+    }
+
+    fn gatherAll(ptrs: @Vector(GATHER_NUM_ELEMENTS_TO_LOAD, *GATHER_ELEMENT)) @Vector(GATHER_NUM_ELEMENTS_TO_LOAD, GATHER_ELEMENT) {
+        return struct {
+            extern fn @"llvm.masked.gather"(@Vector(GATHER_NUM_ELEMENTS_TO_LOAD, *GATHER_ELEMENT), u32, @Vector(GATHER_NUM_ELEMENTS_TO_LOAD, u1), @Vector(GATHER_NUM_ELEMENTS_TO_LOAD, GATHER_ELEMENT)) callconv(.Unspecified) @Vector(GATHER_NUM_ELEMENTS_TO_LOAD, GATHER_ELEMENT);
+        }.@"llvm.masked.gather"(ptrs, @alignOf(@TypeOf(ptrs)), @splat(1), @splat(0));
     }
 
     // Max throughput on my machine is about 11 GB/s, meaning it will take 5.38ms to tokenize everything on my machine. That's about .
@@ -2977,8 +3124,6 @@ const Parser = struct {
         var quote_unescaper: QuoteUnescaper = .{};
         var multi_char_symbol_parser: Operators.MultiCharSymbolParser = .{};
 
-        // Because we have so many loop-carried variables, we stuff them all into a here.
-        // We think we use this to make sure we don't use a ridiculous number of registers.
         var carry: struct {
             slashes: u64 = 0,
             backslashes: u64 = 0,
@@ -2991,10 +3136,10 @@ const Parser = struct {
             carriages: u64 = 0,
             ats: u64 = 0,
 
-            _: u54 = 0,
+            // _: u54 = 0,
 
             fn print(self: @This()) void {
-                if (builtin.mode == .Debug)
+                if (comptime builtin.mode == .Debug)
                     std.debug.print("slashes: {}, backslashes: {}, non_newlines: {}, unescaped_quotes: {}, unescaped_apostrophes: {}, comment_starts: {}, line_string_starts: {}, inside_strings_and_comments: {}, carriages: {}, ats: {}\n", .{
                         self.slashes,
                         self.backslashes,
@@ -3027,6 +3172,10 @@ const Parser = struct {
                 });
             }
 
+            fn get(self: *const @This(), comptime field: std.meta.FieldEnum(GetArgsStruct())) u64 {
+                return @field(self, @tagName(field));
+            }
+
             // Takes the top bit of each bitstring passed in as a u64.
             // Reduces visual clutter at the call site.
             fn updateViaTopBits(self: *@This(), in: GetArgsStruct()) void {
@@ -3044,15 +3193,108 @@ const Parser = struct {
 
         // \\if conste pub defer break try catch var for if if ..............................................................................
 
+        // if (comptime builtin.mode == .Debug) {
+        //     const str =
+        //         \\  comptime  var  "/'"  ++  if
+        //         \\  ++// good
+        //         \\ "me"  // m
+        //         \\
+        //         \\  //m
+        //         \\
+        //         \\  // m
+        //         \\  ++
+        //         \\ e  // soup
+        //         \\
+        //         \\
+        //         \\"\\\"\\; //\"'\\\"\"\\\"///'\"  \\ \"\\\"\\"; "'\\"
+        //         \\
+        //         \\//=///' %" "\\\"\\";
+        //         \\
+        //         \\//"'\\""\\"///'" +$ "\\\"\\";//"'\\""\\"
+        //         \\/
+        //     ;
+        //     @constCast(source.ptr)[0..str.len].* = str.*;
+        // }
+
+        // if (comptime builtin.mode == .Debug) {
+        //     const str =
+        //         \\ "" // hello
+        //     ++ " " ++
+        //         \\
+        //         \\
+        //         \\
+        //         \\ // hello
+        //         \\  comptime  var  "/'"  ++  if
+        //         \\  ++// good
+        //         \\ "me"  // m
+        //         \\
+        //         \\  //m
+        //         \\
+        //         \\  // m
+        //         \\  ++
+        //         \\ e  // soup
+        //         \\
+        //         \\
+        //         \\"\\\"\\; //\"'\\\"\"\\\"///'\"  \\ \"\\\"\\"; "'\\"
+        //         \\
+        //         \\//=///' %" "\\\"\\";
+        //         \\
+        //         \\//"'\\""\\"///'" +$ "\\\"\\";//"'\\""\\"
+        //         \\/
+        //     ;
+        //     @constCast(source.ptr)[0..str.len].* = str.*;
+        // }
+
+        // if (comptime builtin.mode == .Debug) {
+        //     const str =
+        //         \\ "" // hello
+        //     ++ " " ++
+        //         \\
+        //         \\
+        //         \\
+        //         \\ // hello
+        //         \\  comptime  var // hello
+        //         \\
+        //         \\
+        //         \\ "/'"  ++  if
+        //         \\  ++// good
+        //         \\ "me"  // m
+        //         \\
+        //         \\  //m
+        //         \\
+        //         \\  // m
+        //         \\  ++
+        //         \\ e  // soup
+        //         \\
+        //         \\
+        //         \\"\\\"\\; //\"'\\\"\"\\\"///'\"  \\ \"\\\"\\"; "'\\"
+        //         \\
+        //         \\//=///' %" "\\\"\\";
+        //         \\
+        //         \\//"'\\""\\"///'" +$ "\\\"\\";//"'\\""\\"
+        //         \\/
+        //     ;
+        //     @constCast(source.ptr)[0..str.len].* = str.*;
+        // }
+
         if (comptime builtin.mode == .Debug) {
             const str =
+                // \\var prefix_sums = comptime std.simd.shiftElementsRight(std.simd.
+                // zig fmt: off
                 \\  comptime  var  "/'"  ++  if
                 \\  ++// good
                 \\ "me"  // m
                 \\
-                \\  //m
                 \\
-                \\  // m
+                \\
+                \\
+                \\
+                \\
+                \\
+                \\  +
+                \\
+                \\
+                \\ // m
                 \\  ++
                 \\ e  // soup
                 \\
@@ -3064,6 +3306,7 @@ const Parser = struct {
                 \\//"'\\""\\"///'" +$ "\\\"\\";//"'\\""\\"
                 \\/
             ;
+            // zig fmt: on
             @constCast(source.ptr)[0..str.len].* = str.*;
         }
 
@@ -3071,7 +3314,6 @@ const Parser = struct {
         var carried_start: usize = 0;
 
         // TODO vv
-
         // Preserve //! and /// comments. "////" counts as a regular comment
         // Merge // comments and whitespace together.
         // Merge operators and keywords with nearby whitespace and // comments.
@@ -3084,6 +3326,11 @@ const Parser = struct {
 
         while (true) {
             const chunk: @Vector(64, u8) = chunk_ptr[0..64].*;
+            // Tell our cache to evict the chunk next time room is needed
+            // We can do this because we do not need to access data from this chunk again.
+            // This helps us not clutter up the cache unnecessarily.
+            @prefetch(chunk_ptr[0..64], .{ .locality = 0 });
+
             // std.debug.print("NEW CHUNK NEW CHUNK NEW CHUNK  NEW CHUNK  NEW CHUNK  NEW CHUNK  NEW CHUNK NEW CHUNK\n", .{});
             printStr(@as([64]u8, @bitCast(chunk))[0..64]);
             // for (0..64) |i| {
@@ -3100,7 +3347,6 @@ const Parser = struct {
             const slashes: u64 = @bitCast(chunk == @as(V, @splat('/')));
             const quotes: u64 = @bitCast(chunk == @as(V, @splat('"')));
             const apostrophes: u64 = @bitCast(chunk == @as(V, @splat('\'')));
-
             const spaces: uword = @bitCast(chunk == @as(V, @splat(' ')));
             var whitespace = newlines | carriages | tabs | spaces;
 
@@ -3110,105 +3356,147 @@ const Parser = struct {
                 bad |= @bitCast(chunk == @as(V, @splat('\x7F')));
 
                 // '\r' is only valid when there is a '\n' immediately after.
-                bad |= non_newlines & ((carriages << 1) | carry.carriages);
+                bad |= non_newlines & ((carriages << 1) | carry.get(.carriages));
 
-                if (bad != 0) {
-                    @branchHint(.cold);
-                    printb(bad, "bad");
-                    return error.BadCharacter;
-                }
+                // if (bad != 0) {
+                //     @branchHint(.cold);
+                //     printb(bad, "bad");
+                //     return error.BadCharacter;
+                // }
             }
 
-            var comment_starts = slashes & ((slashes >> 1) | carry.slashes);
-            var line_string_starts = backslashes & ((backslashes >> 1) | carry.backslashes);
+            // We intentionally shift right here (i.e. backwards in the source file) because
+            // we want these to start on the first character instead of the second.
+            var comment_starts = slashes & ((slashes >> 1) | carry.get(.slashes));
+            const line_string_starts = backslashes & ((backslashes >> 1) | carry.get(.backslashes));
 
             const escaped_backslashes = quote_unescaper.getEscapedBackslashes(backslashes);
             var unescaped_quotes = quotes & ~escaped_backslashes;
             var unescaped_apostrophes = apostrophes & ~escaped_backslashes;
 
-            comment_starts |= carry.comment_starts;
-            line_string_starts |= carry.line_string_starts;
-            unescaped_quotes |= carry.unescaped_quotes;
-            unescaped_apostrophes |= carry.unescaped_apostrophes;
+            // comment_starts |= carry.get(.comment_starts);
+            assert((comment_starts | carry.get(.comment_starts)) == comment_starts);
+            // line_string_starts |= carry.get(.line_string_starts);
+            assert((line_string_starts | carry.get(.line_string_starts)) == line_string_starts);
+
+            unescaped_quotes |= carry.get(.unescaped_quotes);
+            unescaped_apostrophes |= carry.get(.unescaped_apostrophes);
 
             // Figure out which characters are inside a quote, comment, line-string, or, to a lesser extent, a character literal.
             // The fundamental problem is that any of these could be arbitrarily nested inside of each other, meaning that a
             // 100% parallel tokenize is probably not going to be developed.
             // We could, however, operate in parallel on comments+line-strings because they both end on a '\n' (using pext & pdep).
 
-            const comment_or_line_string_starts = comment_starts | line_string_starts;
+            // Algorithm: Create an `iter` bitstring that has 1 bits as cursors at the first non-newline in each group of non-newlines (henceforth called a "line")
+            // Take the OR of all the starting positions of { quotes, apostrophes, comments, line_strings }, call it `all_ored`
+            // For each bit in OR, let it heat-seek/advance to the next bit in `all_ored` which comes after its position, stopping at newlines too.
+            // This will gives us a bitstring that tells us, for each line, where the first comment/quote/char-literal/line-string begins.
+            // Then we want to advance to the end of whatever we found in each position. If we found a string, we should stop at the next quote
+            // character. If we found a character literal, we stop at this next apostrophe. Everything else, of course, stops at a newline, and it
+            // is an error if the quotes/apostrophes terminate at a newline.
+            // To accomplish this, we replace the bits from the starting position to the end of the line with whatever we hoped to find.
+            // Then we advance the cursors forward, hopefully matching the right characters, hitting newlines otherwise.
+            // By tracking all of our starting and ending positions, we have computed which pieces are nested within each other.
+            // E.g.              `"// is this a comment?"` would result in:
+            //       all_starts:  1......................
+            //         all_ends:  ......................1
+            // With this information, we can tell that `// is this a comment?` is, in fact, not a comment.
+            // Note: We do not throw an error for a quote or character literal that is missing a terminator. That should happen in Sema.zig
+            // Note: We assume there is a newline at the end of the file.
 
-            var iter = non_newlines & ~(non_newlines << 1); // | carry.non_newline
-            const all_ored = unescaped_quotes | unescaped_apostrophes | comment_or_line_string_starts;
+            var iter = non_newlines & ~(non_newlines << 1);
+            const all_ored = unescaped_quotes | unescaped_apostrophes | comment_starts | line_string_starts;
             var all_starts: uword = 0;
             var all_ends: uword = 0;
 
             while (true) {
                 inline for (0..1) |_| {
+                    // Advance each cursor in `iter` to next 1 bit in `all_ored | newlines`, but don't count `newlines` as a valid start
                     const starts = (all_ored & ~((all_ored | newlines) -% iter));
                     all_starts |= starts;
 
                     // From each bit in `starts` to the next newline, fold in the pieces of the target bitstring
                     // that contains the end-characters we want to match against.
                     // E.g. "...\n
-                    //       ^^^ put the characters from the `unescaped_quotes` bitstring in there
+                    //      ^ we start a quote here
+                    // E.g. "...\n
+                    //       ^^^ so we put the characters from the `unescaped_quotes` bitstring in there
                     var interleaved = newlines;
                     inline for (.{ unescaped_quotes, unescaped_apostrophes }) |unescaped| {
                         interleaved |= (unescaped & ~(newlines -% andn(starts, unescaped)));
                         // interleaved |= unescaped & (newlines -% ((starts & unescaped) << 1));
                     }
 
+                    // Move `starts` forward by one, then advance cursor within interleaved bitstring
                     const cur_ends = interleaved & ~(interleaved -% (starts << 1));
                     all_ends |= cur_ends;
+
+                    // Move each bit in 'iter' forward by 1, but if we ended on a newline, delete that bit.
                     iter = (cur_ends & non_newlines) << 1;
                 }
+
                 if (iter == 0) {
                     @branchHint(.likely);
                     break;
                 }
             }
 
-            var kinds: @Vector(64, u8) = @splat(0);
+            // Later, we need this information preserved because we combine comments and whitespace with adjacent tokens where the length doesn't matter.
             comment_starts &= all_starts;
-            kinds = @select(u8, unmovemask64(comment_starts), @as(@Vector(64, u8), @splat(@intFromEnum(Tag.@"\\\\"))), kinds);
-            kinds = @select(u8, unmovemask64(unescaped_quotes & all_starts), @as(@Vector(64, u8), @splat(@intFromEnum(Tag.string))), kinds);
-            kinds = @select(u8, unmovemask64(unescaped_apostrophes & all_starts), @as(@Vector(64, u8), @splat(@intFromEnum(Tag.char_literal))), kinds);
-            kinds = @select(u8, unmovemask64(line_string_starts & all_starts), @as(@Vector(64, u8), @splat(@intFromEnum(Tag.@"\\\\"))), kinds);
 
-            // Find out which characters are inside a string or comment
+            // This is a vector that holds the `kind` of each token
+            var kinds: @Vector(64, u8) = @splat(0);
+
+            inline for ([_]struct { uword, Tag }{
+                // For each (mask, tag) pair, insert the tag into the starting positions in the mask into `kinds`
+                .{ comment_starts, .@"//" },
+                .{ unescaped_quotes, .string },
+                .{ unescaped_apostrophes, .char_literal },
+                .{ line_string_starts, .@"\\\\" },
+            }) |mask_and_tag| {
+                const mask, const tag = mask_and_tag;
+                kinds = @select(u8, unmovemask64(mask & all_starts), @as(@Vector(64, u8), @splat(@intFromEnum(tag))), kinds);
+            }
+
+            // Find out which characters are inside a string/char-literal/comment
             const inside_strings_and_comments = all_ends -% all_starts;
 
             // Zero out the chunk data inside strings and comments
             const contextless_chunk = @select(u8, unmovemask64(inside_strings_and_comments), @as(V, @splat(0)), chunk);
             whitespace &= ~inside_strings_and_comments;
 
+            // Match unambiguously single-char characters using a special version of *Vectorized Classification*
+            // https://validark.github.io/posts/eine-kleine-vectorized-classification/
             comptime var single_char_ops_high_nibble_given_low: @Vector(16, u8) = @splat(0);
             inline for (Operators.single_char_ops) |c| single_char_ops_high_nibble_given_low[c & 0xF] |= 1 << (c >> 4);
             comptime var powers_of_2_up_to_128: [16]u8 = undefined;
             inline for (&powers_of_2_up_to_128, 0..) |*slot, i| slot.* = if (i < 8) @as(u8, 1) << i else 0;
-
             const upper_nibbles = vpshufb(powers_of_2_up_to_128, contextless_chunk >> @splat(4));
+            // We can now do *Vectorized Classification* with just `vptest(upper_nibbles, vpshufb(your_lookup_table, contextless_chunk))`
+
             const standalone_symbols = vptest(upper_nibbles, vpshufb(single_char_ops_high_nibble_given_low, contextless_chunk));
 
-            comptime var alpha_ops_high_nibble_given_low: @Vector(16, u8) = @splat(0);
-            inline for (0..128) |c| {
-                switch (c) {
-                    'a'...'z', 'A'...'Z' => alpha_ops_high_nibble_given_low[c & 0xF] |= 1 << (c >> 4),
-                    else => {},
-                }
-            }
-
-            const alpha = if (!USE_ALPHA_SHUFFLE)
-                (@as(u64, @bitCast(@as(V, @splat('a')) <= contextless_chunk)) & @as(u64, @bitCast(contextless_chunk <= @as(V, @splat('z'))))) |
-                    (@as(u64, @bitCast(@as(V, @splat('A')) <= contextless_chunk)) & @as(u64, @bitCast(contextless_chunk <= @as(V, @splat('Z')))))
-            else
-                vptest(upper_nibbles, vpshufb(alpha_ops_high_nibble_given_low, contextless_chunk));
+            const alpha = if (USE_ALPHA_SHUFFLE) blk: {
+                comptime var alpha_ops_high_nibble_given_low: @Vector(16, u8) = @splat(0);
+                comptime for (0..128) |c| {
+                    switch (c) {
+                        'a'...'z', 'A'...'Z' => alpha_ops_high_nibble_given_low[c & 0xF] |= 1 << (c >> 4),
+                        else => {},
+                    }
+                };
+                break :blk vptest(upper_nibbles, vpshufb(alpha_ops_high_nibble_given_low, contextless_chunk));
+            } else (@as(u64, @bitCast(@as(V, @splat('a')) <= contextless_chunk)) & @as(u64, @bitCast(contextless_chunk <= @as(V, @splat('z'))))) |
+                (@as(u64, @bitCast(@as(V, @splat('A')) <= contextless_chunk)) & @as(u64, @bitCast(contextless_chunk <= @as(V, @splat('Z')))));
 
             const number = (@as(u64, @bitCast(@as(V, @splat('0')) <= contextless_chunk)) & @as(u64, @bitCast(contextless_chunk <= @as(V, @splat('9')))));
             const ats: u64 = @bitCast(contextless_chunk == @as(V, @splat('@')));
-            const follows_at = (ats << 1) | carry.ats;
+            all_starts |= ats;
+
+            const follows_at = (ats << 1) | carry.get(.ats);
             const alpha_numeric_underscore: u64 = alpha | number | @as(u64, @bitCast(contextless_chunk == @as(V, @splat('_'))));
-            kinds = @select(u8, unmovemask64((alpha_numeric_underscore >> 1) & ats), @as(@Vector(64, u8), @splat(@intFromEnum(Tag.builtin))), kinds);
+
+            // TODO: make sure that a @ at the end of a chunk can still register as a builtin
+            // kinds = @select(u8, unmovemask64((carry.get(.ats) & alpha_numeric_underscore) | ((alpha_numeric_underscore >> 1) & ats)), @as(@Vector(64, u8), @splat(@intFromEnum(Tag.builtin))), kinds);
 
             // op_type = switch (cur[0]) {
             //     'a'...'z', 'A'...'Z' => .builtin,
@@ -3217,15 +3505,11 @@ const Parser = struct {
             // };
 
             // Don't count identifiers that follow `@`, those are builtins.
-            printb(follows_at, "follows_at");
-            printb(alpha_numeric_underscore << 1, "alpha_numeric_underscore << 1");
-
             const alphanum_starts = alpha_numeric_underscore & ~disjoint_or(follows_at, alpha_numeric_underscore << 1);
-            kinds = @select(u8, unmovemask64(alphanum_starts), @as(@Vector(64, u8), @splat(@intFromEnum(Tag.identifier))), kinds);
-            const alphanum_ends = alpha_numeric_underscore & ~(alpha_numeric_underscore >> 1);
-
-            all_starts |= ats;
             all_starts |= alphanum_starts;
+            kinds = @select(u8, unmovemask64(alphanum_starts), @as(@Vector(64, u8), @splat(@intFromEnum(Tag.identifier))), kinds);
+
+            const alphanum_ends = alpha_numeric_underscore & ~(alpha_numeric_underscore >> 1);
             all_ends |= alphanum_ends;
 
             var single_char_ends, const double_char_ends, const triple_char_ends = multi_char_symbol_parser.getMultiCharEndPositions(contextless_chunk);
@@ -3244,23 +3528,25 @@ const Parser = struct {
             // If our multi-char-symbols started before the chunk
             const multi_char_starts_before_chunk = 1 & (double_char_ends | (triple_char_ends >> 1) | triple_char_ends);
 
-            // TODO: Optimization idea: try a cmov impl that uses -% 1 as a constant because the compiler probably can't see such a thing
-            const carried_end = all_ends & ~(all_ends -% (carry.inside_strings_and_comments | multi_char_starts_before_chunk));
+            // If anything started before the current chunk
+            const token_starts_before_chunk = carry.get(.inside_strings_and_comments) | multi_char_starts_before_chunk;
+
+            // TODO: Optimization idea: try a cmov impl that uses -% 1 as a constant because the compiler probably can't see such a thing.
+            // ~(x -% 1) = -x
+            // Arm has a CNEG instruction that might be useful here
+            const carried_end = all_ends & ~(all_ends -% token_starts_before_chunk);
             // printb(carried_end, "carried_end");
 
-            // Go back 1 if it was a multi-char symbol because this would have been written out already
-            cur_token.ptr = cur_token.ptr - multi_char_starts_before_chunk;
-            cur_token.len = cur_token.len + multi_char_starts_before_chunk;
-
-            const len = @intFromPtr(chunk_ptr) + @ctz(carried_end) -% carried_start;
-            cur_token[0].len = @truncate(len);
-            cur_token[1..][0..2].* = @bitCast(@as(u32, @truncate(len)));
-            cur_token = cur_token[if (carried_end == 0) 0 else if (len == 0) 3 else 1..];
-            all_ends &= ~carried_end;
+            // If we handled any token that started before this chunk, update its length, advancing by two tokens worth if needed.
+            // Otherwise, write out two tokens worth of garbage without updating cur_token so we can overwrite it later.
+            const new_len = @intFromPtr(chunk_ptr) + @ctz(carried_end) -% carried_start;
+            (cur_token.ptr - token_starts_before_chunk)[0].len = if (new_len > std.math.maxInt(u8)) 0 else @truncate(new_len);
+            cur_token[0..2].* = @bitCast(@as(u32, @truncate(new_len)));
+            cur_token = cur_token[if (token_starts_before_chunk != 0 and new_len > std.math.maxInt(u8)) 2 else 0..];
 
             // Remove the fake `start` and the initial `end` if it was a carry-over from a previous chunk
-            // all_ends &= all_ends -% carry.inside_strings_and_comments;
-            all_starts &= all_starts -% carry.inside_strings_and_comments;
+            all_starts &= all_starts -% token_starts_before_chunk;
+            all_ends &= ~carried_end;
 
             // eof                   = 0,
             // sentinel_operator     = 128 | @as(u8, 20),
@@ -3275,7 +3561,7 @@ const Parser = struct {
             // Figure out where the @"" are, and delete the "" start indicator.
             const string_identifier_starts = ((unescaped_quotes & all_starts) >> 1) & ats;
             kinds = @select(u8, unmovemask64(string_identifier_starts), @as(@Vector(64, u8), @splat(@intFromEnum(Tag.string_identifier))), kinds);
-            all_starts ^= unescaped_quotes & all_starts & follows_at;
+            all_starts &= ~(unescaped_quotes & follows_at);
             // printb(unescaped_quotes & all_starts, "unescaped_quotes & all_starts");
             // printb(((unescaped_quotes & all_starts) >> 1), "((unescaped_quotes & all_starts) >> 1)");
             // printb(ats, "ats");
@@ -3283,7 +3569,6 @@ const Parser = struct {
             // printb(all_starts, "all_starts");
             // all_starts |= string_identifier_starts;
 
-            // TODO: move these individual pieces closer to where they are produced.
             // The compiler thinks we have to wait until all_starts is fully completed.
             // However, we don't actually have to, because we can simply delete bits from the
             // compression mask we use at the end to undo the splats we do here.
@@ -3326,6 +3611,7 @@ const Parser = struct {
                 // ..11111111.1..1.
 
                 // Note: there are at most 32 identifiers in a 64-byte chunk.
+                // TODO: make this alpha_starts and omit builtins
                 var alphanum_starts_larger_than_1 = alphanum_starts & ~alphanum_ends;
                 var alphanum_ends_larger_than_1 = alphanum_ends & ~alphanum_starts;
 
@@ -3335,120 +3621,319 @@ const Parser = struct {
                 var start_indices = std.simd.extract(bitsToIndices(alphanum_starts_larger_than_1, 0), 0, 32);
                 var identifier_lens = std.simd.extract(bitsToIndices(alphanum_ends_larger_than_1, 1), 0, 32) -% start_indices;
 
-                // Although we are truncating to u7's, we can keep this in a `@Vector(32, u16)`, and operate on this directly without concentrating
-                // to a @Vector(32, u8).
-                // Normally, we would have to delete the uppermost bit here, but vperm2 does not look at the uppermost bit
+                // A SIMD version of the hash function found in `Keywords.hashKw`
                 const hash: @Vector(32, u8) = @as(@Vector(32, u8), @truncate(((first_two_chars ^ (@as(@Vector(32, u16), identifier_lens) << @splat(14))) *% last_two_chars) >> @splat(8)))
                 // violently break my code if I am wrong about how vperm2 works!
                 | @as(@Vector(32, u8), @splat(if (comptime builtin.mode == .Debug) 0b1000_0000 else 0));
 
-                comptime var t: @Vector(128, u8) = undefined;
-                const BAKED_IN_MUL = 2;
+                var kw_table_indices: @Vector(32, u8) = undefined;
+
+                comptime var dense_mapper_for_kw_table: @Vector(128, u8) = undefined;
                 comptime for (0..128) |i| {
-                    // Address calculation requires a multiply by 16. However, we can't fit that in here because the number of keywords times 16 is higher
-                    // than 256, as the number of keywords is higher than 15.
-                    // However, we can stuff a multiply by 2 in here. The reason is because `lea` can fold a multiply by 2, 4, or 8 into one op.
-                    t[i] = Keywords.mapToIndex(i) * BAKED_IN_MUL;
+                    dense_mapper_for_kw_table[i] = Keywords.mapToIndex(i);
                 };
 
-                // Every other byte has an index in it. The non-index bytes are all 0. We guarantee this property:
-                assert(Keywords.mapToIndex(0) == 0);
+                if (comptime std.Target.x86.featureSetHas(builtin.cpu.features, .avx512bw)) {
+                    // On AVX-512, we can efficiently index all elements in `hash` into a 128-byte table,
+                    // so it doesn't make sense to use a routine that avoids using a vectorized table lookup for everything.
+                    kw_table_indices = vperm2(dense_mapper_for_kw_table, hash);
+                } else {
+                    @setEvalBranchQuota(1000000);
+                    // A version of Phil Bagwell's popcount trick (someone probably invented it before him, but he published HAMT/Array-Mapped Trie stuff).
+                    // We lookup the prefix-sum popcount of `Keywords.masks` with byte granularity using `vpshufb`. Then we do a rank query (popcount up to a position)
+                    // on the last byte to map a sparse address space (u7, i.e. 128 slots) into a compressed table (a keywords table without empty entries)
+                    const byte_masks = comptime @as(@Vector(16, u8), @bitCast(Keywords.masks));
+                    const prefix_sums = comptime std.simd.shiftElementsRight(std.simd.prefixScan(.Add, 1, @as(@Vector(16, u8), @popCount(byte_masks))), 1, 0);
+                    const blsmsks = comptime (@as(@Vector(8, u8), @splat(1)) << std.simd.iota(u8, 8)) - @as(@Vector(8, u8), @splat(1));
 
-                var kw_table_indices = vperm2(t, @bitCast([2]@Vector(32, u8){ hash, undefined }));
+                    const truncated_hash: @Vector(32, u8) = @as(@Vector(32, u7), @truncate(hash));
+                    const which_byte_are_we_on: @Vector(32, u8) = (hash >> @splat(3)) & @as(@Vector(32, u8), @splat(0xF));
 
-                // While we can produce the initial hash value for all identifiers in parallel, we can't map the hashes to indices all at once.
-                // We use Phil Bagwell's popcount trick for that, and we mapped to a `u7`, which means there are 128 possible slots in sparse space which need to be mapped to compressed space.
-                // That requires 64-bit bit-manipulation, so we can only do 8 at a time. However, one would think we wouldn't need more than that in practice.
-                // Who uses more than 8 keywords in a chunk? Nobody, probably.
+                    kw_table_indices = vpshufb(prefix_sums, which_byte_are_we_on) +
+                        @popCount(vpshufb(byte_masks, which_byte_are_we_on) & vpshufb(blsmsks, truncated_hash));
 
-                // Max number of keywords in a 64-byte chunk is 21. Therefore we can could safely unroll the loop 3 times and be done (3 x 8).
-                // "if if if if if if if if if if if if if if if if if if if if if 1"
-                // However, that seems a tad excessive. Let's just leave the loop in the hope that the branch predictor comes in clutch...
+                    assert(std.simd.countTrues(kw_table_indices == vperm2(dense_mapper_for_kw_table, hash)) == 32);
+                }
 
-                // 0000001000000000010001000000000100000000010101100000000000000000 0000010001000101110000000000000000000000000000000000000000000000
+                const KEYWORD_STRAT: enum { perm, perm_skip_hash_concentrate, gather, fully_inlined_gather, one_by_one } = .perm;
 
-                //t[hash >> 4]
+                switch (KEYWORD_STRAT) {
+                    .perm, .perm_skip_hash_concentrate => {
+                        @setEvalBranchQuota(100000);
+                        const super_string_starts, const super_string_lens = comptime switch (KEYWORD_STRAT) {
+                            .perm => std.simd.deinterlace(2, std.simd.join(@as(@Vector(100, u8), @bitCast(Keywords.kw_slices)), @as(@Vector(28, u8), @splat(0)))),
+                            .perm_skip_hash_concentrate => std.simd.deinterlace(2, @as([256]u8, @bitCast(Keywords.kw_slices_raw))),
+                            else => unreachable,
+                        };
 
-                //                const masks_u16: [8]u16 = comptime @bitCast(Keywords.masks);
-                //                const sub_mask_ = (@as(@Vector(32, u16), @splat(1)) << @truncate(hash)) -% @as(@Vector(32, u64), @splat(1));
-                //                const kw_table_indices =
-                //                        @select(u16, hash >= @as(@Vector(32, u16), @splat(16*1)), comptime @as(@Vector(32, u16), @splat(@popCount(masks_u16[0]))), @as(@Vector(32, u16), @splat(0))) +
-                //                        @select(u16, hash >= @as(@Vector(32, u16), @splat(16*2)), comptime @as(@Vector(32, u16), @splat(@popCount(masks_u16[1]))), @as(@Vector(32, u16), @splat(0))) +
-                //                        @select(u16, hash >= @as(@Vector(32, u16), @splat(16*3)), comptime @as(@Vector(32, u16), @splat(@popCount(masks_u16[2]))), @as(@Vector(32, u16), @splat(0))) +
-                //                        @select(u16, hash >= @as(@Vector(32, u16), @splat(16*4)), comptime @as(@Vector(32, u16), @splat(@popCount(masks_u16[3]))), @as(@Vector(32, u16), @splat(0))) +
-                //                        @select(u16, hash >= @as(@Vector(32, u16), @splat(16*5)), comptime @as(@Vector(32, u16), @splat(@popCount(masks_u16[4]))), @as(@Vector(32, u16), @splat(0))) +
-                //                        @select(u16, hash >= @as(@Vector(32, u16), @splat(16*6)), comptime @as(@Vector(32, u16), @splat(@popCount(masks_u16[5]))), @as(@Vector(32, u16), @splat(0))) +
-                //                        @select(u16, hash >= @as(@Vector(32, u16), @splat(16*7)), comptime @as(@Vector(32, u16), @splat(@popCount(masks_u16[6]))), @as(@Vector(32, u16), @splat(0))) +
-                //// 128 vs 32
-                //                        @popCount(sub_mask & @select(u64, hash >= @as(@Vector(32, u16), @splat(64)), comptime @as(@Vector(32, u64), @splat(Keywords.masks[1])), @as(@Vector(32, u64), @splat(Keywords.masks[0]))));
+                        var super_looked_up_starts = switch (KEYWORD_STRAT) {
+                            .perm => vperm(super_string_starts, kw_table_indices),
+                            .perm_skip_hash_concentrate => vperm2(super_string_starts, hash),
+                            else => unreachable,
+                        };
 
-                const UNROLL_FACTOR = 4;
-                const BitHelper = struct {
-                    fn unset_bits(x: u64) u64 {
-                        if (UNROLL_FACTOR < 3) {
-                            var y = x;
-                            inline for (0..UNROLL_FACTOR) |_| y &= y -% 1;
-                            return y;
-                        } else {
-                            // Worst-case chunk: "if if if if if if if if if if if if if if if if if if if if if 1"
-                            const MAX_KEYWORDS_IN_CHUNK = 21;
-                            // Theoretically, everything above the lower `MAX_KEYWORDS_IN_CHUNK` bits could safely be marked as undefined, and the compiler might theoretically
-                            // be able to reuse a pre-existing constant that matches the lower `MAX_KEYWORDS_IN_CHUNK` bits. However, Zig currently does not pass this information to the backend, and it wouldn't matter
-                            // anyway since I believe LLVM does not attempt to do this sort of optimization (constant re-use was not a big priority for LLVM for a long time).
-                            const BOTTOM_BITS_UNSET = ((@as(u64, 1) << MAX_KEYWORDS_IN_CHUNK) -% 1) >> UNROLL_FACTOR << UNROLL_FACTOR;
-                            return pdep(BOTTOM_BITS_UNSET, x);
+                        var super_looked_up_lens = switch (KEYWORD_STRAT) {
+                            .perm => vperm(super_string_lens, kw_table_indices),
+                            .perm_skip_hash_concentrate => vperm2(super_string_lens, hash),
+                            else => unreachable,
+                        };
+
+                        @setEvalBranchQuota(1000000);
+                        var matched1: u8 = undefined;
+                        var matched2: u16 = undefined;
+                        var matched: u32 = undefined;
+
+                        outer: inline for (0..3) |i| {
+                            const starts_group = spreadFirst8Bytes(start_indices);
+                            const lens_group = spreadFirst8Bytes(identifier_lens);
+
+                            const lookup_starts_group = spreadFirst8Bytes(super_looked_up_starts);
+                            const lookup_lens_group = spreadFirst8Bytes(super_looked_up_lens);
+
+                            var cur_matched: u8 = std.math.maxInt(u8);
+
+                            inline for (0..2) |j| {
+                                // 0 1 2 3 4 5 6 7
+                                // 8 9 A B C D E F
+                                const indices = comptime std.simd.repeat(64, std.simd.iota(u8, 8) + @as(@Vector(8, u8), @splat(j * 8)));
+
+                                const keyword_candidates_from_chunk_half = @select(
+                                    u8,
+                                    indices < lens_group,
+                                    vperm(contextless_chunk, starts_group + indices),
+                                    lens_group,
+                                );
+
+                                const keywords_from_table2_half = if (KEYWORD_STRAT == .perm or KEYWORD_STRAT == .perm_skip_hash_concentrate)
+                                    @select(
+                                        u8,
+                                        indices < lookup_lens_group,
+                                        vperm4(comptime Keywords.kw_buffer[0..Keywords.kw_buffer.len].* ++ [1]u8{0} ** (256 - Keywords.kw_buffer.len), lookup_starts_group + indices),
+                                        lookup_lens_group,
+                                    )
+                                else
+                                    gatherAll(@as(@Vector(8, *align(if (j == 0) 16 else 8) u64), @ptrFromInt(
+                                        std.simd.extract(kw_table_indices, i * 8, 8) *
+                                            @as(@Vector(8, usize), @splat(Keywords.PADDING_RIGHT)) +
+                                            @as(@Vector(8, usize), @splat(@intFromPtr(&Keywords.sorted_padded_kws))) +
+                                            @as(@Vector(8, usize), @splat(j * 8)),
+                                    )));
+
+                                cur_matched &= @bitCast(
+                                    @as(@Vector(8, u64), @bitCast(keyword_candidates_from_chunk_half)) ==
+                                        @as(@Vector(8, u64), @bitCast(keywords_from_table2_half)),
+                                );
+
+                                //if (comptime !FULLY_INLINE_GATHER and i == 0 and j == 0) {
+                                //    const ids_that_fit_in_8_bytes = @as(u32, @bitCast(identifier_lens <= @as(@TypeOf(identifier_lens), @splat(8))));
+                                //    if (0 == (~ids_that_fit_in_8_bytes | @intFromBool(@popCount(alphanum_starts_larger_than_1) <= 8))) {
+                                //        @branchHint(.likely);
+                                //        break :outer;
+                                //    }
+                                //}
+                            }
+
+                            if (comptime KEYWORD_STRAT != .fully_inlined_gather and i == 0) {
+                                matched = cur_matched;
+                                if (@popCount(alphanum_starts_larger_than_1) <= 8) {
+                                    @branchHint(.likely);
+                                    break :outer;
+                                }
+                            }
+
+                            switch (i) {
+                                0 => matched1 = cur_matched,
+                                1 => matched2 = @as(u16, @bitCast(std.simd.join(@as(@Vector(8, bool), @bitCast(matched1)), @as(@Vector(8, bool), @bitCast(cur_matched))))),
+                                2 => matched = @as(u32, @bitCast(std.simd.join(@as(@Vector(16, bool), @bitCast(matched2)), std.simd.join(@as(@Vector(8, bool), @bitCast(cur_matched)), @as(@Vector(8, bool), @splat(false)))))),
+                                else => unreachable,
+                            }
+
+                            start_indices = std.simd.shiftElementsLeft(start_indices, 8, 0);
+                            super_looked_up_starts = std.simd.shiftElementsLeft(super_looked_up_starts, 8, 0);
+                            identifier_lens = std.simd.shiftElementsLeft(identifier_lens, 8, 0);
+                            super_looked_up_lens = std.simd.shiftElementsLeft(super_looked_up_lens, 8, 0);
                         }
-                    }
 
-                    fn distribute_matched_bits(matched: u64, x: u64) u64 {
-                        if (UNROLL_FACTOR == 1) {
-                            return if (matched == 0) 0 else x & (~x +% 1);
-                        } else if (UNROLL_FACTOR == 2) {
-                            const y = x & (x -% 1);
-                            return disjoint_or(x & (~x +% (matched & 1)), y & (~y +% (matched >> 1)));
+                        //                        const broadcast3 = @as(@Vector(64, u8), @splat(8)) +% broadcast2;
+                        //                        const identifier_groups3 = @shuffle(u8, identifier_lens, undefined, broadcast3);
 
-                            // LLVM does not understand that I want cmov instructions...
-                            //const y = x & (x -% 1);
-                            //return disjoint_or(if ((matched & 1) == 0) 0 else x & (~x +% 1), if ((matched & 2) == 0) 0 else y & (~y +% 1));
-                        } else return pdep(matched, x);
-                    }
-                };
+                        //const BOTTOM_BITS_UNSET = ((@as(u64, 1) << MAX_KEYWORDS_IN_CHUNK) -% 1) >> 8 << 8;
+                        //const bit_unsetter = BOTTOM_BITS_UNSET | ~ids_that_fit_in_8_bytes;
+                        //alphanum_starts_larger_than_1 = pdep(bit_unsetter, alphanum_starts_larger_than_1);
+                        //alphanum_ends_larger_than_1 = pdep(bit_unsetter, alphanum_ends_larger_than_1);
 
-                while (true) {
-                    var matched: u64 = 0;
+                        const cur_keyword_starts = distribute_matched_bits(matched, alphanum_starts_larger_than_1, MAX_KEYWORDS_IN_CHUNK);
+                        all_keyword_starts |= cur_keyword_starts;
+                        all_keyword_ends |= distribute_matched_bits(matched, alphanum_ends_larger_than_1, MAX_KEYWORDS_IN_CHUNK);
 
-                    inline for (0..UNROLL_FACTOR) |i| {
-                        assert(@typeInfo(@TypeOf(&Keywords.sorted_padded_kws)).pointer.alignment == Keywords.PADDING_RIGHT);
+                        const keyword_kinds = @select(u8, unmovemask32(matched), ~kw_table_indices, @as(@Vector(32, u8), @splat(@intFromEnum(Tag.identifier))));
+                        kinds = expand(keyword_kinds, kinds, alphanum_starts_larger_than_1);
 
-                        const vec1 = @as(*@Vector(Keywords.PADDING_RIGHT, u8), @ptrFromInt(@intFromPtr(&Keywords.sorted_padded_kws) + kw_table_indices[i] * (Keywords.PADDING_RIGHT / BAKED_IN_MUL))).*; // aligned load
+                        // Get ready for the next iteration, if there needs to be one
+                        //alphanum_starts_larger_than_1 = unset_lowest_set_bits(alphanum_starts_larger_than_1, UNROLL_FACTOR);
+                        //alphanum_ends_larger_than_1 = unset_lowest_set_bits(alphanum_ends_larger_than_1, UNROLL_FACTOR);
+                        //kw_table_indices = std.simd.shiftElementsLeft(kw_table_indices, UNROLL_FACTOR, undefined);
+                        //start_indices = std.simd.shiftElementsLeft(start_indices, UNROLL_FACTOR, undefined);
+                        //identifier_lens = std.simd.shiftElementsLeft(identifier_lens, UNROLL_FACTOR, undefined);
 
-                        const vec2: @Vector(Keywords.PADDING_RIGHT, u8) = chunk_ptr[start_indices[i]..][0..Keywords.PADDING_RIGHT].*; // unaligned load
-                        const len_vec: @TypeOf(vec2) = @splat(identifier_lens[i]);
-                        const cd = @select(u8, len_vec > std.simd.iota(u8, Keywords.PADDING_RIGHT), vec2, len_vec);
+                    },
+                    .gather, .fully_inlined_gather => {
+                        @setEvalBranchQuota(100000);
+                        var matched1: u8 = undefined;
+                        var matched2: u16 = undefined;
+                        var matched: u32 = undefined;
 
-                        matched = disjoint_or(matched, @as(u64, @intFromBool(std.simd.countTrues(cd != vec1) == 0)) << i);
-                    }
+                        outer: inline for (0..3) |i| {
+                            const broadcast = @as(@Vector(64, u8), @splat(i * 8)) +% (std.simd.iota(u8, 64) >> @splat(3));
+                            const lens_group = @shuffle(u8, identifier_lens, undefined, broadcast);
+                            var cur_matched: u8 = std.math.maxInt(u8);
 
-                    const cur_keyword_starts = BitHelper.distribute_matched_bits(matched, alphanum_starts_larger_than_1);
-                    //const cur_keyword_starts = pdep(matched, alphanum_starts_larger_than_1);
-                    all_keyword_starts |= cur_keyword_starts;
-                    all_keyword_ends |= pdep(matched, alphanum_ends_larger_than_1);
-                    // std.debug.print("{any}\n", .{@as([64]Tag, @bitCast(kinds))});
-                    kinds = expandShort(std.simd.extract(~kw_table_indices, 0, UNROLL_FACTOR), kinds, alphanum_starts_larger_than_1, cur_keyword_starts);
-                    // std.debug.print("{any}\n", .{@as([64]Tag, @bitCast(kinds))});
+                            inline for (0..2) |j| {
+                                const indices = comptime std.simd.repeat(64, std.simd.iota(u8, 8) + @as(@Vector(8, u8), @splat(j * 8)));
 
-                    if (UNROLL_FACTOR == 21) break;
+                                const keyword_candidates_from_chunk_half = @select(
+                                    u8,
+                                    lens_group > indices,
+                                    vperm(contextless_chunk, @shuffle(u8, start_indices, undefined, broadcast) + indices),
+                                    lens_group,
+                                );
 
-                    alphanum_starts_larger_than_1 = BitHelper.unset_bits(alphanum_starts_larger_than_1);
-                    alphanum_ends_larger_than_1 = BitHelper.unset_bits(alphanum_ends_larger_than_1);
-                    kw_table_indices = std.simd.shiftElementsLeft(kw_table_indices, UNROLL_FACTOR, undefined);
-                    start_indices = std.simd.shiftElementsLeft(start_indices, UNROLL_FACTOR, undefined);
-                    identifier_lens = std.simd.shiftElementsLeft(identifier_lens, UNROLL_FACTOR, undefined);
+                                const table_ptrs2_half: @Vector(8, *align(if (j == 0) 16 else 8) u64) = @ptrFromInt(
+                                    std.simd.extract(kw_table_indices, i * 8, 8) *
+                                        @as(@Vector(8, usize), @splat(Keywords.PADDING_RIGHT)) +
+                                        @as(@Vector(8, usize), @splat(@intFromPtr(&Keywords.sorted_padded_kws))) +
+                                        @as(@Vector(8, usize), @splat(j * 8)),
+                                );
 
-                    if (alphanum_starts_larger_than_1 == 0) {
-                        @branchHint(.likely);
-                        break;
-                    }
+                                const keywords_from_table2_half = gatherAll(table_ptrs2_half);
+
+                                cur_matched &= @bitCast(@as(@Vector(8, u64), @bitCast(keyword_candidates_from_chunk_half)) ==
+                                    @as(@Vector(8, u64), @bitCast(keywords_from_table2_half)));
+
+                                //if (comptime !FULLY_INLINE_GATHER and i == 0 and j == 0) {
+                                //    const ids_that_fit_in_8_bytes = @as(u32, @bitCast(identifier_lens <= @as(@TypeOf(identifier_lens), @splat(8))));
+                                //    if (0 == (~ids_that_fit_in_8_bytes | @intFromBool(@popCount(alphanum_starts_larger_than_1) <= 8))) {
+                                //        @branchHint(.likely);
+                                //        break :outer;
+                                //    }
+                                //}
+                            }
+
+                            if (comptime KEYWORD_STRAT != .fully_inlined_gather and i == 0) {
+                                matched = cur_matched;
+                                if (@popCount(alphanum_starts_larger_than_1) <= 8) {
+                                    @branchHint(.likely);
+                                    break :outer;
+                                }
+                            }
+
+                            switch (i) {
+                                0 => matched1 = cur_matched,
+                                1 => matched2 = @as(u16, @bitCast(std.simd.join(@as(@Vector(8, bool), @bitCast(matched1)), @as(@Vector(8, bool), @bitCast(cur_matched))))),
+                                2 => matched = @as(u32, @bitCast(std.simd.join(@as(@Vector(16, bool), @bitCast(matched2)), std.simd.join(@as(@Vector(8, bool), @bitCast(cur_matched)), @as(@Vector(8, bool), @splat(false)))))),
+                                else => unreachable,
+                            }
+                        }
+
+                        //                        const broadcast3 = @as(@Vector(64, u8), @splat(8)) +% broadcast2;
+                        //                        const identifier_groups3 = @shuffle(u8, identifier_lens, undefined, broadcast3);
+
+                        //const BOTTOM_BITS_UNSET = ((@as(u64, 1) << MAX_KEYWORDS_IN_CHUNK) -% 1) >> 8 << 8;
+                        //const bit_unsetter = BOTTOM_BITS_UNSET | ~ids_that_fit_in_8_bytes;
+                        //alphanum_starts_larger_than_1 = pdep(bit_unsetter, alphanum_starts_larger_than_1);
+                        //alphanum_ends_larger_than_1 = pdep(bit_unsetter, alphanum_ends_larger_than_1);
+
+                        const UNROLL_FACTOR = 8;
+
+                        const cur_keyword_starts = distribute_matched_bits(matched, alphanum_starts_larger_than_1, UNROLL_FACTOR);
+                        all_keyword_starts |= cur_keyword_starts;
+                        all_keyword_ends |= distribute_matched_bits(matched, alphanum_ends_larger_than_1, UNROLL_FACTOR);
+
+                        const keyword_kinds = @select(u8, unmovemask32(matched), ~kw_table_indices, @as(@Vector(32, u8), @splat(@intFromEnum(Tag.identifier))));
+                        kinds = expand(keyword_kinds, kinds, alphanum_starts_larger_than_1);
+
+                        // Get ready for the next iteration, if there needs to be one
+                        //alphanum_starts_larger_than_1 = unset_lowest_set_bits(alphanum_starts_larger_than_1, UNROLL_FACTOR);
+                        //alphanum_ends_larger_than_1 = unset_lowest_set_bits(alphanum_ends_larger_than_1, UNROLL_FACTOR);
+                        //kw_table_indices = std.simd.shiftElementsLeft(kw_table_indices, UNROLL_FACTOR, undefined);
+                        //start_indices = std.simd.shiftElementsLeft(start_indices, UNROLL_FACTOR, undefined);
+                        //identifier_lens = std.simd.shiftElementsLeft(identifier_lens, UNROLL_FACTOR, undefined);
+                    },
+                    .one_by_one => {
+                        const UNROLL_FACTOR = 8;
+                        const DO_ADDRESS_CALCULATION_IN_SIMD = false;
+                        const DISALLOW_ACCESSING_CHUNK_MORE_THAN_ONCE = true;
+
+                        while (true) {
+                            @setEvalBranchQuota(10000);
+                            const table_ptrs: @Vector(UNROLL_FACTOR, *@Vector(Keywords.PADDING_RIGHT, u8)) = @ptrFromInt(@as(@Vector(UNROLL_FACTOR, usize), std.simd.extract(kw_table_indices, 0, UNROLL_FACTOR)) * @as(@Vector(UNROLL_FACTOR, usize), @splat(Keywords.PADDING_RIGHT)) + @as(@Vector(UNROLL_FACTOR, usize), @splat(@intFromPtr(&Keywords.sorted_padded_kws))));
+                            const chunk_ptrs: @Vector(UNROLL_FACTOR, *[Keywords.PADDING_RIGHT]u8) = @ptrFromInt(std.simd.extract(start_indices, 0, UNROLL_FACTOR) + @as(@Vector(UNROLL_FACTOR, usize), @splat(@intFromPtr(chunk_ptr))));
+
+                            var matched: u8 = 0;
+                            inline for (0..UNROLL_FACTOR) |i| {
+                                assert(@typeInfo(@TypeOf(&Keywords.sorted_padded_kws)).pointer.alignment == Keywords.PADDING_RIGHT);
+
+                                const vec1 = if (DO_ADDRESS_CALCULATION_IN_SIMD)
+                                    table_ptrs[i].*
+                                else
+                                    @as(*@Vector(Keywords.PADDING_RIGHT, u8), @ptrFromInt(@intFromPtr(&Keywords.sorted_padded_kws) + kw_table_indices[i] * Keywords.PADDING_RIGHT)).*; // aligned load
+
+                                // If anyone sees this, I blame LLVM for the way I had to write this...
+
+                                const cd = if (DISALLOW_ACCESSING_CHUNK_MORE_THAN_ONCE) blk: {
+                                    const len_vec = splat16(std.simd.shiftElementsLeft(std.simd.extract(identifier_lens, 0, UNROLL_FACTOR), i, undefined));
+                                    const mask = @as(u16, @bitCast(len_vec > std.simd.iota(u8, 16)));
+                                    const r = vpermWithFallback(contextless_chunk, std.simd.iota(u8, 64) +% splat(std.simd.shiftElementsLeft(std.simd.extract(start_indices, 0, UNROLL_FACTOR), i, undefined)), padWithUndefineds(@Vector(64, u8), len_vec), mask);
+                                    // https://github.com/llvm/llvm-project/issues/113400
+                                    if (comptime (builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx512bw)))
+                                        asm volatile (""
+                                            :
+                                            : [val] "+x" (r),
+                                        );
+                                    break :blk std.simd.extract(r, 0, 16);
+                                } else blk: {
+                                    const vec2 = if (DISALLOW_ACCESSING_CHUNK_MORE_THAN_ONCE) blk2: {
+                                        // Dead because of https://github.com/llvm/llvm-project/issues/113400
+                                        // std.simd.extract(vperm(contextless_chunk, std.simd.iota(u8, 64) +% @as(@Vector(64, u8), @splat(start_indices[i]))), 0, 16)
+                                        break :blk2 vperm(contextless_chunk, std.simd.iota(u8, 64) +% splat(std.simd.shiftElementsLeft(std.simd.extract(start_indices, 0, UNROLL_FACTOR), i, undefined)));
+                                    } else if (DO_ADDRESS_CALCULATION_IN_SIMD)
+                                        @as(@Vector(Keywords.PADDING_RIGHT, u8), chunk_ptrs[i].*)
+                                    else
+                                        @as(@Vector(Keywords.PADDING_RIGHT, u8), chunk_ptr[start_indices[i]..][0..Keywords.PADDING_RIGHT].*); // unaligned load
+
+                                    // https://github.com/llvm/llvm-project/issues/113396
+                                    //  const len_vec: @TypeOf(vec2) = @splat(identifier_lens[i]);
+                                    const len_vec: @TypeOf(vec2) = splat16(std.simd.shiftElementsLeft(std.simd.extract(identifier_lens, 0, UNROLL_FACTOR), i, undefined));
+                                    break :blk @select(u8, len_vec > std.simd.iota(u8, @sizeOf(@TypeOf(vec2))), vec2, len_vec);
+                                };
+
+                                //matched = disjoint_or(matched, @as(u64, @intFromBool(std.simd.countTrues(std.simd.extract(cd, 0, Keywords.PADDING_RIGHT) != vec1) == 0)) << i);
+                                matched = disjoint_or(matched, @as(@TypeOf(matched), @intFromBool(std.simd.countTrues(cd != vec1) == 0)) << i);
+                            }
+
+                            @prefetch(chunk_ptr, .{ .locality = 0 });
+
+                            const cur_keyword_starts = distribute_matched_bits(matched, alphanum_starts_larger_than_1, UNROLL_FACTOR);
+                            all_keyword_starts |= cur_keyword_starts;
+                            all_keyword_ends |= distribute_matched_bits(matched, alphanum_ends_larger_than_1, UNROLL_FACTOR);
+                            const keyword_kinds = @select(u8, unmovemask32(matched), ~kw_table_indices, @as(@Vector(32, u8), @splat(@intFromEnum(Tag.identifier))));
+                            kinds = expand(keyword_kinds, kinds, alphanum_starts_larger_than_1);
+
+                            if (UNROLL_FACTOR == MAX_KEYWORDS_IN_CHUNK) break;
+
+                            // Get ready for the next iteration, if there needs to be one
+                            alphanum_starts_larger_than_1 = unset_lowest_set_bits(alphanum_starts_larger_than_1, UNROLL_FACTOR);
+                            alphanum_ends_larger_than_1 = unset_lowest_set_bits(alphanum_ends_larger_than_1, UNROLL_FACTOR);
+                            kw_table_indices = std.simd.shiftElementsLeft(kw_table_indices, UNROLL_FACTOR, undefined);
+                            start_indices = std.simd.shiftElementsLeft(start_indices, UNROLL_FACTOR, undefined);
+                            identifier_lens = std.simd.shiftElementsLeft(identifier_lens, UNROLL_FACTOR, undefined);
+
+                            if (alphanum_starts_larger_than_1 == 0) {
+                                @branchHint(.likely);
+                                break;
+                            }
+                        }
+                    },
                 }
             }
 
@@ -3473,9 +3958,13 @@ const Parser = struct {
             // ......1......1..1.......1..1........1....1.......1.......1.....1 ⟵ whitespace_ends
             // 1......1......1..1.......1..1........1....1..................... ⟵ all_starts 2
             {
-                // Step 1. Merge whitespace followed by comments into comments.
+                // printb(whitespace, "whitespace");
                 const whitespace_afters = ~whitespace & (whitespace << 1);
                 const whitespace_starts = whitespace & ~(whitespace << 1);
+                const whitespace_ends = whitespace & ~(whitespace >> 1);
+                const comment_ends = all_ends & ~(all_ends -% comment_starts);
+
+                // Step 1. Merge whitespace followed by comments into comments.
 
                 // @hello "///'" ++ // bad$ ++$// good$$"me" // m$$  // m$$  // m$
                 // .......1......1..1.......1..1........1....1.......1.......1..... ⟵ whitespace_afters
@@ -3490,55 +3979,47 @@ const Parser = struct {
                 // then broadcast to the corresponding position in the earlier set of X bits.
                 // This moves the start of comments further left to include whitespace.
                 // We have to use this trick because the carry in an addition only goes one direction.
-                const left_extended_comment_starts_with_mergables = pdep(pext(comments_extendable_left, whitespace_afters), whitespace_starts);
+                // printb(whitespace_afters, "whitespace_afters");
+                // printb(whitespace_starts, "whitespace_starts");
+                // printb(whitespace_ends, "whitespace_ends");
 
-                // printb(all_starts, "all_starts <>");
-                printb(comments_extendable_left, "comments_extendable_left <>");
-                printb(whitespace_afters, "whitespace_afters <>");
-                printb(whitespace_starts, "whitespace_starts <>");
-                printb(left_extended_comment_starts_with_mergables, "left_extended_comment_starts_with_mergables <>");
+                // TODO: check boundary conditions
+                const left_extended_comment_starts_with_mergables = pdep(pext(comments_extendable_left, whitespace_afters), whitespace_starts);
 
                 // Delete the old comment start positions
                 all_starts_for_len_calc ^= comments_extendable_left;
                 // Merge in the left-shifted comment start positions
                 all_starts_for_len_calc |= left_extended_comment_starts_with_mergables;
 
-                // printb(left_extended_comment_starts_with_mergables, "left_extended_comment_starts_with_mergables");
-                // printb(all_starts_for_len_calc, "all_starts_for_len_calc");
-                const comment_ends = all_ends & ~(all_ends -% comment_starts);
-
                 // Step 2. Merge adjacent comments.
 
-                // Find which comments can be merged together, separated only by whitespace (at least one newline, obviously)
+                // Find which comments can be merged together, separated only by whitespace (whitespace inside of comments are zeroed)
+                //  "" // hello $$$ // hello
+                // ...1.........1.................................................. ⟵ left_extended_comment_starts_with_mergables
+                // .............1...........1...................................... ⟵ comment_ends
+                // .............1.................................................. ⟵ mergable_comments
                 const mergable_comments = left_extended_comment_starts_with_mergables & comment_ends;
-                printb(mergable_comments, "mergable_comments");
-
-                const deletable_comment_start_positions = comments_extendable_left & ~(comments_extendable_left -% mergable_comments);
-                printb(deletable_comment_start_positions, "deletable_comment_start_positions");
-                all_starts ^= deletable_comment_start_positions;
-                const left_extended_comment_starts = (left_extended_comment_starts_with_mergables & ~comment_ends) | comments_not_extendable_left;
                 all_starts_for_len_calc ^= mergable_comments;
                 all_ends_for_len_calc ^= mergable_comments;
 
-                // printb(all_ends, "all_ends");
-                // printb(comment_ends, "comment_ends");
-                // printb(all_starts, "all_starts");
+                //  "" // hello $$$ // hello
+                // ....1............1.............................................. ⟵ comments_extendable_left
+                // .............1.................................................. ⟵ mergable_comments
+                const deletable_comment_start_positions = comments_extendable_left & ~(comments_extendable_left -% mergable_comments);
+                all_starts ^= deletable_comment_start_positions;
 
-                // const whitespace_befores = whitespace_starts;
-                // printb(whitespace_befores, "whitespace_befores");
-                // printb(comment_ends, "comment_ends");
+                // ...1............................................................ ⟵ left_extended_comment_starts
+                const left_extended_comment_starts = (left_extended_comment_starts_with_mergables & ~comment_ends) | comments_not_extendable_left;
 
                 // Step 3. Merge comments followed by whitespace.
-                const whitespace_ends = whitespace & ~(whitespace >> 1);
-                // printb(whitespace_ends, "whitespace_ends");
-                // ........................1.........1............1.......1.....1.. ⟵ right_extended_comment_ends
-                // ........................1.........1..........................1.. ⟵ right_extended_comment_ends
+
+                //  "" // hello $$$ // hello$  comptime  var // hello$$$ "/'"  ++
+                // .............1...........1........................1............. ⟵ comment_ends
+                // ...1.........1...........................1...................... ⟵ left_extended_comment_starts_with_mergables
+                // .........................1........................1............. ⟵ comment_ends & ~left_extended_comment_starts_with_mergables
+                // 1..1............1..........1.........1...1...........1.....1...1 ⟵ whitespace_ends
+                // ...........................1.........................1.......... ⟵ right_extended_comment_ends
                 const right_extended_comment_ends = whitespace_ends & ~(whitespace_ends -% (comment_ends & ~left_extended_comment_starts_with_mergables));
-                printb(comment_ends & ~left_extended_comment_starts_with_mergables, "comment_ends & ~left_extended_comment_starts_with_mergables");
-                printb(left_extended_comment_starts, "left_extended_comment_starts");
-                printb(mergable_comments, "mergable_comments");
-                printb(right_extended_comment_ends, "right_extended_comment_ends");
-                // printb(comment_ends, "comment_ends");
 
                 // Always delete comment_ends, because in the initial phase, comments were said to end at a newline.
                 // `right_extended_comment_ends` will always have the proper end character for all comments.
@@ -3547,96 +4028,61 @@ const Parser = struct {
 
                 // Step 4. Merge whitespace/comments with operators and keywords
 
-                printStr(@as([64]u8, @bitCast(chunk))[0..64]);
-                printb(left_extended_comment_starts | comments_not_extendable_left, "left_extended_comment_starts");
-                printb(right_extended_comment_ends, "right_extended_comment_ends");
-
-                printStr(@as([64]u8, @bitCast(chunk))[0..64]);
-                printb(whitespace_starts, "whitespace_starts");
-                printb(whitespace_ends, "whitespace_ends");
-                printb(whitespace_afters, "whitespace_afters");
-
                 const sym_kw_starts = all_symbol_starts | all_keyword_starts;
                 const sym_kw_ends = all_symbol_ends | all_keyword_ends;
 
-                printb(sym_kw_starts, "sym_kw_starts");
-                printb(sym_kw_ends, "sym_kw_ends");
-
                 // Because comments always end with \n, we kill 2 birds with 1 stone right here.
-                const extendable_sym_kw_starts = whitespace_afters & (sym_kw_starts);
+                const extendable_sym_kw_starts = whitespace_afters & sym_kw_starts;
 
-                printb(extendable_sym_kw_starts, "extendable_sym_kw_starts");
-                printb(left_extended_comment_starts, "left_extended_comment_starts");
-                printb(right_extended_comment_ends, "right_extended_comment_ends");
-                printStr(@as([64]u8, @bitCast(chunk))[0..64]);
                 const inside_extended_comments = (right_extended_comment_ends << 1) -% left_extended_comment_starts;
-                printb(inside_extended_comments, "inside_extended_comments");
-
                 const left_boundaries = (whitespace_starts & ~inside_extended_comments) | left_extended_comment_starts;
 
-                // const inner_left_boundaries = (whitespace_starts & ~inside_extended_comments) | comment_starts;
-                // printb(whitespace_starts, "whitespace_starts");
-                // printb(whitespace_starts & ~((right_extended_comment_ends << 1) -% left_extended_comment_starts), "[][][][][]<><>{}{}");
-                // printb(left_extended_comment_starts_with_mergables, "left_extended_comment_starts_with_mergables");
-                // printb(mergable_comments, "mergable_comments");
-                // printb(whitespace_starts ^ left_extended_comment_starts_with_mergables, "whitespace_starts ^ left_extended_comment_starts_with_mergables");
+                all_ends_for_len_calc &= ~(extendable_sym_kw_starts >> 1);
 
-                // const left_boundaries = (whitespace_starts ^ left_extended_comment_starts_with_mergables) | left_extended_comment_starts;
-                printb(extendable_sym_kw_starts, "extendable_sym_kw_starts");
-                printb(left_boundaries, "left_boundaries");
-                // printb(whitespace_ends | right_extended_comment_ends, "whitespace_ends | right_extended_comment_ends");
-                // const mask = (whitespace_ends | right_extended_comment_ends) & ~inside_extended_comments;
-                // printb(mask, "(whitespace_ends | right_extended_comment_ends) & ~inside_extended_comments");
-                // printb(pext(extendable_sym_kw_starts, (whitespace_ends | right_extended_comment_ends) & ~inside_extended_comments), "pext(extendable_sym_kw_starts, (whitespace_ends | right_extended_comment_ends) & ~inside_extended_comments)");
-                // printb(pdep(pext(extendable_sym_kw_starts, (whitespace_ends | right_extended_comment_ends) & ~inside_extended_comments), left_boundaries), "pdep(pext(extendable_sym_kw_starts, (whitespace_ends | right_extended_comment_ends) & ~inside_extended_comments), left_boundaries)");
-                // printb(comment_ends, "comment_ends");
+                const left_extended_sym_kw_starts_using_bitreverse = andn(left_boundaries, reversedSubtraction(left_boundaries, extendable_sym_kw_starts));
 
-                const left_extended_sym_kw_starts = left_boundaries & ~reversedSubtraction(left_boundaries, extendable_sym_kw_starts);
+                // Because bitReversal is slow on x86, we can extend left by instead extending right, and then shifting the boundary bits left relative to each other.
+                // By "relative" shift I mean `pdep(pext(z, x) >> 1, x)`, where in this case `z` is `x & ~(x -% y)`.
+                // This almost works without modification, however, we need a catcher bit at the end so that a bit in that position won't be discarded.
+                const left_boundaries_with_catcher = left_boundaries | (@as(u64, 1) << 63);
+                const left_extended_sym_kw_starts_using_pdep_n_pext = pdep(pext(andn(left_boundaries_with_catcher, left_boundaries_with_catcher -% extendable_sym_kw_starts), left_boundaries_with_catcher) >> 1, left_boundaries_with_catcher);
+
+                const left_extended_sym_kw_starts = if (HAS_FAST_PDEP_AND_PEXT) left_extended_sym_kw_starts_using_pdep_n_pext else left_extended_sym_kw_starts_using_bitreverse;
+
+                if (comptime builtin.mode == .Debug or builtin.mode == .ReleaseSafe) {
+                    // printb(left_boundaries, "left_boundaries");
+                    // printb(left_boundaries_with_catcher, "left_boundaries_with_catcher");
+                    // printb(extendable_sym_kw_starts, "extendable_sym_kw_starts");
+                    // printb(left_boundaries_with_catcher -% extendable_sym_kw_starts, "left_boundaries_with_catcher -% extendable_sym_kw_starts");
+                    // printb(left_boundaries_with_catcher & ~(left_boundaries_with_catcher -% extendable_sym_kw_starts), "left_boundaries_with_catcher & ~(left_boundaries_with_catcher -% extendable_sym_kw_starts)");
+                    // printb(left_extended_sym_kw_starts_using_bitreverse, "left_extended_sym_kw_starts_using_bitreverse");
+                    // printb(left_extended_sym_kw_starts_using_pdep_n_pext, "left_extended_sym_kw_starts_using_pdep_n_pext");
+                    assert(left_extended_sym_kw_starts_using_bitreverse == left_extended_sym_kw_starts_using_pdep_n_pext);
+                }
+                // printb(left_boundaries, "left_boundaries");
+                // printb(extendable_sym_kw_starts, "extendable_sym_kw_starts");
+                // printb(left_extended_sym_kw_starts, "left_extended_sym_kw_starts");
+
+                // printb(andy(andn(left_boundaries, left_boundaries -% extendable_sym_kw_starts), left_boundaries), "andy(andn(left_boundaries, left_boundaries -% extendable_sym_kw_starts), left_boundaries)");
+                // printb(, "pext(andn(left_boundaries, left_boundaries -% extendable_sym_kw_starts), left_boundaries) >> 1");
                 all_starts_for_len_calc ^= extendable_sym_kw_starts;
                 all_starts_for_len_calc |= left_extended_sym_kw_starts;
 
-                printb(left_extended_sym_kw_starts, "left_extended_sym_kw_starts");
-                printStr(@as([64]u8, @bitCast(chunk))[0..64]);
-                printb(sym_kw_ends, "sym_kw_ends");
-                printb(whitespace_starts, "whitespace_starts");
-                printStr(@as([64]u8, @bitCast(chunk))[0..64]);
                 const extendable_sym_kw_ends = (((whitespace_starts | left_extended_comment_starts) & ~left_extended_sym_kw_starts) >> 1) & sym_kw_ends;
-                printb(whitespace_starts, "whitespace_starts");
-                printb(left_extended_comment_starts, "left_extended_comment_starts");
-                printb(sym_kw_ends << 1, "sym_kw_ends << 1");
-                printb(extendable_sym_kw_ends, "extendable_sym_kw_ends");
-                printb(left_extended_sym_kw_starts, "left_extended_sym_kw_starts");
-                printStr(@as([64]u8, @bitCast(chunk))[0..64]);
-
                 const right_boundaries = right_extended_comment_ends | (whitespace_ends & ~inside_extended_comments);
-                printb(right_boundaries, "right_boundaries");
-                const right_extended_sym_kw_ends = right_boundaries & ~(right_boundaries -% extendable_sym_kw_ends);
-                const consumed_left_boundaries = left_boundaries & ~(left_boundaries -% extendable_sym_kw_ends);
-                printb(consumed_left_boundaries, "consumed_left_boundaries");
-                printb(right_extended_sym_kw_ends, "right_extended_sym_kw_ends");
-                const consumed_comments = comment_starts & ~(comment_starts -% extendable_sym_kw_ends);
+                const right_extended_sym_kw_ends = andn(right_boundaries, right_boundaries -% extendable_sym_kw_ends);
+                const consumed_left_boundaries = andn(left_boundaries, left_boundaries -% extendable_sym_kw_ends);
+                const consumed_comments = comment_starts & (~(comment_starts -% extendable_sym_kw_ends) | left_extended_sym_kw_starts);
 
+                // left_extended_sym_kw_starts & comment_starts;
                 all_starts ^= consumed_comments;
                 all_starts_for_len_calc &= ~consumed_left_boundaries;
 
                 all_ends_for_len_calc ^= extendable_sym_kw_ends;
                 all_ends_for_len_calc |= right_extended_sym_kw_ends;
-
-                // printb(reversedSubtraction(left_boundaries, extendable_sym_kw_starts), "reversedSubtraction(left_boundaries, extendable_sym_kw_starts)");
-                // printb(left_boundaries & ~reversedSubtraction(left_boundaries, extendable_sym_kw_starts), "left_boundaries & ~reversedSubtraction(left_boundaries, extendable_sym_kw_starts)");
-                // printb(whitespace_afters, "whitespace_afters");
-
-                // printb(comments_extendable_left, "comments_extendable_left {.}");
-                // printb(all_ends, "all_ends {.}");
-                // printb(comment_starts, "comment_starts {.}");
-                // printb(all_ends & ~(all_ends -% comment_starts), "all_ends -% comment_starts {.}");
-                // printb(all_starts_for_len_calc, "all_starts_for_len_calc 2");
-                // printb(all_starts, "all_starts 2");
             }
             // const whitespace_starts = whitespace & ~(whitespace << 1);
             // (whitespace +% whitespace_starts) & comment_starts;
-
-            // not considering @"" yet
 
             printStr(@as([64]u8, @bitCast(chunk))[0..64]);
             printb(all_starts_for_len_calc, "all_starts_for_len_calc");
@@ -3644,13 +4090,15 @@ const Parser = struct {
             printb(all_starts, "all_starts");
             const lens = bitsToIndices(all_ends_for_len_calc, 1) -% bitsToIndices(all_starts_for_len_calc, 0);
 
+            // storeNonTemporal(cur_token.ptr, @as([64]Token, @bitCast(std.simd.interlace(.{ lens, compress(kinds, all_starts) }))));
             cur_token[0..64].* = @as([64]Token, @bitCast(std.simd.interlace(.{ lens, compress(kinds, all_starts) })));
             cur_token = cur_token[@popCount(all_starts)..]; // advance by the number of completed tokens
+            @prefetch(cur_token.ptr - 64, .{ .locality = 0 });
 
             carried_start = if (all_starts == 0) carried_start else (@intFromPtr(chunk_ptr) + @as(usize, 62) - @clz(all_starts));
             // 62 is one less than normal because we do a subtraction with this, avoiding adding 1 later.
             // Theoretically, if we were on a platform that allows the zero pointer to be addressable, we can't use this trick.
-            // But in practice, the first page of memory is not addressable on AVX-512-enabled platforms.
+            // But in practice, the first page of memory is not addressable on most platforms.
 
             carry.updateViaTopBits(.{
                 .slashes = slashes,
@@ -3675,26 +4123,58 @@ const Parser = struct {
             }
         }
 
+        // if (@intFromPtr(cur.ptr) < @intFromPtr(end_ptr)) return error.Found0ByteInFile;
+
+        cur_token = cur_token[if (cur_token[0].len == 0) 3 else 1..];
+        cur_token[0] = .{ .len = 1, .kind = .eof };
+        cur_token = cur_token[1..];
+
+        // cur_token[0] = .{ .len = 0, .kind = .eof };
+        // cur_token = cur_token[1..];
+        // cur_token[0] = .{ .len = 0, .kind = .eof };
+        // cur_token = cur_token[1..];
+        // cur_token[0] = .{ .len = 0, .kind = .eof };
+        // cur_token = cur_token[1..];
+
+        // TODO: we do this because of cur_token[0..4].*
+        // Prove at compile-time that 3 cannot be too much for cur_token to hold
         const num_tokens = (@intFromPtr(cur_token.ptr) - @intFromPtr(tokens.ptr)) / @sizeOf(Token);
-        // const new_chunks_data_len = 3 + num_tokens;
 
-        var cursor: []const u8 = source[0..];
-        for (tokens[0..num_tokens]) |token| {
-            const len = token.len;
-            std.debug.print("kind: {s}, len: {}, str: `", .{ @tagName(token.kind), len });
+        if (builtin.mode == .Debug) {
+            var cursor: []const u8 = source[0..];
 
-            for (cursor[0..len]) |c| {
-                switch (c) {
-                    '\n' => std.debug.print("$", .{}),
-                    else => std.debug.print("{c}", .{c}),
+            for (tokens[0..num_tokens]) |token| {
+                const len = token.len;
+                std.debug.print("kind: {s}, len: {}, str: `", .{ @tagName(token.kind), len });
+
+                for (cursor[0..len]) |c| {
+                    switch (c) {
+                        '\n' => std.debug.print("$", .{}),
+                        else => std.debug.print("{c}", .{c}),
+                    }
                 }
-            }
-            std.debug.print("`\n", .{});
+                std.debug.print("`\n", .{});
 
-            cursor = cursor[len..];
+                cursor = cursor[len..];
+            }
+        }
+
+        const new_chunks_data_len = 3 + num_tokens;
+
+        if (gpa.resize(tokens, new_chunks_data_len)) {
+            var resized_tokens = tokens;
+            resized_tokens.len = new_chunks_data_len;
+            return resized_tokens;
         }
 
         return tokens;
+    }
+
+    // https://github.com/llvm/llvm-project/issues/114001
+    fn spreadFirst8Bytes(a: @Vector(32, u8)) @Vector(64, u8) {
+        const broadcast = std.simd.iota(u8, 64) >> @splat(3);
+        //return @shuffle(u8, a, undefined, broadcast);
+        return @shuffle(u8, @as(@Vector(64, u8), @bitCast(vpbroadcast(@Vector(8, u64), a))), undefined, broadcast + (std.simd.iota(u8, 64) >> @splat(4) << @splat(4)));
     }
 
     // TODO: Maybe recover from parse_errors by switching to BitmapKind.unknown? Report errors?
@@ -4317,7 +4797,7 @@ pub fn main() !void {
     //    .split_large_spans_to_one = true,
     //    .split_large_spans_to_large = true,
     //}).init();
-    // defer jdz.deinit();
+    //defer jdz.deinit();
     //const gpa: Allocator = jdz.allocator();
     const gpa = std.heap.page_allocator;
     const sources = try readFiles(gpa);
@@ -4387,11 +4867,13 @@ pub fn main() !void {
 
         defer {
             if (comptime builtin.mode == .Debug) { // Just to make the leak detectors happy
-                for (source_tokens) |source_token| gpa.free(source_token);
-                gpa.free(source_tokens);
-                if (RUN_COMPRESS_TOKENIZER) {
-                    for (source_tokens2) |source_token| gpa.free(source_token);
-                    gpa.free(source_tokens2);
+                if (1 != 1) {
+                    for (source_tokens) |source_token| gpa.free(source_token);
+                    gpa.free(source_tokens);
+                    if (RUN_COMPRESS_TOKENIZER) {
+                        for (source_tokens2) |source_token| gpa.free(source_token);
+                        gpa.free(source_tokens2);
+                    }
                 }
             }
         }
@@ -4457,7 +4939,8 @@ pub fn main() !void {
         if (RUN_COMPRESS_TOKENIZER) {
             for (sources.source_list.items(.file_contents), source_tokens2) |source, *source_token_slot| {
                 source_token_slot.* = try Parser.tokenizeWithCompress(gpa, source);
-                break;
+                if (comptime builtin.mode == .Debug)
+                    break;
             }
         }
 
@@ -6628,10 +7111,10 @@ const Utf8Checker = struct {
 // Forces the compiler to use the `andn` instruction on some targets.
 // Kinda unfortunate but LLVM just doesn't make good decisions regarding op-fusion that much.
 // https://github.com/llvm/llvm-project/issues/108840
-// https://github.com/llvm/llvm-project/issues/108731
 // https://github.com/llvm/llvm-project/issues/103501 (sorta)
 // https://github.com/llvm/llvm-project/issues/85857
 // https://github.com/llvm/llvm-project/issues/71389
+// https://github.com/llvm/llvm-project/issues/112425
 fn andn(src: anytype, mask: @TypeOf(src)) @TypeOf(src) {
     switch (builtin.cpu.arch) {
         .x86_64 => if (std.Target.x86.featureSetHas(builtin.cpu.features, .bmi2)) {
@@ -6694,6 +7177,26 @@ fn disjoint_or(a: anytype, b: anytype) @TypeOf(a, b) {
 }
 
 // Works around https://github.com/llvm/llvm-project/issues/110868
+fn unmovemask32(x: u32) @Vector(32, bool) {
+    if (comptime std.Target.x86.featureSetHas(builtin.cpu.features, .avx512bw)) {
+        return @bitCast(x);
+    }
+
+    const bit_positions = comptime std.simd.repeat(32, @as(@Vector(8, u8), @splat(1)) << std.simd.iota(u3, 8));
+    const shuffled_x = @shuffle(u8, @as(@Vector(32, u8), @bitCast(@as(@Vector(4, u64), @splat(x)))), undefined, (std.simd.iota(u8, 32) >> @splat(4) << @splat(4)) + (std.simd.iota(u8, 32) >> @splat(3)));
+    const T = [2]@Vector(16, u8);
+    var bit_positions_and_shuffled_x: T = undefined;
+
+    // Works around https://github.com/llvm/llvm-project/issues/110875
+    // Helps sandybridge (avx) and goldmont (sse4_2) targets too
+    for (&bit_positions_and_shuffled_x, @as(T, @bitCast(bit_positions)), @as(T, @bitCast(shuffled_x))) |*slot, a, b| {
+        slot.* = a & b;
+    }
+
+    return bit_positions == @as(@Vector(32, u8), @bitCast(bit_positions_and_shuffled_x));
+}
+
+// Works around https://github.com/llvm/llvm-project/issues/110868
 fn unmovemask64(x: u64) @Vector(64, bool) {
     if (comptime std.Target.x86.featureSetHas(builtin.cpu.features, .avx512bw)) {
         return @bitCast(x);
@@ -6747,6 +7250,7 @@ fn reversedSubtraction(x: u64, y: u64) u64 {
         }
     };
 
+    // https://github.com/llvm/llvm-project/issues/112425
     if (comptime std.Target.x86.featureSetHas(builtin.cpu.features, .avx512bw)) {
         const a: u64 = Helpers.bitReverse2(x);
         const b: u64 = Helpers.bitReverse2(y);
@@ -6758,3 +7262,31 @@ fn reversedSubtraction(x: u64, y: u64) u64 {
 }
 
 //--------------------------------------------------------------------------------------------
+
+export fn expand_ext(expandable: @Vector(32, u8), fallback: @Vector(64, u8), pos_mask: u64) @Vector(64, u8) {
+    return Parser.expand(expandable, fallback, pos_mask);
+}
+
+fn loadNonTemporal(ptr: anytype) @typeInfo(@TypeOf(ptr)).pointer.child {
+    // @prefetch(ptr, .{
+    //     .rw = .read,
+    //     .locality = 0, // 0 means no temporal locality. That is, the data can be immediately dropped from the cache after it is accessed.
+    //     .cache = .data,
+    // });
+    return struct {
+        extern fn @"llvm.x86.avx512.movntdqa"(@TypeOf(ptr)) @typeInfo(@TypeOf(ptr)).pointer.child;
+    }.@"llvm.x86.avx512.movntdqa"(ptr);
+}
+
+fn storeNonTemporal(ptr: anytype, d: anytype) void {
+    if (comptime @sizeOf(@TypeOf(d)) > if (std.Target.x86.featureSetHas(builtin.cpu.features, .avx512f)) 64 else 32) {
+        const half_size_of = @sizeOf(@TypeOf(d)) / 2;
+        const half1, const half2 = @as([2]@Vector(half_size_of, u8), @bitCast(d));
+        storeNonTemporal(ptr, half1);
+        storeNonTemporal(ptr + half_size_of, half2);
+    } else {
+        struct {
+            extern fn @"llvm.x86.avx.movnt.dq"(@TypeOf(ptr), @TypeOf(d)) void;
+        }.@"llvm.x86.avx.movnt.dq"(ptr, d);
+    }
+}
