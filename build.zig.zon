@@ -17,8 +17,10 @@
     // internet connectivity.
     .dependencies = .{
         .jdz_allocator = .{
-            .url = "https://github.com/joadnacer/jdz_allocator/archive/main.tar.gz",
-            .hash = "12205cc579d7cd5d7419014d984c23fc0a410decc43176d87a4545189d7f1f69622d",
+            .url = "https://github.com/kython28/jdz_allocator/archive/refs/tags/0.1.1.tar.gz",
+            .hash = "jdz_allocator-0.1.1-MT50pr1OAgCRgixFMufnta-ZTRDaX-mpowH-q2VwyXfk",
+            // .url = "https://github.com/joadnacer/jdz_allocator/archive/main.tar.gz",
+            // .hash = "12205cc579d7cd5d7419014d984c23fc0a410decc43176d87a4545189d7f1f69622d",
         },
     },
     .paths = .{
