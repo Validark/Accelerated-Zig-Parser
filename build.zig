@@ -16,9 +16,6 @@ pub fn build(b: *std.Build) void {
     // lib.root_module.addImport("package", b.createModule(.{
     //     .root_source_file = .{ .path = cfg.package_path },
     // }));
-    // if (cfg.use_libc) {
-    //     lib.linkLibC();
-    // }
     // if (cfg.target.cpu_arch == .wasm32) {
     //     lib.use_lld = false;
     //     lib.rdynamic = true;
@@ -49,6 +46,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         // .linkage = .dynamic,
         .single_threaded = true,
+        .link_libc = false,
     });
 
     // exe.root_module.single_threaded = true;
@@ -61,7 +59,6 @@ pub fn build(b: *std.Build) void {
     // exe.linkSystemLibrary("lppreload");
     // exe.linkLibC();
     // exe.linkLibrary(library: *Compile)
-
     // exe.linkage = .dynamic;
 
     // exe.addIncludePath(.{ .path = "c-src" }); // Look for C source files
