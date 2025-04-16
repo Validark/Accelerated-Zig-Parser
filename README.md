@@ -2,7 +2,33 @@
 
 A high-throughput tokenizer and parser (soon™️) for the Zig programming language.
 
-So far, a tokenizer implementation is provided. The mainline Zig tokenizer uses a deterministic finite state machine. Those are pretty good for some applications, but tokenizing can often employ the use of other techniques for added speed.
+The mainline Zig tokenizer uses a deterministic finite state machine. Those are pretty good for some applications, but tokenizing can often employ the use of other techniques for added speed.
+
+Two tokenizer implementations are provided.
+
+1. A version that produces a few bitstrings per 64-byte chunk and uses those to skip over continuation-character matching. I gave [two](https://www.youtube.com/watch?v=oN8LDpWuPWw&t=530s) [talks](https://www.youtube.com/live/FDiUKafPs0U&t=210s) on this subject. (**Currently this code has gone poof, but I will resurrect this for comparison's sake within 3 months (when I give my final Utah-Zig talk on the subject of the Zig Tokenizer in July)**)
+
+2. A version that produces bitstrings for EVERYTHING we want to do within a 64-byte chunk, and utilizes vector compression to find the extents of all tokens simulataneously. See [this animation](https://validark.dev/presentations/simd-intro#keywords-lookup). I also gave a talk (really more of a rant) about my grand plans [here](https://www.youtube.com/watch?v=NM1FNB5nagk). Unfortunately it did not turn out how I had hoped because I got sick before I had time to give it the love it deserves. But my next talk shall knocketh thy socks off, guaranteed!
+
+The test bench as it sits on my computer right now prints this out when I run it:
+
+```
+       Read in files in 26.479ms (1775.63 MB/s) and used 47.018545MB memory with 3504899722 lines across 3253 files
+Legacy Tokenizing took              91.419ms (0.51 GB/s, 38.34B loc/s) and used 40.07934MB memory
+Tokenizing with compression took    33.301ms (1.41 GB/s, 105.25B loc/s) and used 16.209284MB memory
+       That's 2.75x faster and 2.47x less memory than the mainline implementation!
+```
+
+And I still have more optimization plans >:D !!! Stay tuned!
+
+See my article on the new tokenizer, here: https://validark.dev/posts/deus-lex-machina/
+
+---
+
+## Tokenizer 1:
+
+Everything beneath this notice was written with regards to Tokenizer 1. The information is a little out-of-date but the optimization strategies are still applicable.
+
 
 [Click here to see my latest work.](#latest-work)
 
@@ -12,13 +38,13 @@ So far, a tokenizer implementation is provided. The mainline Zig tokenizer uses 
 
 The test bench fully reads in all of the Zig files under the folders in the `src/files_to_parse` folder. In my test I installed the Zig compiler, ZLS, and a few other Zig projects in my `src/files_to_parse` folder. The test bench iterates over the source bytes from each Zig file (with added sentinels) and calls the tokenization function on each **with the utf8 validator turned off**.
 
-To tokenize 3,215 Zig files with 1,298,139 newlines, the original tokenizer and my new tokenizer have the following characteristics:
+To tokenize 3,218 Zig files with 1,298,380 newlines, the original tokenizer and my new tokenizer have the following characteristics:
 
 |  | memory (megabytes)|
 |:-:|:-:|
 | raw source files | 59.162811MB |
-| original (tokens) | 46.08376MB |
-| this (tokens) | 18.50587MB |
+| original (tokens) | 46.089775MB |
+| this (tokens) | 18.50827MB |
 
 That's 2.49x less memory!
 
@@ -30,11 +56,11 @@ Please keep in mind that comparing to the legacy tokenizer's speed is not necess
 
 |  | run-time (milliseconds) | throughput (megabytes per second) |throughput (million lines of code per second) |
 |:-:|:-:|:-:|:-:|
-| read files (baseline) | 35.269ms | 1677.45 MB/s | 35.01M loc/s |
-| original | 235.293ms  | 251.44 MB/s | 5.52M loc/s |
-| this     | 78.525ms   | 753.42 MB/s | 16.53M loc/s |
+| read files (baseline) |   37.03ms  | 1597.85 MB/s | 35.06M loc/s |
+| original              | 218.512ms  |  270.78 MB/s |  5.94M loc/s |
+| this                  |  72.107ms  |  820.57 MB/s | 18.01M loc/s |
 
-That's ~3.00x faster! **Currently the utf8 validator is turned off! I did a lot of performance optimization the past few days and did not finish porting my changes over yet.**
+That's ~3.03x faster! **Currently the utf8 validator is turned off! I did a lot of performance optimization the past few days and did not finish porting my changes over yet.**
 
 ### RISC-V SiFive U74
 
@@ -42,9 +68,9 @@ That's ~3.00x faster! **Currently the utf8 validator is turned off! I did a lot 
 
 |  | run-time (milliseconds) | throughput (megabytes per second) |throughput (million lines of code per second) |
 |:-:|:-:|:-:|:-:|
-| read files (baseline) | 318.989ms |  185.47 MB/s | 4.07M loc/s |
-| original | 2.206s  | 26.81 MB/s | 0.59M loc/s |
-| this | 894.963ms   | 66.11 MB/s | 1.45M loc/s |
+| read files (baseline) | 318.989ms | 185.47 MB/s | 4.07M loc/s |
+| original              |    2.206s |  26.81 MB/s | 0.59M loc/s |
+| this                  | 894.963ms |  66.11 MB/s | 1.45M loc/s |
 
 That's ~2.47x faster! **Currently the utf8 validator is turned off! I did a lot of performance optimization the past few days and did not finish porting my changes over yet.**
 

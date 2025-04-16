@@ -194,12 +194,13 @@ const SourceData = struct {
     fn readFiles(gpa: Allocator) !@This() {
         if (SKIP_OUTLIERS)
             std.debug.print("Skipping outliers!\n", .{});
-        std.debug.print("v0.8\n", .{});
+        std.debug.print("v0.9\n", .{});
         const directory = switch (INFIX_TEST) {
             true => "./src/bee",
-            false => "./src/files_to_parse/",
+            false => "./src/files_to_parse",
         };
 
+        // TODO: try to remove this?
         var parent_dir2 = try std.fs.cwd().openDirZ(directory, .{ .iterate = false });
         defer parent_dir2.close();
 
@@ -330,14 +331,14 @@ fn Tokenizer(
             /// This will be emitted separately from the `tag` and `len`, if present. Will share a buffer with `start` fields if present.
             start: bool = false,
 
-            /// This will be emitted separately from the `tag` and `len`, if present. Will share a buffer with `start` fields if present.
-            end: bool = false,
-
-            /// Len's are emitted as bytes. If we need more than 1 byte, we store a 0 and the next 4 bytes are the true length.
-            len: bool = true,
+            extents_field: enum(u2) {
+                /// This will be emitted separately from the `tag` and `len`, if present. Will share a buffer with `start` fields if present.
+                end,
+                /// Len's are emitted as bytes. If we need more than 1 byte, we store a 0 and the next 4 bytes are the true length.
+                len,
+                none,
+            } = .len,
         } = .{},
-
-        exclude_newlines_from_comments_and_string_literals_and_invalids: bool = false,
 
         emit_whitespace_and_comments: enum {
             yes,
@@ -345,21 +346,27 @@ fn Tokenizer(
             fold_whitespace_and_comments_into_adjacent,
         } = .fold_whitespace_and_comments_into_adjacent,
 
+        uint: type = u64, // @Vector(8, u64),
+        V: type = @Vector(64, u8), // @Vector(512, u8),
+
         const LegacyTokenizerReplacement = @This(){
             .emitted_token_data = .{
                 .tag = true,
                 .start = true,
             },
-            .exclude_newlines_from_comments_and_string_literals_and_invalids = true,
             .emit_whitespace_and_comments = .no,
         };
     },
 ) type {
-    if (options.emitted_token_data != @TypeOf(options.emitted_token_data){ .tag = true, .len = true, .start = false, .end = false })
+    if (options.emitted_token_data != @TypeOf(options.emitted_token_data){ .tag = true, .extents_field = .len, .start = false })
         @compileError("Needs to be implemented");
 
     return struct {
-        const EXCLUDE_NEWLINES_FROM_COMMENTS_AND_STRING_LITERALS_AND_INVALIDS = options.exclude_newlines_from_comments_and_string_literals_and_invalids;
+        const V = options.V;
+        const uint = options.uint;
+        const VLEN = @typeInfo(V).vector.len;
+        const U512_IMPL = uint == @Vector(8, u64) and V == @Vector(512, u8);
+
         const EMIT_WHITESPACE_AND_COMMENTS = options.emit_whitespace_and_comments;
         const CLASSIFIER_STRATEGY = options.optimization_strategies.classifier_strategy;
         const EMITTED_TOKEN_DATA = options.emitted_token_data;
@@ -545,12 +552,12 @@ fn Tokenizer(
             };
 
             const kw_slice = struct {
-                const uint = std.meta.Int(
+                const kw_uint = std.meta.Int(
                     .unsigned,
                     std.math.ceilPowerOfTwoPromote(u64, std.math.log2_int_ceil(u64, kw_buffer.len + 1)),
                 );
-                start_index: uint,
-                len: uint,
+                start_index: kw_uint,
+                len: kw_uint,
             };
 
             const kw_slices = blk: {
@@ -613,21 +620,21 @@ fn Tokenizer(
         };
 
         const MultiCharSymbolTokenizer = struct {
-            prev_chunk: @Vector(64, u8) = @splat(0),
-            prev_singleCharEnds: @Vector(64, u8) = @splat(0),
-            prev_doubleCharEnds: @Vector(64, u8) = @splat(0),
+            prev_chunk: V = @splat(0),
+            prev_singleCharEnds: V = @splat(0),
+            prev_doubleCharEnds: V = @splat(0),
             delete_triple_char_pos_carry: uword = 0,
 
             // TODO: we could separate `chunk` and `classified_chunk` as separate here, for code clarity.
-            fn getMultiCharEndPositions(self: *@This(), carry: *Carry, chunk: @Vector(64, u8)) struct { uword, uword, uword } {
+            fn getMultiCharEndPositions(self: *@This(), carry: *Carry, chunk: V) struct { uint, uint, uint } {
                 const prelim_ends = self.getMultiCharMasks(chunk);
                 const refined_ends = self.refineMultiCharEndsMasks(carry, prelim_ends.doubleCharEnds, prelim_ends.tripleCharEnds);
 
                 return .{
                     // Whatever remains outside of a double or triple char symbol can remain a single char symbol
                     prelim_ends.singleCharEnds &
-                        ~(refined_ends.double_char_ends | (refined_ends.double_char_ends >> 1)) &
-                        ~(refined_ends.triple_char_ends | (refined_ends.triple_char_ends >> 1) | (refined_ends.triple_char_ends >> 2)),
+                        ~(refined_ends.double_char_ends | shr(refined_ends.double_char_ends, 1)) &
+                        ~(refined_ends.triple_char_ends | shr(refined_ends.triple_char_ends, 1) | shr(refined_ends.triple_char_ends, 2)),
                     refined_ends.double_char_ends,
                     refined_ends.triple_char_ends,
                 };
@@ -688,10 +695,10 @@ fn Tokenizer(
                 }
             }
 
-            fn getMultiCharMasks(self: *@This(), chunk: @Vector(64, u8)) struct {
-                singleCharEnds: u64,
-                doubleCharEnds: u64,
-                tripleCharEnds: u64,
+            fn getMultiCharMasks(self: *@This(), chunk: V) struct {
+                singleCharEnds: uint,
+                doubleCharEnds: uint,
+                tripleCharEnds: uint,
             } {
                 // We produce 3 shuffle vectors: The i-th shuffle vector, after looking up the textual characters (as indices into it),
                 // tells us whether that character is a valid i-th character of a multi-character symbol.
@@ -774,24 +781,24 @@ fn Tokenizer(
 
                 const doubleCharEnds = hash_shuffle(chunk, second_char_data) &
                     shift_in_prev(1, singleCharEnds, self.prev_singleCharEnds) &
-                    @select(u8, prev1 == chunk, @as(@Vector(64, u8), @splat(0b11111111)), @as(@Vector(64, u8), @splat(@bitCast(state_without_self))));
+                    @select(u8, prev1 == chunk, @as(V, @splat(0b11111111)), @as(V, @splat(@bitCast(state_without_self))));
                 defer self.prev_doubleCharEnds = doubleCharEnds;
 
                 const tripleCharEnds = hash_shuffle(chunk, third_char_data) &
                     shift_in_prev(1, doubleCharEnds, self.prev_doubleCharEnds) &
-                    @select(u8, prev2 == prev1, @as(@Vector(64, u8), @splat(0b11111111)), @as(@Vector(64, u8), @splat(@bitCast(state_without_self))));
+                    @select(u8, prev2 == prev1, @as(V, @splat(0b11111111)), @as(V, @splat(@bitCast(state_without_self))));
 
                 defer self.prev_chunk = chunk;
 
-                const singleCharEndsBitstr = @as(u64, @bitCast(singleCharEnds != @as(@Vector(64, u8), @splat(0)))) |
-                    @as(u64, @bitCast(chunk == @as(@TypeOf(chunk), @splat(classifier['?']))));
+                const singleCharEndsBitstr = @as(uint, @bitCast(singleCharEnds != @as(V, @splat(0)))) |
+                    @as(uint, @bitCast(chunk == @as(@TypeOf(chunk), @splat(classifier['?']))));
 
-                const doubleCharEndsBitstr = @as(u64, @bitCast(doubleCharEnds != @as(@Vector(64, u8), @splat(0))))
+                const doubleCharEndsBitstr = @as(uint, @bitCast(doubleCharEnds != @as(V, @splat(0))));
                 // add *^
-                | (@as(u64, @bitCast(prev1 == @as(@TypeOf(prev1), @splat(classifier['*'])))) &
-                    @as(u64, @bitCast(chunk == @as(@TypeOf(chunk), @splat(classifier['^'])))));
+                // | (@as(uint, @bitCast(prev1 == @as(@TypeOf(prev1), @splat(classifier['*'])))) &
+                //     @as(uint, @bitCast(chunk == @as(@TypeOf(chunk), @splat(classifier['^'])))));
 
-                const tripleCharEndsBitstr = @as(u64, @bitCast(tripleCharEnds != @as(@Vector(64, u8), @splat(0))));
+                const tripleCharEndsBitstr = @as(uint, @bitCast(tripleCharEnds != @as(V, @splat(0))));
 
                 return .{
                     .singleCharEnds = singleCharEndsBitstr,
@@ -800,17 +807,17 @@ fn Tokenizer(
                 };
             }
 
-            fn refineMultiCharEndsMasks(self: *@This(), carry: *Carry, doubleCharEnd_: uword, tripleCharEnd: uword) struct {
-                double_char_ends: uword,
-                triple_char_ends: uword,
+            fn refineMultiCharEndsMasks(self: *@This(), carry: *Carry, doubleCharEnd_: uint, tripleCharEnd: uint) struct {
+                double_char_ends: uint,
+                triple_char_ends: uint,
             } {
                 // The rule for multi-char symbol matching is that we always want to match the longest possible symbol that we can.
                 // That means that if there is a 3-char-end in the next position from a two-char-end, we can unset the two-char-end bit.
                 // E.g.              a +|= b
                 //  doubleCharEnd <- 0001000 (we unset the 1 bit)
                 //  tripleCharEnd <- 0000100
-                const doubleCharEnd = doubleCharEnd_ & ~(tripleCharEnd >> 1);
-                //                                   ^ We could use XOR, instead of ANDN, so long as all 2-char prefixes of 3-char symbols are valid.
+                const doubleCharEnd = doubleCharEnd_ & ~shr(tripleCharEnd, 1);
+                //                                   ^ We *could* use XOR, instead of ANDN, so long as all 2-char prefixes of 3-char symbols are valid.
 
                 // The idea is to iterate over a bitstring which is the bitwise-OR of `doubleCharEnd` and `tripleCharEnd`.
                 // We iteratively find the lowest 1 bit, unset that bit, then unset one, possibly two bits after that bit, and repeat.
@@ -823,7 +830,7 @@ fn Tokenizer(
                 var s = doubleCharEnd | tripleCharEnd;
 
                 // Will be a subset of `doubleCharEnd` | `tripleCharEnd`, but with the boundaries properly figured out.
-                var ends: uword = 0;
+                var ends: uint = 0;
 
                 // If a triple-char-symbol-end is at the beginning of the next chunk, we unset it if the last chunk ended with a multi-char symbol within two chars. E.g.:
                 //                                                                     a =>>= b
@@ -836,7 +843,7 @@ fn Tokenizer(
                 //                                                                         ^ unset this one since it's a triple-char-end within two positions of the previous symbol-end
 
                 s &= ~(self.delete_triple_char_pos_carry & ~doubleCharEnd);
-                defer self.delete_triple_char_pos_carry = ends >> 62;
+                defer self.delete_triple_char_pos_carry = shr(ends, VLEN - 2);
 
                 // This handles the case where a chunk ends on a double-char symbol, only to find in the next chunk that it's a triple-char symbol.
                 //                                                                     a +%= b
@@ -847,8 +854,8 @@ fn Tokenizer(
                 // ends <- 0000000000000000000000000000000000000000000000000000000000000001
                 //                                                           next chunk -> 100000000000000000000000000000000000000000000000000000000000000
                 //                                                                         ^ unset because it's a double-char-end
-                s &= ~andn(carry.get(.ended_on_double_char_carry), tripleCharEnd);
-                defer carry.set(.ended_on_double_char_carry, ends & doubleCharEnd);
+                s &= ~andn(carry.get(.ended_on_double_char), tripleCharEnd);
+                defer carry.set(.ended_on_double_char, ends & doubleCharEnd);
 
                 while (true) {
                     // Optimization: Instead of iterating over a single position at once, we iterate over multiple positions at once
@@ -857,8 +864,7 @@ fn Tokenizer(
                     // start to finish, in order, because we cannot tell in parallel where all the symbols start.
                     // However, in real Zig code, you typically have "spaces" in between the symbols, sufficient that you can guarantee that
                     // the first character in a group is the start of a multi-char symbol.
-                    const iter = s & ~(s << 1) & ~(s << 2);
-
+                    const iter = s & ~shl(s, 1) & ~shl(s, 2);
                     ends |= iter;
 
                     // We want to unset the current bit(s) pointed to by `iter`, as well as the next bit, given by `iter << 1`,
@@ -889,10 +895,10 @@ fn Tokenizer(
                     //                   ^ unset this bit because there's a potential 3-char-symbol-end within two chars of one of the `iter` bits.
                     //                     I.e., we can't match both `=>` and `>>=` because they overlap.
 
-                    s &= ~(disjoint_or(iter, iter << 1) | andn(iter << 2, doubleCharEnd));
+                    s &= ~(disjoint_or(iter, shl(iter, 1)) | andn(shl(iter, 2), doubleCharEnd));
                     //           ^ All 1's in `iter` must have at least two 0's between them. The compiler gives us the shift+add in a single `lea` instruction :)
 
-                    if (s == 0) {
+                    if (isZero(s)) {
                         @branchHint(.likely);
                         break;
                     }
@@ -902,7 +908,7 @@ fn Tokenizer(
                 }
 
                 // 3-char sequences take precedence over two-char sequences, except when they are just two characters apart.
-                const double_char_ends_final = (ends & ~tripleCharEnd) | (ends & (ends << 2));
+                const double_char_ends_final = (ends & ~tripleCharEnd) | (ends & shl(ends, 2));
                 const triple_char_ends_final = ends ^ double_char_ends_final;
                 // Alternative implementation:
                 //const triple_char_ends_final = ((ends & tripleCharEnd) & ~(ends & (ends << 2)));
@@ -914,35 +920,26 @@ fn Tokenizer(
             }
         };
 
-        // TODO: I believe the best idea is to take advantage of movemask facilities.
-        // By moving each of these over to a vector and using the hardware's builtin functionality of taking the uppermost bit,
-        // we might be able to avoid some of our interactions with the stack
-
         const Carry = struct {
-            quote_starts: u64 = 0,
-            char_lit_starts: u64 = 0,
-            comment_starts: u64 = 0,
-            line_string_starts_incl_carry: u64 = 0,
+            slashes: uint = std.mem.zeroes(uint),
+            backslashes: uint = std.mem.zeroes(uint),
+            carriages: uint = std.mem.zeroes(uint),
+            ats: uint = std.mem.zeroes(uint),
 
-            slashes: u64 = 0,
-            backslashes: u64 = 0,
-            non_newlines: u64 = 0,
-            carriages: u64 = 0,
-            ats: u64 = 0,
+            inside_strings_and_comments_including_start: uint = std.mem.zeroes(uint),
+            next_is_escaped: uint = std.mem.zeroes(uint),
+            ended_on_double_char: uint = std.mem.zeroes(uint),
 
-            inside_strings_and_comments_including_start: u64 = 0,
-            next_is_escaped: u64 = 0,
-            ended_on_double_char_carry: u64 = 0,
+            number_or_builtin_ends: uint = std.mem.zeroes(uint),
+            identifier_ends: uint = std.mem.zeroes(uint),
 
-            alpha_numeric_underscores: u64 = 0,
-            identifier_ends: u64 = 0,
-            identifier_or_number_or_builtin_ends: u64 = 0,
-            number_or_builtin_ends: u64 = 0,
+            //-------------------------
+            // bounds: u4 = 0,
+            inside_quotes_incl_start_and_carry: uint = std.mem.zeroes(uint),
+            inside_apostrophes_incl_start_and_carry: uint = std.mem.zeroes(uint),
+            inside_comments: uint = std.mem.zeroes(uint),
+            inside_line_strings: uint = std.mem.zeroes(uint),
 
-            inside_quotes_incl_start_and_carry: u64 = 0,
-            inside_apostrophes_incl_start_and_carry: u64 = 0,
-            inside_comments: u64 = 0,
-            inside_line_strings: u64 = 0,
             // _: u54 = 0,
 
             fn print(self: @This()) void {
@@ -972,7 +969,7 @@ fn Tokenizer(
                     if (std.mem.eql(u8, field_name, "_")) continue;
                     fields = fields ++ [1]std.builtin.Type.StructField{.{
                         .name = field_name,
-                        .type = u64,
+                        .type = uint,
                         .default_value_ptr = null,
                         .is_comptime = false,
                         .alignment = 8,
@@ -989,11 +986,17 @@ fn Tokenizer(
                 });
             }
 
-            fn get(self: *const @This(), comptime field: std.meta.FieldEnum(GetArgsStruct())) u64 {
-                return @field(self, @tagName(field)) >> 63;
+            fn get(self: *const @This(), comptime field: std.meta.FieldEnum(GetArgsStruct())) uint {
+                return 1 & switch (field) {
+                    // .inside_quotes_incl_start_and_carry => self.bounds >> 0,
+                    // .inside_apostrophes_incl_start_and_carry => self.bounds >> 1,
+                    // .inside_comments => self.bounds >> 2,
+                    // .inside_line_strings => self.bounds >> 3,
+                    else => @field(self, @tagName(field)) >> 63,
+                };
             }
 
-            fn set(self: *@This(), comptime field: std.meta.FieldEnum(GetArgsStruct()), value: u64) void {
+            fn set(self: *@This(), comptime field: std.meta.FieldEnum(GetArgsStruct()), value: uint) void {
                 @field(self, @tagName(field)) = value;
             }
 
@@ -1006,18 +1009,14 @@ fn Tokenizer(
             }
         };
 
-        const TokenizerCarry2 = struct {
-            buffer: @Vector(8, u64),
-        };
-
-        fn getEscapedPositions(carry: *Carry, backslashes: uword) uword {
+        fn getEscapedPositions(carry: *Carry, backslashes: uint) uint {
             // ----------------------------------------------------------------------------
             // This code is brought to you courtesy of simdjson, licensed
             // under the Apache 2.0 license which is included at the bottom of this file
             // Credit to John Keiser (@jkeiser) for designing this algorithm.
             // See https://github.com/simdjson/simdjson/pull/2042
 
-            const ODD_BITS: uword = @bitCast([_]u8{0xaa} ** @divExact(@bitSizeOf(uword), 8));
+            const ODD_BITS: uint = @bitCast([_]u8{0xaa} ** @divExact(@bitSizeOf(uint), 8));
             const next_is_escaped = carry.get(.next_is_escaped);
             // |                                | Mask (shows characters instead of 1's) | Depth | Instructions        |
             // |--------------------------------|----------------------------------------|-------|---------------------|
@@ -1061,15 +1060,14 @@ fn Tokenizer(
             //
 
             // Escaped characters are characters following an escape.
-            const maybe_escaped = potential_escape << 1;
+            const maybe_escaped = shl(potential_escape, 1);
 
             // To distinguish odd from even escape sequences, therefore, we turn on any *starting*
             // escapes that are on an odd byte. (We actually bring in all odd bits, for speed.)
             // - Odd runs of backslashes are 0000, and the code at the end ("n" in \n or \\n) is 1.
             // - Odd runs of backslashes are 1111, and the code at the end ("n" in \n or \\n) is 0.
             // - All other odd bytes are 1, and even bytes are 0.
-            const maybe_escaped_and_odd_bits = maybe_escaped | ODD_BITS;
-            const even_series_codes_and_odd_bits = maybe_escaped_and_odd_bits -% potential_escape;
+            const even_series_codes_and_odd_bits = sub(maybe_escaped | ODD_BITS, potential_escape);
 
             // Now we flip all odd bytes back with xor. This:
             // - Makes odd runs of backslashes go from 0000 to 1010
@@ -1219,15 +1217,6 @@ fn Tokenizer(
                 enumFields = enumFields ++ [1]std.builtin.Type.EnumField{.{ .name = kw, .value = 128 | hash }};
             }
 
-            // @as(*const [12:0]u8, "unary -% 42") 204
-            // @as(*const [12:0]u8, "unary ** 247-204")
-            // 44
-            // @as(*const [11:0]u8, "unary - 249")
-            // @as(*const [11:0]u8, "unary * 250")
-            // @as(*const [11:0]u8, "unary . 251")
-            // @as(*const [11:0]u8, "unary & 252")
-            // @as(*const [12:0]u8, "unary .. 253")
-
             // for (Operators.potentially_unary) |op| {
             //     const padded_op = (op ++ ("\x00" ** (4 - op.len))).*;
             //     const hash = Operators.rawHash(Operators.getOpWord(&padded_op, op.len));
@@ -1370,41 +1359,30 @@ fn Tokenizer(
 
                     else => .unknown,
                 }));
+
+                // if (classifier_vec[c] >= last_exclusively_in_single_char_symbol)
+                //     @compileLog(c, std.fmt.comptimePrint("{c}", .{c}));
             }
 
             break :blk classifier_vec;
         };
 
         fn getKeywordExtents(
-            prev_chunk: @Vector(64, u8),
-            contextless_chunk: @Vector(64, u8),
-            lens: *@Vector(64, u8),
-            kinds: *@Vector(64, u8),
-            identifier_starts: u64,
-            identifier_ends: u64,
+            prev_chunk: V,
+            contextless_chunk: V,
+            lens: *V,
+            kinds: *V,
+            identifier_starts: uint,
+            identifier_ends: uint,
             prev_carried_len: u4,
             potential_kw_started_before_chunk: u1,
         ) void {
-            // TODO: Maybe don't consider identifiers that run off the end of the buffer.
-            //        these wouldn't work if their data is split across two chunks, because we would not hash them properly.
-            //        I think the solution here is just to do an individual hash for those that cross the boundary.
-            //        This also prevents errors where there could theoretically be two keywords where one is a prefix of the other,
-            //        and we match the prefix that occurs before the chunk boundary:
-            //            |
-            //          or|else
-            //            |
+            // TODO: Consider just doing an individual hash for cross-chunk identifiers rather than shoehorning it into this?
+            // It's unclear to me without trying both ways which is a better strategy overall.
 
-            // We could prune identifiers based on length. Not worth it though:
+            // We could prune identifiers based on length. Most definitely not worth it though:
             // 0123456789abcdef
             // ..11111111.1..1.
-
-            // Data carries over IF (((identifier_ends >> 63) AND identifier_starts) & 1)
-            // The length from the last token...?
-            // alphanum_starts and ends should be modified to include a potentially-carried over value
-            //
-
-            printb(identifier_starts, "identifier_starts");
-            printb(identifier_ends, "identifier_ends");
 
             // There are at most 32 identifiers in a chunk.
             // There are at most 22 multi-character identifiers in a chunk, including a carry-over from the previous chunk
@@ -1412,11 +1390,11 @@ fn Tokenizer(
             //  ^ break between previous chunk and current chunk
             const alphanum_starts_larger_than_1 = identifier_starts & (~identifier_ends | potential_kw_started_before_chunk);
             // printb(alphanum_starts_larger_than_1, "alphanum_starts_larger_than_1");
-            const alphanum_ends_larger_than_1 = (identifier_ends & ~identifier_starts) | ((potential_kw_started_before_chunk & identifier_ends) << 1);
+            const alphanum_ends_larger_than_1 = (identifier_ends & ~identifier_starts) | shl(potential_kw_started_before_chunk & identifier_ends, 1);
             // printb(alphanum_ends_larger_than_1, "alphanum_ends_larger_than_1");
 
-            const first_two_chars_mask = disjoint_or(alphanum_starts_larger_than_1, alphanum_starts_larger_than_1 << 1);
-            const last_two_chars_mask = disjoint_or(alphanum_ends_larger_than_1, alphanum_ends_larger_than_1 >> 1);
+            const first_two_chars_mask = disjoint_or(alphanum_starts_larger_than_1, shl(alphanum_starts_larger_than_1, 1));
+            const last_two_chars_mask = disjoint_or(alphanum_ends_larger_than_1, shr(alphanum_ends_larger_than_1, 1));
 
             // const first_two_chars: @Vector(32, u16) = @bitCast(compress(contextless_chunk, first_two_chars_mask));
             // const last_two_chars: @Vector(32, u16) = @bitCast(compress(contextless_chunk, last_two_chars_mask));
@@ -1424,23 +1402,17 @@ fn Tokenizer(
             var start_indices = bitsToIndices(first_two_chars_mask, 0) -% ([2]u8{ prev_carried_len, prev_carried_len } ++ [1]u8{0} ** 62);
             const should_end_indices_decrement: u1 = @truncate(potential_kw_started_before_chunk & identifier_ends);
             const end_indices = bitsToIndices(last_two_chars_mask, 0) -% ([2]u8{ should_end_indices_decrement, should_end_indices_decrement } ++ [1]u8{0} ** 62);
-            var identifier_lens = end_indices -% start_indices +% @as(@Vector(64, u8), @splat(2));
+            var identifier_lens = end_indices -% start_indices +% @as(V, @splat(2));
 
             const first_two_chars: @Vector(32, u16) = @bitCast(vperm2(std.simd.join(contextless_chunk, prev_chunk), start_indices));
             const last_two_chars: @Vector(32, u16) = @bitCast(vperm2(std.simd.join(contextless_chunk, prev_chunk), end_indices));
 
             lens.* = @select(u8, @as(@Vector(64, bool), @bitCast(@as(u64, potential_kw_started_before_chunk))), identifier_lens, lens.*);
 
-            // std.debug.print("start_indices  : {d: >2}\n", .{start_indices});
-            // std.debug.print("end_indices  : {d: >2}\n", .{end_indices});
-            // std.debug.print("identifier_lens: {d: >2}\n", .{identifier_lens});
-            // std.debug.print("first_two_chars: {c}\n", .{@as(@Vector(64, u8), @bitCast(first_two_chars))});
-            // std.debug.print("last_two_chars: {c}\n", .{@as(@Vector(64, u8), @bitCast(last_two_chars))});
-
             // A SIMD version of the hash function found in `Keywords.hashKw`
             // Hash is just the upper byte of the u16's, ignoring the uppermost bit.
             // We do a `>> splat(8)` to move it to the lower byte, that way we can reuse `first8Interlacedbroadcast` below
-            const hash: @Vector(64, u8) = @bitCast(
+            const hash: V = @bitCast(
                 (((@as(@Vector(32, u16), @bitCast(identifier_lens)) << @splat(14)) ^ first_two_chars) *% last_two_chars) >> @splat(8),
             );
 
@@ -1474,7 +1446,7 @@ fn Tokenizer(
 
                 var cur_matched: u8 = std.math.maxInt(u8);
 
-                inline for ([2]@Vector(64, u8){
+                inline for ([2]V{
                     comptime std.simd.repeat(64, std.simd.iota(u8, 8)),
                     comptime std.simd.repeat(64, std.simd.iota(u8, 8) + @as(@Vector(8, u8), @splat(8))),
                 }) |indices| {
@@ -1485,13 +1457,6 @@ fn Tokenizer(
                         lens_group,
                     );
 
-                    // std.debug.print("keyword_candidates_from_chunk_half: {c}\n", .{@select(
-                    //     u8,
-                    //     keyword_candidates_from_chunk_half < @as(@TypeOf(keyword_candidates_from_chunk_half), @splat(16)),
-                    //     keyword_candidates_from_chunk_half + @as(@TypeOf(keyword_candidates_from_chunk_half), @splat('0')),
-                    //     keyword_candidates_from_chunk_half,
-                    // )});
-
                     const keywords_from_table2_half = @select(
                         u8,
                         indices < lookup_lens_group,
@@ -1501,13 +1466,6 @@ fn Tokenizer(
                         ),
                         lookup_lens_group,
                     );
-
-                    // std.debug.print("keywords_from_table2_half: {c}\n", .{@select(
-                    //     u8,
-                    //     keywords_from_table2_half < @as(@TypeOf(keywords_from_table2_half), @splat(16)),
-                    //     keywords_from_table2_half + @as(@TypeOf(keywords_from_table2_half), @splat('0')),
-                    //     keywords_from_table2_half,
-                    // )});
 
                     cur_matched &= @bitCast(
                         @as(@Vector(8, u64), @bitCast(keyword_candidates_from_chunk_half)) ==
@@ -1542,10 +1500,6 @@ fn Tokenizer(
             // Set the highest bit of each byte because that is how we fit the keywords into the `Tag` enum.
             const potential_kinds = @shuffle(u8, hash, undefined, std.simd.iota(u8, 32) << @splat(1)) | @as(@Vector(32, u8), @splat(128));
 
-            // inline for (0..32) |i|
-            //     std.debug.print("{s} ", .{if (std.meta.intToEnum(Tag, potential_kinds[i])) |t| @tagName(t) else |_| "_"});
-            // std.debug.print("\n", .{});
-
             const matched_kinds = @select(
                 u8,
                 unmovemask32(matched),
@@ -1562,14 +1516,12 @@ fn Tokenizer(
         }
 
         fn getMultiCharKinds(
-            prev_chunk: @Vector(64, u8),
-            chunk: @Vector(64, u8),
+            prev_chunk: V,
+            chunk: V,
             multi_char_end_indices: @Vector(16, u8),
             which_multi_char_symbols_are_triple_chars_compacted: @Vector(16, bool),
         ) @Vector(16, u8) {
-            // std.debug.print("multi_char_end_indices: {}\n", .{multi_char_end_indices});
-
-            const adjustment_vec: @Vector(64, u8) = @bitCast(@select(
+            const adjustment_vec: V = @bitCast(@select(
                 u32,
                 which_multi_char_symbols_are_triple_chars_compacted,
                 [_]u32{@bitCast([4]u8{ 2, 1, 0, 0x80 })} ** 16, // 3 characters, zero the uppermost byte
@@ -1598,25 +1550,16 @@ fn Tokenizer(
                 15, 15, 15, 15,
             }) -% adjustment_vec;
 
-            // std.debug.print("successive_indices: {}\n", .{successive_indices & @as(@TypeOf(successive_indices), @splat(0b0111_1111))});
-            // std.debug.print("adjustment_vec: {}\n", .{adjustment_vec});
-
-            // std.debug.print("prev_chunk:\n", .{});
-            // printStr(@as([64]u8, @bitCast(prev_chunk))[0..64]);
-            // std.debug.print("chunk:\n", .{});
-            // printStr(@as([64]u8, @bitCast(chunk))[0..64]);
-
             const multi_char_symbol_strs_zero_padded = vperm2_zmask(
                 std.simd.join(chunk, prev_chunk),
                 successive_indices,
                 @bitCast(adjustment_vec < @as(@TypeOf(adjustment_vec), @splat(0x80))),
             );
 
-            // std.debug.print("multi_char_symbol_strs_zero_padded: {c}\n", .{multi_char_symbol_strs_zero_padded});
-
             var hash: @Vector(16, u7) = @truncate(
                 @as(@Vector(16, u32), @bitCast(multi_char_symbol_strs_zero_padded)) *% ([1]u32{698839068} ** 16) >> @splat(25),
             );
+
             // It would be cool if we changed our hash function that didn't require these post-processing steps.
             // Everytime we do a 7-bit addtion or subtraction, there is implicitly a bitwise AND that must be inserted.
             // This hash function is from the old version, which had more inputs because it had to accept single-character symbols.
@@ -1624,6 +1567,345 @@ fn Tokenizer(
             hash -%= @as(@TypeOf(hash), @splat(29));
             hash = @select(u7, hash < @as(@TypeOf(hash), @splat(16)), hash +% @as(@TypeOf(hash), @splat(18)), hash);
             return hash;
+        }
+
+        // TODO: make this a usize
+        fn beforeEOFs(len: u64) uint {
+            switch (uint) {
+                u64, u32 => {
+                    // https://github.com/llvm/llvm-project/issues/132714
+                    const chunk_mask = bzhi(~@as(u64, 0), len);
+                    return if (len >= 64) ~@as(u64, 0) else chunk_mask;
+                },
+
+                @Vector(8, u64) => return vpsllvq(~@as(@Vector(8, u64), @splat(0)), @as(@Vector(8, u64), @splat(len)) -| (std.simd.iota(u64, 8) << @splat(6))),
+                else => @compileError("Not implemented"),
+            }
+        }
+
+        fn index(vec: @Vector(8, u64), comptime i: u3) u64 {
+            const impl: enum { no_round_trip, round_trip } = .no_round_trip;
+            return switch (impl) {
+                .no_round_trip => @bitCast(@shuffle(u8, @as(@Vector(64, u8), @bitCast(std.simd.shiftElementsLeft(vec, i, 0))), undefined, std.simd.iota(u8, 64) >> @splat(3)) &
+                    @as(@Vector(64, u8), @splat(1)) << @truncate(std.simd.iota(u8, 64)) != @as(@Vector(64, u8), @splat(0))),
+                .round_trip => vec[i],
+            };
+        }
+
+        fn vpunpckhbw(a: anytype, b: anytype) @Vector(64, u8) {
+            const shuffler = comptime std.simd.repeat(32, std.simd.iota(i8, 8) + @as(@Vector(8, i8), @splat(8))) + (std.simd.iota(u7, 32) >> @splat(3) << @splat(4));
+            return @shuffle(u8, @as(@Vector(64, u8), @bitCast(a)), @as(@Vector(64, u8), @bitCast(b)), std.simd.interlace(.{ shuffler, ~shuffler }));
+        }
+
+        fn interlaceHighHalves(args: anytype) @Vector(64, u8) {
+            return switch (args.len) {
+                0, 1 => @compileError("Must pass at least two parameters to interlaceHighHalves"),
+
+                2 => vpunpckhbw(args[0], args[1]),
+
+                3 => vpunpckhbw(
+                    vpunpckhbw(args[0], args[2]),
+                    args[1],
+                ),
+
+                4 => vpunpckhbw(
+                    vpunpckhbw(args[0], args[2]),
+                    vpunpckhbw(args[1], args[3]),
+                ),
+
+                5 => vpunpckhbw(
+                    vpunpckhbw(vpunpckhbw(args[0], args[4]), args[2]),
+                    vpunpckhbw(args[1], args[3]),
+                ),
+
+                6 => vpunpckhbw(
+                    vpunpckhbw(vpunpckhbw(args[0], args[4]), args[2]),
+                    vpunpckhbw(vpunpckhbw(args[1], args[5]), args[3]),
+                ),
+
+                7 => vpunpckhbw(
+                    vpunpckhbw(
+                        vpunpckhbw(args[0], args[4]),
+                        vpunpckhbw(args[2], args[6]),
+                    ),
+                    vpunpckhbw(
+                        vpunpckhbw(args[1], args[5]),
+                        args[3],
+                    ),
+                ),
+
+                8 => vpunpckhbw(
+                    vpunpckhbw(
+                        vpunpckhbw(args[0], args[4]),
+                        vpunpckhbw(args[2], args[6]),
+                    ),
+                    vpunpckhbw(
+                        vpunpckhbw(args[1], args[5]),
+                        vpunpckhbw(args[3], args[7]),
+                    ),
+                ),
+
+                else => @compileError("Too many arguments passed to interlaceHighHalves."),
+            };
+        }
+
+        fn interlaceHighHalvesAndMoveToLowestQuad(args: anytype) @Vector(8, u64) {
+            return std.simd.shiftElementsLeft(
+                @as(@Vector(8, u64), @bitCast(interlaceHighHalves(args))),
+                7,
+                0,
+            );
+        }
+
+        // Oftentimes, we want to combine two bitstrings via `|`.
+        // However, when we know they are disjoint, we can use `+%` instead.
+        // This enables optimizations on x86 like using `lea` instead of `or`,
+        // which can fuse a left-shift for one of the operands, and can move to a
+        // different destination register. Interestingly, the compiler seems afraid of
+        // doing `kaddq` in `k`-registers, so we should double-check how using this instead
+        // of an `|` changes the emit.
+        fn disjoint_or(a: uint, b: uint) uint {
+            assert((a & b) == 0);
+            switch (uint) {
+                u32, u64 => return a +% b,
+                @Vector(8, u64) => return a | b,
+                else => @compileError("Not implemented"),
+            }
+        }
+
+        // Forces the compiler to use the `andn` instruction on some targets.
+        // Kinda unfortunate but LLVM just doesn't make good decisions regarding op-fusion that much.
+        // https://github.com/llvm/llvm-project/issues/108840
+        // https://github.com/llvm/llvm-project/issues/103501 (sorta)
+        // https://github.com/llvm/llvm-project/issues/85857
+        // https://github.com/llvm/llvm-project/issues/71389
+        // https://github.com/llvm/llvm-project/issues/112425
+        fn andn(src: anytype, mask: @TypeOf(src)) @TypeOf(src) {
+            // Only force `andn` when operating on GPR's
+            if (@TypeOf(src) == u64 or @TypeOf(src) == u32) {
+                switch (builtin.cpu.arch) {
+                    .x86_64 => if (std.Target.x86.featureSetHas(builtin.cpu.features, .bmi2)) {
+                        return asm ("andn %[src], %[mask], %[ret]"
+                            : [ret] "=r" (-> @TypeOf(src)),
+                            : [src] "r" (src),
+                              [mask] "r" (mask),
+                        );
+                    },
+
+                    .riscv64 => if (std.Target.riscv.featureSetHas(builtin.cpu.features, .zbb) or std.Target.riscv.featureSetHas(builtin.cpu.features, .zbkb)) {
+                        return asm ("andn %[ret], %[src], %[mask]"
+                            : [ret] "=r" (-> @TypeOf(src)),
+                            : [src] "r" (src),
+                              [mask] "r" (mask),
+                        );
+                    },
+
+                    .aarch64, .aarch64_be => {
+                        return asm ("bic %[ret], %[src], %[mask]"
+                            : [ret] "=r" (-> @TypeOf(src)),
+                            : [src] "r" (src),
+                              [mask] "r" (mask),
+                        );
+                    },
+
+                    .powerpc64 => {
+                        return asm ("andc %[ret], %[src], %[mask]"
+                            : [ret] "=r" (-> @TypeOf(src)),
+                            : [src] "r" (src),
+                              [mask] "r" (mask),
+                        );
+                    },
+
+                    else => {},
+                }
+            }
+
+            return src & ~mask;
+        }
+
+        inline fn v_op(str: V, op: enum { @"==", @">=", @"<=", @"<", @">" }, chr: u8, mask: uint) uint {
+            const other_vec = @as(@Vector(64, u8), @splat(chr));
+
+            if (uint == u64) {
+                return @bitCast(switch (op) {
+                    .@"==" => str == other_vec,
+                    .@">=" => str >= other_vec,
+                    .@"<=" => str <= other_vec,
+                    .@"<" => str < other_vec,
+                    .@">" => str > other_vec,
+                });
+            }
+
+            const BufPtr = @Type(.{ .pointer = .{
+                .size = .one,
+                .is_const = false,
+                .is_volatile = true,
+                .alignment = 8,
+                .address_space = .generic,
+                .child = [8]u64,
+                .is_allowzero = false,
+                .sentinel_ptr = null,
+            } });
+
+            // Might be kinda silly, but by segmenting vectors up ourselves on a volatile pointer
+            // we can get it to not to write data out twice
+            var buffer: @Vector(8, u64) = undefined;
+            inline for (@as(BufPtr, &buffer), @as([8]@Vector(64, u8), @bitCast(str))) |*u64_slot, sub_vec|
+                u64_slot.* = @bitCast(switch (op) {
+                    .@"==" => sub_vec == other_vec,
+                    .@">=" => sub_vec >= other_vec,
+                    .@"<=" => sub_vec <= other_vec,
+                    .@"<" => sub_vec < other_vec,
+                    .@">" => sub_vec > other_vec,
+                });
+
+            if (U512_IMPL) buffer &= mask;
+            return buffer;
+        }
+
+        inline fn v_eq(str: V, chr: u8, mask: uint) uint {
+            return v_op(str, .@"==", chr, mask);
+        }
+
+        fn shl(a: uint, comptime i: std.math.Log2Int(std.meta.Int(.signed, @bitSizeOf(uint)))) uint {
+            switch (@typeInfo(uint)) {
+                .int => return a << i,
+                else => {
+                    if (i % 64 == 0) return std.simd.shiftElementsRight(a, i / 64, 0);
+                    return (std.simd.shiftElementsRight(a, 1 + i / 64, 0) >> @splat(64 - (i % 64))) |
+                        (std.simd.shiftElementsRight(a, i / 64, 0) << @splat(i % 64));
+                },
+            }
+        }
+
+        fn shr(a: uint, comptime i: std.math.Log2Int(std.meta.Int(.signed, @bitSizeOf(uint)))) uint {
+            switch (@typeInfo(uint)) {
+                .int => return a >> i,
+                else => {
+                    if (i % 64 == 0) return std.simd.shiftElementsLeft(a, i / 64, 0);
+                    return std.simd.shiftElementsLeft(a, 1 + i / 64, 0) << @splat(64 - (i % 64)) |
+                        std.simd.shiftElementsLeft(a, i / 64, 0) >> @splat(i % 64);
+                },
+            }
+        }
+
+        fn isolateLastBit(x: uint) u1 {
+            switch (uint) {
+                u32, u64 => x >> (@bitSizeOf(uint) - 1),
+                @Vector(8, u64) => x[7] >> 63,
+                else => @compileError("Invalid uint type passed to isolateLastBit. Please implement."),
+            }
+        }
+
+        /// Kogge-Stone Vector Addition/Subtraction
+        /// Source: http://www.numberworld.org/y-cruncher/internals/addition.html
+        fn sub(A: uint, B: uint) uint {
+            switch (@typeInfo(uint)) {
+                .int => return A -% B,
+                else => {
+                    const MAX_WORD: @Vector(8, u64) = @splat(0xffffffffffffffff);
+                    const s = A -% B;
+                    var c: u16 = @as(u8, @bitCast(A < B));
+                    var m: u8 = @bitCast(A == B);
+
+                    {
+                        c = kshiftl(c, 1);
+                        // c = c | carry.*;
+                        c = k_op(c, .@"+", m);
+                        // carry.* = kshiftr(c, 8);
+                        m = k_op(m, .@"+", @as(u8, @truncate(c)));
+                    }
+
+                    // I prefer to use a masked-add here instead of expanding each bit in k-mask `m` to an element of all 1's or all 0's (whichever the bit was) and adding that.
+                    // Since we probably need to keep a `MAX_WORD` vector lying around anyway, this can save us an instruction by consuming the mask directly.
+                    const ans = vpaddq_masked_asm(m, s, MAX_WORD);
+                    assert(@as(std.meta.Int(.unsigned, @bitSizeOf(uint)), @bitCast(ans)) == @as(std.meta.Int(.unsigned, @bitSizeOf(uint)), @bitCast(A)) -% @as(std.meta.Int(.unsigned, @bitSizeOf(uint)), @bitCast(B)));
+                    return ans;
+                    //  return @select(u64, @as(@Vector(8, bool), @bitCast(m)), s +% MAX_WORD, s);
+                },
+            }
+        }
+
+        fn kshiftl(src: anytype, comptime i: std.math.Log2Int(@TypeOf(src))) @TypeOf(src) {
+            return asm ("kshiftl" ++ switch (@TypeOf(src)) {
+                    u8 => "b",
+                    u16 => "w",
+                    u32 => "d",
+                    u64 => "q",
+                    else => @compileError("Invalid type passed to kshiftl"),
+                } ++ " %[mask], %[src], %[ret]"
+                : [ret] "=k" (-> @TypeOf(src)),
+                : [src] "k" (src),
+                  [mask] "i" (@as(u8, i)),
+            );
+        }
+
+        fn kshiftr(src: anytype, comptime i: std.math.Log2Int(@TypeOf(src))) @TypeOf(src) {
+            return asm ("kshiftr" ++ switch (@TypeOf(src)) {
+                    u8 => "b",
+                    u16 => "w",
+                    u32 => "d",
+                    u64 => "q",
+                    else => @compileError("Invalid type passed to kshiftr"),
+                } ++ " %[mask], %[src], %[ret]"
+                : [ret] "=k" (-> @TypeOf(src)),
+                : [src] "k" (src),
+                  [mask] "i" (@as(u8, i)),
+            );
+        }
+
+        fn vpaddq_masked_asm(mask: u8, vec_1: @Vector(8, u64), vec_2: @Vector(8, u64)) @Vector(8, u64) {
+            var result = vec_1;
+            asm (
+                \\ vpaddq %[vec_2], %[vec_1], %[sum] {%[mask]}
+                : [sum] "+x" (result),
+                : [vec_1] "x" (vec_1),
+                  [vec_2] "x" (vec_2),
+                  [mask] "^Yk" (mask),
+            );
+            return result;
+        }
+
+        fn isZero(x: anytype) bool {
+            return @as(std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(x))), @bitCast(x)) == 0;
+        }
+
+        fn isNonZero(x: anytype) bool {
+            return @as(std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(x))), @bitCast(x)) != 0;
+        }
+
+        /// Returns a bitstring with just the most-significant-bit of `x` set.
+        fn isolateMSb(x: uint) uint {
+            return switch (uint) {
+                u64, u32 => if (x == 0) 0 else @as(uint, 1) << (@bitSizeOf(uint) - 1) >> @intCast(@clz(x)),
+                @Vector(8, u64) => @select(
+                    u64,
+                    std.simd.extract(@as(@Vector(16, u8), @bitCast(vpsrlvq(
+                        @as(@Vector(2, u64), @splat(@as(u64, 1) << 63)),
+                        @clz(@as(@Vector(2, u64), [2]u64{ @bitCast(@select(u8, x != @as(uint, @splat(0)), @as(@Vector(8, u8), @splat(0xFF)), @as(@Vector(8, u8), @splat(0)))), undefined })),
+                    ))) >= @as(@Vector(16, u8), @splat(0x80)), 0, 8),
+                    vpsrlvq(@as(@Vector(8, u64), @splat(@as(u64, 1) << 63)), @clz(x)),
+                    @as(uint, @splat(0)),
+                ),
+                else => @compileError("isolateMSb not yet implemented"),
+            };
+        }
+
+        /// Returns a bitstring with just the most-significant-u64 of `x` non-zeroed.
+        fn isolateMSQ(x: uint) uint {
+            return switch (uint) {
+                u64, u32 => x,
+                @Vector(8, u64) => @select(
+                    u64,
+                    std.simd.extract(@as(@Vector(16, u8), @bitCast(vpsrlvq(
+                        @as(@Vector(2, u64), @splat(@as(u64, 1) << 63)),
+                        @clz(@as(@Vector(2, u64), [2]u64{ @bitCast(@select(u8, x != @as(uint, @splat(0)), @as(@Vector(8, u8), @splat(0xFF)), @as(@Vector(8, u8), @splat(0)))), undefined })),
+                    ))) >= @as(@Vector(16, u8), @splat(0x80)), 0, 8),
+                    x,
+                    @as(uint, @splat(0)),
+                ),
+                else => @compileError("isolateMSb not yet implemented"),
+            };
         }
 
         // Caller owns memory
@@ -1645,181 +1927,82 @@ fn Tokenizer(
 
             var multi_char_symbol_parser: MultiCharSymbolTokenizer = .{};
             var carry: Carry = .{};
-            var utf8_checker: Utf8Checker(.{
-                .USE_ARM_NEON = HAS_ARM_NEON,
-                .V = Chunk,
-                .native_int = NATIVE_VEC_INT,
-            }) = .empty;
+            var utf8_checker: Utf8Checker(.{ .USE_ARM_NEON = HAS_ARM_NEON, .V = Chunk, .native_int = NATIVE_VEC_INT }) = .empty;
 
-            // if (comptime builtin.mode == .Debug) {
-            //     const str =
-            //         \\ "" // hello
-            //     ++ " " ++
-            //         \\
-            //         \\
-            //         \\
-            //         \\ // hello
-            //         \\  comptime  var  "/'"  ++  if
-            //         \\  ++// good
-            //         \\ "me"  // m
-            //         \\
-            //         \\  //m
-            //         \\
-            //         \\  // m
-            //         \\  ++
-            //         \\ e  // soup
-            //         \\
-            //         \\
-            //         \\"\\\"\\; //\"'\\\"\"\\\"///'\"  \\ \"\\\"\\"; "'\\"
-            //         \\
-            //         \\//=///' %" "\\\"\\";
-            //         \\
-            //         \\//"'\\""\\"///'" +$ "\\\"\\";//"'\\""\\"
-            //         \\/
-            //     ;
-            //     @constCast(source.ptr)[0..str.len].* = str.*;
-            // }
-
-            // if (comptime builtin.mode == .Debug) {
-            //     const str =
-            //         \\ "" // hello
-            //     ++ " " ++
-            //         \\
-            //         \\
-            //         \\
-            //         \\ // hello
-            //         \\  comptime  var // hello
-            //         \\
-            //         \\
-            //         \\ "/'"  ++  if
-            //         \\  ++// good
-            //         \\ "me"  // m
-            //         \\
-            //         \\  //m
-            //         \\
-            //         \\  // m
-            //         \\  ++
-            //         \\ e  // soup
-            //         \\
-            //         \\
-            //         \\"\\\"\\; //\"'\\\"\"\\\"///'\"  \\ \"\\\"\\"; "'\\"
-            //         \\
-            //         \\//=///' %" "\\\"\\";
-            //         \\
-            //         \\//"'\\""\\"///'" +$ "\\\"\\";//"'\\""\\"
-            //         \\/
-            //     ;
-            //     @constCast(source.ptr)[0..str.len].* = str.*;
-            // }
-
-            // if (comptime builtin.mode == .Debug) {
-            //     const str =
-            //         // \\var prefix_sums = comptime std.simd.shiftElementsRight(std.simd.
-            //         \\  comptime  var  "/'"  ++  if
-            //         \\  ++// good
-            //         \\ "me" 1e14 // m
-            //         \\
-            //         \\
-            //         \\
-            //         \\
-            //         \\
-            //         \\
-            //         \\
-            //         \\  +
-            //         \\
-            //         \\
-            //         \\ // m
-            //         \\  ++
-            //         \\ e  // soup
-            //         \\
-            //         \\
-            //         \\"\\\"\\; //\"'\\\"\"\\\"///'\"  \\ \"\\\"\\"; "'\\"
-            //         \\
-            //         \\//=///' %" "\\\"\\";
-            //         \\
-            //         \\//"'\\""\\"///'" +$ "\\\"\\";//"'\\""\\"
-            //         \\/
-            //     ;
-            //     @constCast(source.ptr)[0..str.len].* = str.*;
-            // }
-
-            // var super_duper_pls_delete_me_iter: u64 = 0;
-            // Preserve //! and /// comments. "////" counts as a regular comment
-            // Merge // comments and whitespace together.
-            // Merge operators and keywords with nearby whitespace and // comments.
-            // Deal with @ symbol
-            // Make sure things work properly across chunks
-            // @constCast(sourcey.allocatedSlice().ptr)[23..][0..41].* = "defghij\"lmnopqrs\" vwxyzABCDEFGHIJKLMNOPQR".*;
+            // TODO: Preserve //! and /// comments. "////" counts as a regular comment
+            // TODO: Bring back the merging of // comments and whitespace together with adjacent keywords and operators.
+            //      In my original implementation, I expanded leftwards first. The consistent algorithm is to expand rightwards first
 
             var cur = source;
-
-            // var chunk_ptr = source.ptr[0..];
-            // const final_chunk_ptr = source.ptr + source.len;
-
             var prev_carried_len: u32 = 0;
-            var prev_chunk: @Vector(64, u8) = @splat(0);
+            var prev_chunk: V = @splat(0);
 
             while (true) {
                 // Tell our cache to evict the chunk next time room is needed
                 // We can do this because we do not need to access data from this chunk again.
                 // This helps us not clutter up the cache unnecessarily.
-                @prefetch(cur.ptr[0..64], .{ .locality = 0 });
+                @prefetch(cur.ptr[0..VLEN], .{ .locality = 0 });
 
-                const V = @Vector(64, u8);
+                const before_eofs = beforeEOFs(cur.len);
 
-                const before_eofs = before_eofs: {
-                    // https://github.com/llvm/llvm-project/issues/132714
-                    const chunk_mask = bzhi(~@as(u64, 0), cur.len);
-                    break :before_eofs if (cur.len >= 64) ~@as(u64, 0) else chunk_mask;
-                };
-
-                const chunk: V = @select(u8, @as(@Vector(64, bool), @bitCast(before_eofs)), cur.ptr[0..64].*, [1]u8{0} ** 64);
+                const chunk: V = if (!U512_IMPL)
+                    @select(u8, @as(@Vector(VLEN, bool), @bitCast(before_eofs)), cur.ptr[0..VLEN].*, [1]u8{0} ** VLEN)
+                else
+                    cur.ptr[0..VLEN].*;
                 defer prev_chunk = chunk;
 
-                printb(before_eofs, "before_eofs");
-                printStr(@as([64]u8, @bitCast(chunk))[0..64]);
-
                 // Bitstrings that mark where each token begins and ends
-                var all_starts: u64 = 0;
-                var all_ends: u64 = 0;
+                var all_starts: uint = std.mem.zeroes(uint);
+                var all_ends: uint = std.mem.zeroes(uint);
 
                 // zig fmt: off
-                const carriages  : u64 = @bitCast(chunk == @as(V, @splat('\r')));
-                const newlines   : u64 = @bitCast(chunk == @as(V, @splat('\n')));
-                const slashes    : u64 = @bitCast(chunk == @as(V, @splat('/')));
-                const backslashes: u64 = @bitCast(chunk == @as(V, @splat('\\')));
-                const nonASCII   : u64 = @bitCast(chunk >= @as(V, @splat(0x80)));
-                const quotes     : u64 = @bitCast(chunk == @as(V, @splat('"')));
-                const apostrophes: u64 = @bitCast(chunk == @as(V, @splat('\'')));
+                const carriages   = v_eq(chunk, '\r', before_eofs);
+                const newlines    = v_eq(chunk, '\n', before_eofs);
+                const slashes     = v_eq(chunk, '/', before_eofs);
+                const backslashes = v_eq(chunk, '\\', before_eofs);
+                const quotes      = v_eq(chunk, '"', before_eofs);
+                const apostrophes = v_eq(chunk, '\'', before_eofs);
+                const nonASCII    = v_op(chunk, .@">=", 0x80, before_eofs);
                 // zig fmt: on
 
-                defer carry.set(.slashes, slashes);
-                defer carry.set(.backslashes, backslashes);
-                defer carry.set(.carriages, carriages);
-
                 // '\r' is only valid when there is a '\n' immediately after.
-                const bad_carriage_returns = ~newlines & ((carriages << 1) | carry.get(.carriages));
+                const bad_carriage_returns = if (!U512_IMPL)
+                    ~newlines & (shl(carriages, 1) | carry.get(.carriages))
+                else // TODO: try carrying implicitly in the shl-1?
+                    tern(newlines, shl(carriages, 1), carry.get(.carriages), "~a & (b | c)");
 
-                if (bad_carriage_returns != 0) {
-                    @branchHint(.unlikely);
-                    return error.BadCarriageReturn;
-                }
+                if (isNonZero(bad_carriage_returns)) return error.BadCarriageReturn;
 
-                // We intentionally shift right here (i.e. backwards in the source file) because
-                // we want these to start on the first character instead of the second.
-                const double_slash_starts = slashes & ((slashes >> 1) | carry.get(.slashes));
-                const double_backslash_starts = backslashes & ((backslashes >> 1) | carry.get(.backslashes));
-
-                const comment_bounds_incl_carry = double_slash_starts | carry.get(.inside_comments);
-                const line_string_bounds_incl_carry = double_backslash_starts | carry.get(.inside_line_strings);
+                const carriages_or_newlines = carriages | newlines;
+                const carriages_or_newlines_or_eof = carriages_or_newlines | ~before_eofs;
 
                 const escaped_positions = getEscapedPositions(&carry, backslashes);
 
                 const unescaped_quotes = quotes & ~escaped_positions;
                 const unescaped_apostrophes = apostrophes & ~escaped_positions;
 
-                const quote_bounds_incl_carry = unescaped_quotes | carry.get(.inside_quotes_incl_start_and_carry);
-                const apostrophe_bounds_incl_carry = unescaped_apostrophes | carry.get(.inside_apostrophes_incl_start_and_carry);
+                // We intentionally shift right here (i.e. backwards in the source file) because
+                // we want these to start on the first character instead of the second.
+                const double_slash_starts = slashes & ((shr(slashes, 1)) | carry.get(.slashes));
+                const double_backslash_starts = backslashes & ((shr(backslashes, 1)) | carry.get(.backslashes));
+
+                const comment_bounds_incl_carry = double_slash_starts | carry.get(.inside_comments);
+                const line_string_bounds_incl_carry = double_backslash_starts | carry.get(.inside_line_strings);
+
+                // We might have the end of some string/char_literal at the beginning of the chunk,
+                // and in this case we need the (pseudo) start and end character to be the same.
+                // That's why we handle this separately from the loop that follows, which only permits
+                // starts to be different from ends.
+                const first_char_ends_string = disjoint_or(
+                    unescaped_quotes & carry.get(.inside_quotes_incl_start_and_carry),
+                    unescaped_apostrophes & carry.get(.inside_apostrophes_incl_start_and_carry),
+                );
+
+                all_starts |= first_char_ends_string;
+                all_ends |= first_char_ends_string;
+
+                const quote_bounds_incl_carry = unescaped_quotes ^ carry.get(.inside_quotes_incl_start_and_carry);
+                const apostrophe_bounds_incl_carry = unescaped_apostrophes ^ carry.get(.inside_apostrophes_incl_start_and_carry);
 
                 // Figure out which characters are inside a quote, comment, line-string, or, to a lesser extent, a character literal.
                 // The fundamental problem is that any of these could be arbitrarily nested inside of each other, meaning that a
@@ -1843,37 +2026,12 @@ fn Tokenizer(
                 // Note: We do not throw an error for a quote or character literal that is missing a terminator. That should happen in Sema.zig
                 // Note: We assume there is a newline at the end of the file.
 
-                // printb(newlines_or_eof, "newlines_or_eof");
-
-                // 1111111111..........
-                // x & ~(x + 1)
-
-                var iter = (~newlines & ~(~newlines << 1)); // | is_first_char_inside_string_or_comment;
+                var iter = ~carriages_or_newlines & ~shl(~carriages_or_newlines, 1); // | is_first_char_inside_string_or_comment;
                 var all_bounds_incl_carry = quote_bounds_incl_carry | apostrophe_bounds_incl_carry | comment_bounds_incl_carry | line_string_bounds_incl_carry;
-                printb(quote_bounds_incl_carry, "quote_bounds_incl_carry");
-                printb(apostrophe_bounds_incl_carry, "apostrophe_bounds_incl_carry");
-                printb(comment_bounds_incl_carry, "comment_bounds_incl_carry");
-                printb(line_string_bounds_incl_carry, "line_string_bounds_incl_carry");
-                const newlines_or_eof = newlines | ~before_eofs;
-
-                // We might have the end of some string/char_literal at the beginning of the chunk,
-                // and in this case we need the (pseudo) start and end character to be the same.
-                // That's why we handle this separately from the loop that follows, which only permits
-                // starts to be different from ends.
-                const first_char_ends_quote_or_apostrophe =
-                    (unescaped_quotes & carry.get(.inside_quotes_incl_start_and_carry)) |
-                    (unescaped_apostrophes & carry.get(.inside_apostrophes_incl_start_and_carry));
-
-                all_starts |= first_char_ends_quote_or_apostrophe;
-                all_ends |= first_char_ends_quote_or_apostrophe;
-                all_bounds_incl_carry ^= first_char_ends_quote_or_apostrophe;
 
                 while (true) {
-                    printb(iter, "iter");
-                    printb(all_bounds_incl_carry, "all_bounds_incl_carry");
-                    // Advance each cursor in `iter` to next 1 bit in `all_bounds_incl_carry | newlines`, but don't count `newlines` as a valid start
-                    const starts = (all_bounds_incl_carry & ~((all_bounds_incl_carry | newlines_or_eof) -% iter));
-                    printb(starts, "starts");
+                    // Advance each cursor in `iter` to next 1 bit in `all_bounds_incl_carry | carriages_or_newlines`, but don't count `carriages_or_newlines` as a valid start
+                    const starts = (all_bounds_incl_carry & ~sub(all_bounds_incl_carry | carriages_or_newlines_or_eof, iter));
                     all_starts |= starts;
 
                     // From each bit in `starts` to the next newline, fold in the pieces of the target bitstring
@@ -1882,112 +2040,72 @@ fn Tokenizer(
                     //      ^ we start a quote here
                     // E.g. "...\n
                     //       ^^^ so we put the characters from the `quote_bounds_incl_carry` bitstring in there
-                    var interleaved = newlines_or_eof;
-                    interleaved |= quote_bounds_incl_carry & (newlines_or_eof -% (starts & quote_bounds_incl_carry));
-                    interleaved |= apostrophe_bounds_incl_carry & (newlines_or_eof -% (starts & apostrophe_bounds_incl_carry));
+                    var interleaved = carriages_or_newlines_or_eof;
+                    interleaved |= quote_bounds_incl_carry & sub(carriages_or_newlines_or_eof, starts & quote_bounds_incl_carry);
+                    interleaved |= apostrophe_bounds_incl_carry & sub(carriages_or_newlines_or_eof, starts & apostrophe_bounds_incl_carry);
                     interleaved &= ~starts;
-                    // interleaved |= (unescaped & ~(newlines_or_eof -% andn(starts, unescaped)));
-
-                    printb(interleaved, "interleaved");
 
                     // Advance cursor within interleaved bitstring
-                    const cur_ends = interleaved & ~(interleaved -% starts);
+                    const cur_ends = interleaved & ~sub(interleaved, starts);
                     all_ends |= cur_ends;
-                    printb(cur_ends, "cur_ends");
 
                     // Make cur_ends the new iters, but if we ended on a newline, delete that bit.
-                    iter = cur_ends & ~newlines_or_eof;
+                    iter = cur_ends & ~carriages_or_newlines_or_eof;
                     assert((all_bounds_incl_carry & iter) == iter);
                     all_bounds_incl_carry ^= iter;
 
-                    printb(iter, "iter");
-                    printb(all_bounds_incl_carry, "all_bounds_incl_carry");
-
-                    if (iter == 0) {
+                    if (isZero(iter)) {
                         @branchHint(.likely);
                         break;
                     }
                 }
 
-                const inside_strings_and_comments_including_start = all_ends -% all_starts;
-                defer carry.set(.inside_strings_and_comments_including_start, inside_strings_and_comments_including_start);
-                printb(all_starts, "all_starts");
-                printb(all_ends, "all_ends");
-                printb(inside_strings_and_comments_including_start, "inside_strings_and_comments_including_start");
+                const inside_strings_and_comments_including_start = sub(all_ends, all_starts);
 
-                const is_first_char_inside_string_or_comment = carry.get(.inside_strings_and_comments_including_start) & ~newlines & ~first_char_ends_quote_or_apostrophe;
+                const is_first_char_inside_string_or_comment = carry.get(.inside_strings_and_comments_including_start) & ~first_char_ends_string & ~carriages_or_newlines_or_eof;
 
                 // Find out which characters are inside a string/char-literal/comment.
                 // We need the carry because all_starts might include the first character as a pseudo-start.
                 const inside_strings_or_comments = (inside_strings_and_comments_including_start & ~all_starts) | is_first_char_inside_string_or_comment;
-                printb(inside_strings_or_comments, "inside_strings_or_comments");
-                // defer carry.set(.inside_strings_and_comments_including_start, inside_strings_or_comments);
 
-                // carry.get(.inside_quotes_incl_start_and_carry);
-                // carry.get(.inside_apostrophes_incl_start_and_carry);
+                const last_start = if (U512_IMPL) isolateMSb(all_starts);
+                const ends_inside_string_or_comment = if (U512_IMPL) isolateLastBit(inside_strings_or_comments);
 
-                // alternative idea:
-                // const inside_quotes_incl_start_and_carry = inside_strings_or_comments & ~(inside_strings_and_comments_including_start +% quote_starts_incl_carry);
-
-                printb(all_ends -% (all_starts & apostrophe_bounds_incl_carry), "all_ends -% (all_starts & apostrophe_bounds_incl_carry)");
-                carry.set(.inside_quotes_incl_start_and_carry, (all_ends -% (all_starts & quote_bounds_incl_carry)) & ~all_ends);
-                carry.set(.inside_apostrophes_incl_start_and_carry, (all_ends -% (all_starts & apostrophe_bounds_incl_carry)) & ~all_ends);
-                carry.set(.inside_comments, (all_ends -% (all_starts & comment_bounds_incl_carry)) & ~all_ends);
-                carry.set(.inside_line_strings, (all_ends -% (all_starts & line_string_bounds_incl_carry)) & ~all_ends);
-
-                printStr(@as([64]u8, @bitCast(chunk))[0..64]);
-                // const inside_comment_or_line_string = inside_strings_or_comments & ~disjoint_or(inside_quotes_incl_start_and_carry, inside_apostrophes_incl_start_and_carry);
-                // _ = inside_comment_or_line_string;
-
-                printb(all_starts, "[0] all_starts");
-                printb(all_ends, "[0] all_ends");
-
-                // TODO: this may or may not be broken by //|\n
-                //                                          ^ chunk break
-
-                // Revise `all_ends` such that tokens do not include the newline_or_eof
-                all_ends = (all_ends & ~newlines_or_eof) | ((all_ends & newlines_or_eof) >> 1);
-                printb(all_ends, "[a] all_ends");
-
-                const no_ends = all_ends == 0;
-
-                // Let us set a dummy end if we ended inside a string/comment/line_string/char_literal
-                all_ends = disjoint_or(all_ends, inside_strings_and_comments_including_start & (@as(u64, 1) << 63));
-                printb(all_ends, "[b] all_ends");
-
-                // inline for (0..128) |i| {
-                //     std.debug.print("{d: >2} '{c}' {} {s}\n", .{
-                //         i,
-                //         @as(u8, i),
-                //         classifier[i],
-                //         if (std.meta.intToEnum(Tag, classifier[i])) |e| @tagName(e) else |_| "n/a",
-                //     });
-                // }
+                inline for (
+                    [_]std.meta.FieldEnum(Carry.GetArgsStruct()){
+                        .inside_quotes_incl_start_and_carry,
+                        .inside_apostrophes_incl_start_and_carry,
+                        .inside_comments,
+                        .inside_line_strings,
+                    },
+                    [_]u64{
+                        quote_bounds_incl_carry,
+                        apostrophe_bounds_incl_carry,
+                        comment_bounds_incl_carry,
+                        line_string_bounds_incl_carry,
+                    },
+                ) |e, x| {
+                    if (!U512_IMPL)
+                        carry.set(e, sub(all_ends, all_starts & x) & ~all_ends)
+                    else // Avoid subtracting u512's
+                        carry.set(e, ends_inside_string_or_comment & @intFromBool(isNonZero(last_start & x)));
+                }
 
                 var classified_chunk = if (CLASSIFIER_STRATEGY == .global)
-                    vperm2(classifier, chunk);
-
-                if (CLASSIFIER_STRATEGY == .global)
-                    classified_chunk = @select(u8, unmovemask64(inside_strings_or_comments), @as(V, @splat(0)), classified_chunk);
+                    @select(u8, unmovemask64(inside_strings_or_comments), @as(V, @splat(0)), vperm2(classifier, chunk));
 
                 // We can do Vectorized Classification with just `intersect_byte_halves(upper_nibbles, vpshufb(table, contextless_chunk))`
                 // https://validark.github.io/posts/eine-kleine-vectorized-classification/
                 var upper_nibbles = if (CLASSIFIER_STRATEGY == .on_demand) blk: {
                     comptime var powers_of_2_up_to_128: [16]u8 = undefined;
                     inline for (&powers_of_2_up_to_128, 0..) |*slot, i| slot.* = if (i < 8) @as(u8, 1) << i else 0xFF;
-                    break :blk vpshufb(powers_of_2_up_to_128, chunk >> @splat(4));
+                    break :blk @select(u8, unmovemask64(inside_strings_or_comments), @as(V, @splat(0)), vpshufb(powers_of_2_up_to_128, chunk >> @splat(4)));
                 };
 
-                if (CLASSIFIER_STRATEGY == .on_demand)
-                    upper_nibbles = @select(u8, unmovemask64(inside_strings_or_comments), @as(V, @splat(0)), upper_nibbles);
-
                 var contextless_chunk = if (CLASSIFIER_STRATEGY == .on_demand or CLASSIFIER_STRATEGY == .none)
-                    chunk;
+                    @select(u8, unmovemask64(inside_strings_or_comments), @as(V, @splat(0)), chunk);
 
-                if (CLASSIFIER_STRATEGY == .on_demand or CLASSIFIER_STRATEGY == .none)
-                    contextless_chunk = @select(u8, unmovemask64(inside_strings_or_comments), @as(V, @splat(0)), contextless_chunk);
-
-                if (nonASCII != 0) {
+                if (isNonZero(nonASCII)) {
                     @branchHint(.unlikely);
 
                     inline for (0..@sizeOf(@TypeOf(chunk)) / @sizeOf(Chunk)) |i| {
@@ -1995,6 +2113,10 @@ fn Tokenizer(
                     }
 
                     switch (CLASSIFIER_STRATEGY) {
+                        // Kinda funny optimization: `vperm2` looks up 64 bytes into a 128-byte lookup table and simply ignores the uppermost bit.
+                        // On the rare occasion there was a non-ascii character causing us to branch into this block, we revise the `classified_chunk`
+                        // vector so that non-ascii characters are not treated as though they are.
+                        // TODO: instead of having 0 here, it would be nice if this was forwards compatible with an implementation that wanted to use a different number
                         .global => classified_chunk = @select(u8, unmovemask64(nonASCII), @as(V, @splat(0)), classified_chunk),
                         .on_demand => {
                             const nonASCII_bool_vec = unmovemask64(nonASCII);
@@ -2003,11 +2125,11 @@ fn Tokenizer(
                         },
                         .none => contextless_chunk = @select(u8, unmovemask64(nonASCII), @as(V, @splat(0)), contextless_chunk),
                     }
-                }
+                } else if (utf8_checker.is_invalid_place_to_end)
+                    return error.InvalidUtf8;
 
-                // printb(all_starts, "quote or charlit or linestring or comment starts");
-                // _ = char_lit_starts;
-                // _ = line_string_starts_incl_carry;
+                // const ats: u64 = @bitCast(@select(u8, unmovemask64(inside_strings_or_comments), @as(V, @splat(0)), chunk) == @as(V, @splat('@')));
+                const ats: u64 = @as(uint, @bitCast(chunk == @as(V, @splat('@')))) & ~inside_strings_or_comments;
 
                 const standalone_symbols: u64 = switch (CLASSIFIER_STRATEGY) {
                     .global => @bitCast(classified_chunk >= @as(V, @splat(last_exclusively_in_single_char_symbol))),
@@ -2045,19 +2167,12 @@ fn Tokenizer(
                     // zig fmt: on
                 };
 
-                const ats: u64 = switch (CLASSIFIER_STRATEGY) {
-                    .global => @bitCast(classified_chunk == @as(V, @splat(@intFromEnum(CharClasses.at)))),
-                    else => @bitCast(contextless_chunk == @as(V, @splat('@'))),
-                };
-                defer carry.set(.ats, ats);
-
                 const whitespaces: u64 = switch (CLASSIFIER_STRATEGY) {
                     .global => @bitCast(classified_chunk == @as(V, @splat(@intFromEnum(CharClasses.whitespace)))),
                     .on_demand => @bitCast(vpshufb([16]u8{ ' ', 0, 0, 0, 0, 0, 0, 0, 0, '\t', '\n', 0, 0, '\r', 0, 0 }, contextless_chunk) == contextless_chunk),
                     .none => @as(u64, @bitCast(contextless_chunk == @as(V, @splat(' ')))) |
                         @as(u64, @bitCast(contextless_chunk == @as(V, @splat('\t')))) |
-                        carriages |
-                        newlines,
+                        carriages_or_newlines,
                 };
 
                 const alpha_underscores: u64 = switch (CLASSIFIER_STRATEGY) {
@@ -2077,55 +2192,28 @@ fn Tokenizer(
                         @as(u64, @bitCast(contextless_chunk == @as(V, @splat('_')))),
                 };
 
-                const alpha_numeric_underscores: u64 = switch (CLASSIFIER_STRATEGY) {
-                    .global => // zig fmt: off
-                        // The CharClasses are laid out in such a way that this compiles down to a single instruction on AVX-512.
-                        @as(u64, @bitCast(classified_chunk == @as(V, @splat(@intFromEnum(CharClasses.alpha_underscore))))) |
-                        @as(u64, @bitCast(classified_chunk == @as(V, @splat(@intFromEnum(CharClasses.digit))))),
-                    // zig fmt: on
-                    .on_demand, .none => alpha_underscores | digits,
-                };
-                defer carry.set(.alpha_numeric_underscores, alpha_numeric_underscores);
-
-                // quote_starts_incl_carry, char_lit_starts, line_string_starts_incl_carry, comment_starts_incl_carry, classified_chunk, upper_nibbles, contextless_chunk, newlines, carriages, ats, all_starts, all_ends, standalone_symbols, digits, whitespaces, alpha_underscores, alpha_numeric_underscores
-
-                // TODO: make sure that a @ at the end of a chunk can still register as a builtin
-                // kinds = @select(u8, unmovemask64((carry.get(.ats) & alpha_numeric_underscores) | ((alpha_numeric_underscores >> 1) & ats)), @as(V, @splat(@intFromEnum(Tag.builtin))), kinds);
-
-                const builtin_starts = ats & (alpha_underscores >> 1);
+                const alpha_numeric_underscores = alpha_underscores | digits;
+                const builtin_starts = ats & (shr(alpha_underscores, 1));
                 all_starts |= builtin_starts;
 
-                const identifier_or_number_or_builtin_ends = alpha_numeric_underscores & ~(alpha_numeric_underscores >> 1);
-                // printb(identifier_or_number_or_builtin_ends, "identifier_or_number_or_builtin_ends");
-                defer carry.set(.identifier_or_number_or_builtin_ends, identifier_or_number_or_builtin_ends);
+                const identifier_or_number_or_builtin_ends = alpha_numeric_underscores & ~shr(alpha_numeric_underscores, 1);
                 all_ends |= identifier_or_number_or_builtin_ends;
-                printb(identifier_or_number_or_builtin_ends, "identifier_or_number_or_builtin_ends!!!!");
-                printb(all_ends, "[c] all_ends");
 
                 // Figure out where the @"" are. It's okay to use `unescaped_quotes` because `ats` is not in a string/comment/character literal.
-                const string_identifier_starts = ats & (unescaped_quotes >> 1);
+                const string_identifier_starts = ats & shr(unescaped_quotes, 1);
                 all_starts |= string_identifier_starts;
                 // Delete the "" start indicator for @"".
-                all_starts ^= string_identifier_starts << 1; // TODO: delete both the ident and this at once?
-                // all_starts &= ~(quote_starts_incl_carry & follows_at);
+                all_starts ^= shl(string_identifier_starts, 1); // TODO: delete both the ident and this at once?
 
-                // const follows_alpha_numeric_underscore = (alpha_numeric_underscores << 1) | carry.get(.alpha_numeric_underscores);
-
-                const follows_at = (ats << 1); // | carry.get(.ats);
-
-                const identifier_or_number_starts = alpha_numeric_underscores & ~(alpha_numeric_underscores << 1) & ~follows_at;
+                const identifier_or_number_starts = alpha_numeric_underscores & ~shl(alpha_numeric_underscores | ats, 1);
                 all_starts |= identifier_or_number_starts;
-                // printb(identifier_or_number_starts, "identifier_or_number_starts");
 
-                const identifier_starts = alpha_underscores & ~(alpha_numeric_underscores << 1) & ~follows_at;
+                const identifier_starts = alpha_underscores & ~shl(alpha_numeric_underscores | ats, 1);
 
                 const identifier_ends =
-                    identifier_or_number_or_builtin_ends & ~(identifier_or_number_or_builtin_ends -% identifier_starts);
-                defer carry.set(.identifier_ends, identifier_ends);
+                    identifier_or_number_or_builtin_ends & ~sub(identifier_or_number_or_builtin_ends, identifier_starts);
 
                 const number_or_builtin_ends = identifier_or_number_or_builtin_ends ^ identifier_ends;
-                // printb(number_or_builtin_ends, "number_or_builtin_ends");
-                defer carry.set(.number_or_builtin_ends, number_or_builtin_ends);
 
                 var single_char_ends,
                 // These may indicate the first char of a chunk, when a multi-char symbol started in the previous chunk
@@ -2134,6 +2222,7 @@ fn Tokenizer(
                     if (CLASSIFIER_STRATEGY == .global) classified_chunk else contextless_chunk,
                 );
 
+                // Erase `/` from being regarded as a division symbol when used as a comment.
                 // It's okay to use `comment_bounds_incl_carry` because `single_char_ends` is guaranteed not to be in a string/comment/char-literal
                 single_char_ends &= ~comment_bounds_incl_carry;
                 single_char_ends |= standalone_symbols;
@@ -2141,14 +2230,10 @@ fn Tokenizer(
                 const multi_char_symbol_ends = double_char_ends | triple_char_ends;
                 const all_symbol_ends = single_char_ends | multi_char_symbol_ends;
 
-                const triple_char_starts = (triple_char_ends >> 2);
-                const multi_char_symbol_starts = (double_char_ends >> 1) | triple_char_starts;
+                const multi_char_symbol_starts = shr(double_char_ends, 1) | shr(triple_char_ends, 2);
                 const all_symbol_starts = single_char_ends | multi_char_symbol_starts;
-                // printb(all_symbol_starts, "all_symbol_starts");
                 all_starts |= all_symbol_starts;
-                // printb(all_symbol_ends, "all_symbol_ends");
                 all_ends |= all_symbol_ends;
-                printb(all_ends, "[d] all_ends");
 
                 // Maximally, we can have 32 2 character symbols in a 64-byte chunk.
                 const multi_char_end_indices = std.simd.extract(bitsToIndices(multi_char_symbol_ends, 0), 0, 32);
@@ -2170,76 +2255,78 @@ fn Tokenizer(
                             @splat(0),
                             chunk,
                             std.simd.extract(multi_char_end_indices, 16, 16),
-                            @bitCast(@as(u16, @truncate(which_multi_char_symbols_are_triple_chars_compacted >> 16))),
+                            @bitCast(@as(u16, @truncate(shr(which_multi_char_symbols_are_triple_chars_compacted, 16)))),
                         );
                     },
                 );
 
-                const whitespace_starts = whitespaces & ~(whitespaces << 1);
-                const whitespace_ends = whitespaces & ~(whitespaces >> 1);
-
                 if (EMIT_WHITESPACE_AND_COMMENTS == .yes) {
+                    const whitespace_starts = whitespaces & ~shl(whitespaces, 1);
+                    const whitespace_ends = whitespaces & ~shr(whitespaces, 1);
+
                     all_starts |= whitespace_starts;
                     all_ends |= whitespace_ends;
                 }
 
-                // const multi_char_symbol_indices = bitsToIndices((double_char_ends >> 1) | double_char_ends, 0);
-
-                const multi_char_has_one_char_in_prev_chunk: u1 = @truncate(double_char_ends | (triple_char_ends >> 1));
+                const multi_char_has_one_char_in_prev_chunk: u1 = @truncate(double_char_ends | shr(triple_char_ends, 1));
                 const multi_char_has_two_chars_in_prev_chunk: u1 = @truncate(triple_char_ends);
-                const multi_char_starts_before_chunk: u1 = @truncate(multi_char_has_one_char_in_prev_chunk | multi_char_has_two_chars_in_prev_chunk);
+                const multi_char_starts_before_chunk: u1 = multi_char_has_one_char_in_prev_chunk | multi_char_has_two_chars_in_prev_chunk;
 
                 all_starts |= multi_char_starts_before_chunk;
 
                 const number_or_builtin_started_before_chunk: u1 = @truncate(carry.get(.number_or_builtin_ends) & identifier_or_number_starts);
-                printb(number_or_builtin_started_before_chunk, "number_or_builtin_started_before_chunk");
                 // It's okay to use `unescaped_quotes` because the ats cannot be in a string or comment or character literal.
+                // TODO: Revisit me? It could be a pseudo start or the end of a string
                 const string_identifier_started_before_chunk: u1 = @truncate(unescaped_quotes & carry.get(.ats));
                 const builtin_started_before_chunk: u1 = @truncate(alpha_underscores & carry.get(.ats));
-                printb(builtin_started_before_chunk, "builtin_started_before_chunk $$$$$$$$$$$");
                 const identifier_started_before_chunk: u1 = @truncate(alpha_numeric_underscores & carry.get(.identifier_ends));
 
-                //
-                const is_comment_opener_split_between_chunks: u1 = @truncate(all_starts & slashes & carry.get(.slashes));
-                const is_line_string_opener_split_between_chunks: u1 = @truncate(all_starts & backslashes & carry.get(.backslashes));
-
-                // We have separate codepaths for handling potential keywords vs long identifiers because potential keywords should have
-                // a length that can be stored in one byte whereas for arbitrarily long identifiers this is not the case.
-                comptime for (Keywords.unpadded_kws) |kw| assert(kw.len < 15);
-                const is_prev_carried_len_short_enough_for_kw: u1 = @intFromBool(prev_carried_len < 15);
-                const potential_kw_started_before_chunk: u1 = is_prev_carried_len_short_enough_for_kw & identifier_started_before_chunk;
+                const is_comment_opener_split_between_chunks: u1 = @truncate(slashes & carry.get(.slashes) & ~carry.get(.inside_strings_and_comments_including_start));
+                const is_line_string_opener_split_between_chunks: u1 = @truncate(backslashes & carry.get(.backslashes) & ~carry.get(.inside_strings_and_comments_including_start));
 
                 // We have two different models of rewriting the previous token.
 
                 // if a builtin or a number or an identifier that is too long
                 const first_token_starts_before_chunk: u1 = @truncate(is_first_char_inside_string_or_comment |
-                    first_char_ends_quote_or_apostrophe |
+                    first_char_ends_string |
                     string_identifier_started_before_chunk |
                     builtin_started_before_chunk |
-                    (~is_prev_carried_len_short_enough_for_kw & identifier_started_before_chunk) |
+                    // If identifier is short enough to be a keyword, we handle it in the keyword-specific logic
+                    identifier_started_before_chunk |
                     number_or_builtin_started_before_chunk |
                     is_comment_opener_split_between_chunks |
-                    is_line_string_opener_split_between_chunks);
+                    is_line_string_opener_split_between_chunks |
+                    multi_char_starts_before_chunk);
 
+                // Revise `all_ends` such that tokens do not include the carriages_or_newlines_or_eof
+                all_ends = (all_ends & ~carriages_or_newlines_or_eof) | shr(all_ends & carriages_or_newlines_or_eof, 1);
+
+                const MSB: uint = @bitCast(@as(std.meta.Int(.unsigned, @bitSizeOf(uint)), 1) << (VLEN - 1));
+                // Add a dummy end if we ended inside a string/comment/line_string/char_literal
+                all_ends = disjoint_or(all_ends, inside_strings_and_comments_including_start & MSB);
+
+                assert(@popCount(all_ends) == @popCount(all_starts) and (all_ends & ~sub(all_ends, all_starts)) == all_ends);
+
+                // TODO: I re-ordered some of the surrounding logic, so audit this again to make sure this is 100% correct.
+                // This is the length of the token split across the previous and current chunks, if there is one.
+                const carried_len = prev_carried_len + if (first_token_starts_before_chunk == 1) ctzNon0(all_ends) + 1 else 0;
+
+                // We have separate codepaths for handling potential keywords vs long identifiers because potential keywords should have
+                // a length that can be stored in one byte whereas for arbitrarily long identifiers this is not the case.
+                comptime for (Keywords.unpadded_kws) |kw| assert(kw.len <= 14);
+                const is_carried_len_short_enough_to_be_kw: u1 = @intFromBool(carried_len <= 14);
+                const potential_kw_started_before_chunk: u1 = is_carried_len_short_enough_to_be_kw & identifier_started_before_chunk;
                 const rewritable_token_starts_before_chunk: u1 = potential_kw_started_before_chunk | multi_char_starts_before_chunk;
 
-                // std.debug.print("first_token_starts_before_chunk: {}, ", .{first_token_starts_before_chunk});
-                // std.debug.print("potential_kw_started_before_chunk: {}", .{potential_kw_started_before_chunk});
-                // std.debug.print("\n", .{});
-                // TODO: Optimization idea: try a cmov impl that uses -% 1 as a constant because the compiler probably can't see such a thing.
-                // ~(x -% 1) = -x (Arm has a CNEG instruction that might be useful here)
-                const carried_end = all_ends & ~(all_ends -% first_token_starts_before_chunk);
+                const invalids = before_eofs & ~(sub(all_ends, all_starts) | all_ends | whitespaces);
+                all_starts |= invalids;
+                all_ends |= invalids;
 
-                printb(carried_end, "carried_end");
-                // printb(first_token_starts_before_chunk, "first_token_starts_before_chunk");
-                // printb(carried_end, "carried_end");
+                const potentially_in_next_chunk: u1 = @truncate(shr(all_ends, VLEN - 1));
+                const is_token_entire_chunk: u1 = @intFromBool(all_starts == 1) & potentially_in_next_chunk;
 
                 // If we handled any token that started before this chunk, update its length, advancing by two tokens worth if needed.
                 // Otherwise, write out two tokens worth of garbage without updating cur_token so we can overwrite it later.
-                // std.debug.print("prev_carried_len: {}\n", .{prev_carried_len});
-                const carried_len: u32 = if (first_token_starts_before_chunk == 0) 0 else prev_carried_len + @ctz(carried_end) + 1;
-                // std.debug.print("carried_len: {}\n", .{carried_len});
-
                 const last_token = &(cur_token.ptr - first_token_starts_before_chunk)[0];
                 last_token.len = if (carried_len > std.math.maxInt(u8)) 0 else @intCast(carried_len);
                 last_token.kind = if (string_identifier_started_before_chunk == 1)
@@ -2255,27 +2342,18 @@ fn Tokenizer(
 
                 cur_token[0..2].* = @bitCast(carried_len);
 
-                printb(all_starts, "[1] all_starts");
-                printb(all_ends, "[1] all_ends");
-                // _ = before_eofs;
-                const invalids = before_eofs & ~((all_ends -% all_starts) | all_ends | whitespaces);
-                all_starts |= invalids;
+                assert(@popCount(all_starts) == @popCount(all_ends));
 
-                printb(invalids, "invalids");
-                all_ends |= invalids;
-
-                // Remove the fake `start` and the initial `end` if it was a carry-over from a previous chunk
-                all_starts &= all_starts -% first_token_starts_before_chunk;
-                all_ends &= ~carried_end;
-                // std.debug.print("no_ends: {}\n", .{no_ends});
-                const adv_amt: usize = if ((!no_ends or cur.len <= 64) and first_token_starts_before_chunk != 0 and carried_len > std.math.maxInt(u8)) 2 else 0;
-                // std.debug.print("adv_amt: {}\n", .{adv_amt});
+                // If we had an identifier/number/builtin token that ended at the end of the previous chunk, and it was longer than can fit in a u8, we want to skip over 2 chars here.
+                // When do we advance the cur_token over the 4 bytes written out for length? When any combination of the following are true:
+                // 1. When there are other tokens within this chunk.
+                // 2. When we are on the last chunk, we know there cannot be more continuation characters, therefore we must advance.
+                // 3. When the previous chunk ended with a token whose length was over 255, and our current chunk does not continue that chunk
+                // It must also be true that the last token has a length longer than 255.
+                const adv_amt: usize = if ((all_starts > 1 or cur.len <= 64) and carried_len > std.math.maxInt(u8)) 2 else 0;
                 cur_token = cur_token[adv_amt..];
-
                 cur_token = (cur_token.ptr - rewritable_token_starts_before_chunk)[0 .. cur_token.len + rewritable_token_starts_before_chunk];
 
-                // printb(all_starts, "all_starts");
-                // printb(all_ends, "all_ends");~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                 // This is a vector that holds the `kind` of each token.
                 // It's okay to have tags broadcasted to places that will not be extracted in the end
                 var kinds: V = classified_chunk;
@@ -2283,12 +2361,16 @@ fn Tokenizer(
                 inline for ([_]struct { u64, Tag }{
                     // For each (mask, tag) pair, insert the tag into the starting positions in the mask into `kinds`
                     .{ comment_bounds_incl_carry, .@"//" },
+                    .{ string_identifier_starts, .string_identifier },
+                    .{ invalids, .invalid },
+
+                    // Actually all this dead code was eliminated by just making the `classified_chunk` put the correct tag in these positions.
+                    // We don't have to do nearly as much work here as I initially anticipated :D
+
                     // .{ line_string_starts_incl_carry, .@"\\\\" },
                     // .{ quote_starts, .string },
                     // .{ char_lit_starts, .char_literal },
 
-                    .{ string_identifier_starts, .string_identifier },
-                    .{ invalids, .invalid },
                     // .{ builtin_starts, .builtin },
                     // .{ alpha_numeric_underscores, .identifier },
                     // .{ digits, .number },
@@ -2299,42 +2381,28 @@ fn Tokenizer(
                     kinds = @select(u8, unmovemask64(mask), @as(V, @splat(@intFromEnum(tag))), kinds);
                 }
 
-                // printb(multi_char_symbol_starts | multi_char_starts_before_chunk, "multi_char_symbol_starts");
                 kinds = expand(multi_char_kinds_compressed, kinds, multi_char_symbol_starts | multi_char_starts_before_chunk);
 
-                // inline for (0..32) |i|
-                //     std.debug.print("{}: {s}\n", .{ i, if (std.meta.intToEnum(Tag, multi_char_kinds_compressed[i])) |x| @tagName(x) else |_| "n/a" });
+                const next_carried_len =
+                    // We want to carry length across chunks when we end in the last position of a chunk.
+                    // -%@as(u32, potentially_in_next_chunk) &
+                    if (potentially_in_next_chunk == 0) 0 else
+                // We need to keep the carried length from the previous chunk when:
+                // 1. There is only one token in this chunk and
+                // 2. It is a continuation of the last token of the previous chunk
+                (clzNon0(all_starts) + 1 + if (is_token_entire_chunk & first_token_starts_before_chunk == 1) prev_carried_len else 0);
+
+                {
+                    // Remove the fake `start` and the initial `end` if it was a carry-over from a previous chunk
+                    // that we aren't going to handle with a specific routine (keyword classification and multi-char symbol parsing)
+                    const should_delete_first_token = first_token_starts_before_chunk & ~rewritable_token_starts_before_chunk;
+                    all_starts &= all_starts -% should_delete_first_token;
+                    all_ends &= all_ends -% should_delete_first_token;
+                }
 
                 var lens = bitsToIndices(all_ends, 1) -% bitsToIndices(all_starts, 0);
-                // printb(multi_char_has_one_char_in_prev_chunk, "multi_char_has_one_char_in_prev_chunk");
                 lens += @as(V, [1]u8{multi_char_starts_before_chunk} ++ [1]u8{0} ** 63);
                 lens += @as(V, [1]u8{multi_char_has_two_chars_in_prev_chunk} ++ [1]u8{0} ** 63);
-                // printb(unescaped_quotes & all_starts, "unescaped_quotes & all_starts");
-                // printb(((unescaped_quotes & all_starts) >> 1), "((unescaped_quotes & all_starts) >> 1)");
-                // printb(ats, "ats");
-                // printb(all_starts, "all_starts");
-                // printb(all_starts, "all_starts");
-                // all_starts |= string_identifier_starts;
-
-                // The compiler thinks we have to wait until all_starts is fully completed.
-                // However, we don't actually have to, because we can simply delete bits from the
-                // compression mask we use at the end to undo the splats we do here.
-                // inline for ([_]struct { u64, Tag }{
-                //     // For each (mask, tag) pair, insert the tag into the starting positions in the mask into `kinds`
-                //     .{ (alpha_numeric_underscores >> 1) & ats, .builtin },
-                //     .{ unescaped_quotes & all_starts & ~follows_at, .string },
-                //     .{ string_identifier_starts, .string_identifier },
-                //     .{ unescaped_apostrophes & all_starts, .char_literal },
-                //     .{ comment_starts_incl_carry, .@"//" },
-                //     .{ line_string_starts_incl_carry & all_starts, .@"\\\\" },
-                //     .{ identifier_starts, .identifier },
-                //     .{ all_symbol_starts, .symbol },
-                // }) |mask_and_tag| {
-                //     const mask, const tag = mask_and_tag;
-                //     kinds = @select(u8, @as(@Vector(64, bool), @bitCast(mask)), @as(V, @splat(@intFromEnum(tag))), kinds);
-                // }
-
-                // kinds = @select(u8, @as(@Vector(64, bool), @bitCast(mask)), @as(V, @splat(@intFromEnum(tag))), kinds);
 
                 // Note: We sometimes use contextless_chunk here because if we used chunk, we'd have to keep that information alive.
                 getKeywordExtents(
@@ -2344,79 +2412,19 @@ fn Tokenizer(
                     &kinds,
                     identifier_starts,
                     identifier_ends,
-                    if ((potential_kw_started_before_chunk & is_prev_carried_len_short_enough_for_kw) == 1) @intCast(prev_carried_len) else 0,
+                    if ((potential_kw_started_before_chunk & is_carried_len_short_enough_to_be_kw) == 1) @intCast(prev_carried_len) else 0,
                     potential_kw_started_before_chunk,
                 );
 
-                // printb(, "(all_ends -% all_starts) | all_ends | whitespaces");
+                prev_carried_len = next_carried_len;
 
                 // TODO: revitalize this codepath
                 // mergeWhitespaceAndCommentsWithAdjacentKeywordsAndSymbols(all_starts, all_ends);
 
-                // const whitespace_starts = whitespace & ~(whitespace << 1);
-                // (whitespace +% whitespace_starts) & comment_starts_incl_carry;
-
-                printStr(@as([64]u8, @bitCast(if (CLASSIFIER_STRATEGY == .global) chunk else contextless_chunk))[0..64]);
-                // printb(all_starts_for_len_calc, "all_starts_for_len_calc");
-                // printb(all_ends_for_len_calc, "all_ends_for_len_calc");
-                // printb(all_starts, "all_starts");
-
-                if (builtin.mode == .Debug) {
-                    var s = all_starts;
-                    printb(all_starts, "all_starts");
-                    printb(all_ends, "all_ends");
-                    var i: u64 = 0;
-                    while (s != 0) : ({
-                        s &= s -% 1;
-                        i += 1;
-                    }) {
-                        // const e1 = std.meta.intToEnum(CharClasses, kinds[@ctz(s)]);
-                        const e2 = std.meta.intToEnum(Tag, kinds[@ctz(s)]);
-                        std.debug.print("{} {s} {}\n", .{
-                            @ctz(s),
-                            // if (e1) |e| @tagName(e) else |_| "n/a",
-                            if (e2) |e| @tagName(e) else |_| "n/a",
-                            lens[i],
-                        });
-                    }
-                }
-
-                // storeNonTemporal(cur_token.ptr, @as([64]Token, @bitCast(std.simd.interlace(.{ lens, compress(kinds, all_starts) }))));
                 cur_token[0..64].* = @as([64]Token, @bitCast(std.simd.interlace(.{ lens, compress(kinds, all_starts) })));
                 cur_token = cur_token[@popCount(all_starts)..]; // advance by the number of completed tokens
-
-                const cache_deletion_stat: enum { clflush, prefetch, none } = .none;
-
-                switch (cache_deletion_stat) {
-                    .clflush => {
-                        const flushable_cache_line = cur_token.ptr - 64;
-                        if (@intFromPtr(flushable_cache_line) >= @intFromPtr(tokens.ptr)) {
-                            @branchHint(.likely);
-                            clflushopt(flushable_cache_line);
-                        }
-                    },
-                    .prefetch => @prefetch(cur_token.ptr - 64, .{ .locality = 0 }),
-                    .none => {},
-                }
-
-                // TODO: restore optimization maybe?
-                // 62 is one less than it otherwise would be to avoid a `+1`.
-                prev_carried_len = if (all_starts == 0) prev_carried_len + 64 else 1 + @clz(all_starts);
-
-                // carry.updateViaTopBits(.{
-                //     .slashes = slashes,
-                //     .backslashes = backslashes,
-                //     .non_newlines = non_newlines,
-                //     .quote_starts = ~all_ends & (all_ends -% quote_starts),
-                //     .char_lit_starts = ~all_ends & (all_ends -% char_lit_starts),
-                //     .comment_starts_incl_carry = ~all_ends & (all_ends -% comment_starts_incl_carry),
-                //     .line_string_starts_incl_carry = ~all_ends & (all_ends -% line_string_starts_incl_carry),
-                //     .inside_strings_and_comments_including_start = inside_strings_or_comments,
-                //     .carriages = carriages,
-                //     .ats = ats,
-                // });
-
-                // carry.print();
+                // TODO: It's faster to not interlace them. Perhaps we can avoid/lessen this cost?
+                // We could try producing these as u16's then combining them could be faster?
 
                 if (0 != before_eofs & @as(u64, switch (CLASSIFIER_STRATEGY) {
                     .global => @bitCast(classified_chunk == @as(V, @splat(@intFromEnum(CharClasses.bad_control)))),
@@ -2434,7 +2442,7 @@ fn Tokenizer(
                         const codes: u64 = @bitCast(contextless_chunk < @as(V, @splat(@intFromEnum(' '))));
                         const tabs: u64 = @bitCast(contextless_chunk == @as(V, @splat(@intFromEnum('\t'))));
                         const del: u64 = @bitCast(contextless_chunk == @as(V, @splat(@intFromEnum(0x7F))));
-                        break :blk (codes ^ (tabs | newlines | carriages)) | del;
+                        break :blk (codes ^ (tabs | newlines)) | del;
                     },
                 })) {
                     @branchHint(.unlikely);
@@ -2443,33 +2451,40 @@ fn Tokenizer(
 
                 if (cur.len <= 64) break;
                 cur = cur[64..];
-                // std.debug.print("----- NEW CHUNK -----\n", .{});
 
-                // if (comptime builtin.mode == .ReleaseSafe or builtin.mode == .Debug)
-                // if (@intFromPtr(cur) >= @intFromPtr(final_cur)) break;
-                // if (comptime builtin.mode == .Debug) {
-                //     super_duper_pls_delete_me_iter += 1;
-                //     if (super_duper_pls_delete_me_iter == 4) break;
-                // }
+                carry.set(.slashes, slashes);
+                carry.set(.backslashes, backslashes);
+                carry.set(.carriages, carriages);
+                carry.set(.inside_strings_and_comments_including_start, inside_strings_and_comments_including_start);
+                carry.set(.ats, ats);
+                carry.set(.identifier_ends, identifier_ends);
+                carry.set(.number_or_builtin_ends, number_or_builtin_ends);
+
+                // TODO Idea: We could interleave the high halves of all of these and thereby compress them into the upper part of a vector.
+                //  Then we move them all to the lowest quad at once, and we could extract the interesting bits efficiently.
+                //  I think we could do a trivial (non-lane-crossing) shift and then a `VPAND`. But even better, we could probably stuff that into
+                //  a vpternlog to completely hide the cost of the `VPAND` (well, except in your i$, but who even needs that anyway?)
+
+                // TODO Idea: Alternatively we will write each one out to a byte which we can load back in from memory later.
+                //  Hopefully the hardware does register mirroring for us?
+
+                // interlaceHighHalvesAndMoveToLowestQuad(.{
+                //     slashes,
+                //     backslashes,
+                //     carriages,
+                //     inside_strings_and_comments_including_start,
+                //     ats,
+                //     identifier_ends,
+                //     number_or_builtin_ends,
+                // });
             }
 
-            // if (@intFromPtr(cur) < @intFromPtr(final_cur) or (sourcey.slice().len % 64) != @ctz(eofs)) {
-            //     return error.Invalid0ByteInFile;
-            // }
-
-            // cur_token = cur_token[if (cur_token[0].len == 0) 3 else 1..];
             cur_token[0] = .{ .len = 1, .kind = .eof };
             cur_token = cur_token[1..];
 
-            if (builtin.mode == .Debug) {
+            if (builtin.mode == .Debug and 1 == 0) {
                 const end_token = cur_token;
-                // cur_token = tokens;
 
-                std.debug.print("-----------------------\n", .{});
-
-                for (tokens[0 .. end_token.ptr - tokens.ptr]) |tok| {
-                    std.debug.print("tok.kind: {s}, tok.len: {}\n", .{ @tagName(tok.kind), tok.len });
-                }
                 std.debug.print("-----------------------\n", .{});
 
                 var iter: TokenInfoIterator = .init(source, tokens[0 .. end_token.ptr - tokens.ptr]);
@@ -2478,38 +2493,11 @@ fn Tokenizer(
                     std.debug.print("{s} {}\n", .{ @tagName(iter.current().kind), iter.current().source.len });
                     if (iter.current().kind == .invalid) found_invalid = true;
                 }
-                if (found_invalid) return error.InvalidChicken;
+                // if (found_invalid) return error.InvalidChicken;
                 std.debug.print("-----------------------\n", .{});
             }
 
-            // if (@intFromPtr(cur.ptr) < @intFromPtr(end_ptr)) return error.Found0ByteInFile;
-
-            // cur_token[0] = .{ .len = 0, .kind = .eof };
-            // cur_token = cur_token[1..];
-            // cur_token[0] = .{ .len = 0, .kind = .eof };
-            // cur_token = cur_token[1..];
-            // cur_token[0] = .{ .len = 0, .kind = .eof };
-            // cur_token = cur_token[1..];
-
             const num_tokens = (@intFromPtr(cur_token.ptr) - @intFromPtr(tokens.ptr)) / @sizeOf(Token);
-            // if (builtin.mode == .Debug) {
-            //     var cursor: []const u8 = sourcey.slice();
-
-            //     for (tokens[0..num_tokens]) |token| {
-            //         const len = token.len;
-            //         std.debug.print("kind: {s}, len: {}, str: `", .{ @tagName(token.kind), len });
-
-            //         for (cursor[0..len]) |c| {
-            //             switch (c) {
-            //                 '\n' => std.debug.print("$", .{}),
-            //                 else => std.debug.print("{c}", .{c}),
-            //             }
-            //         }
-            //         std.debug.print("`\n", .{});
-
-            //         cursor = cursor[len..];
-            //     }
-            // }
 
             // Overallocate the tokens a little for convenience in the Parser (soon™)
             const new_chunks_data_len = 3 + num_tokens;
@@ -2558,7 +2546,7 @@ fn Tokenizer(
             var all_ends_for_len_calc = all_ends;
 
             // printb(whitespace, "whitespace");
-            const whitespace_afters = ~whitespaces & (whitespaces << 1);
+            const whitespace_afters = ~whitespaces & shl(whitespaces, 1);
             const comment_ends = all_ends & ~(all_ends -% comment_starts);
 
             // Step 1. Merge whitespace followed by comments into comments.
@@ -2631,10 +2619,10 @@ fn Tokenizer(
             // Because comments always end with \n, we kill 2 birds with 1 stone right here.
             const extendable_sym_kw_starts = whitespace_afters & sym_kw_starts;
 
-            const inside_extended_comments = (right_extended_comment_ends << 1) -% left_extended_comment_starts;
+            const inside_extended_comments = shl(right_extended_comment_ends, 1) -% left_extended_comment_starts;
             const left_bounds = (whitespace_starts & ~inside_extended_comments) | left_extended_comment_starts;
 
-            all_ends_for_len_calc &= ~(extendable_sym_kw_starts >> 1);
+            all_ends_for_len_calc &= ~shr(extendable_sym_kw_starts, 1);
 
             const left_extended_sym_kw_starts_using_bitreverse = andn(left_bounds, reversedSubtraction(left_bounds, extendable_sym_kw_starts));
 
@@ -2681,23 +2669,60 @@ fn Tokenizer(
     };
 }
 
+fn ctzNon0(x: anytype) u32 {
+    switch (@TypeOf(x)) {
+        @Vector(8, u64) => {
+            const non_zeroes: u8 = @bitCast(x != @as(@Vector(8, u64), @splat(0)));
+            assert(non_zeroes != 0);
+            return @as(u32, @ctz(non_zeroes)) * 64 + @ctz(compressq(x, non_zeroes)[0]);
+        },
+        u64, u32 => {
+            assert(x != 0);
+            return @ctz(x);
+        },
+        else => @compileError("Not yet implemented!"),
+    }
+}
+
+fn clzNon0(x: anytype) u32 {
+    switch (@TypeOf(x)) {
+        @Vector(8, u64) => {
+            const y = std.simd.reverseOrder(x);
+            const non_zeroes: u8 = @bitCast(y != @as(@Vector(8, u64), @splat(0)));
+            assert(non_zeroes != 0);
+            return @as(u32, @ctz(non_zeroes)) * 64 + @clz(compressq(y, non_zeroes)[0]);
+        },
+        u64, u32 => {
+            assert(x != 0);
+            return @clz(x);
+        },
+        else => @compileError("Not yet implemented!"),
+    }
+}
+
+fn compressq(compressable: @Vector(8, u64), mask: u8) @Vector(8, u64) {
+    return struct {
+        extern fn @"llvm.x86.avx512.mask.compress.q"(@Vector(8, u64), @Vector(8, u64), u8) @Vector(8, u64);
+    }.@"llvm.x86.avx512.mask.compress.q"(compressable, @splat(0), mask);
+}
+
 // const Rp = rpmalloc.RPMalloc(.{});
 pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
-    // var jdz = jdz_allocator.JdzAllocator(.{
-    //     .split_large_spans_to_one = true,
-    //     .split_large_spans_to_large = true,
-    // }).init();
-    // defer jdz.deinit();
-    // const gpa: Allocator = jdz.allocator();
+    var jdz = jdz_allocator.JdzAllocator(.{
+        .split_large_spans_to_one = true,
+        .split_large_spans_to_large = true,
+    }).init();
+    defer jdz.deinit();
+    const gpa: Allocator = jdz.allocator();
 
     // const gpa = std.heap.c_allocator;
-    const gpa = std.heap.page_allocator;
+    // const gpa = std.heap.page_allocator;
     const sources: SourceData = try .readFiles(gpa);
     defer {
         // Leak memory in ReleaseFast because the OS is going to clean it up on program exit.
         // However, in debug mode, we still want to make sure we don't have any leaks that could affect the program while still running.
-        if (comptime builtin.mode == .Debug)
+        if (comptime builtin.mode == .Debug or builtin.mode == .ReleaseSafe)
             sources.deinit(gpa);
     }
 
@@ -2744,8 +2769,8 @@ pub fn main() !void {
         const elapsedNanos2: u64 = @intCast(t4 - t3);
 
         if (REPORT_SPEED) {
-            const throughput = @as(f64, @floatFromInt(bytes * 1000)) / @as(f64, @floatFromInt(elapsedNanos2));
-            try stdout.print("\n" ** @intFromBool(RUN_LEGACY_AST or RUN_NEW_AST) ++ "Legacy Tokenizing took             {: >9} ({d:.2} MB/s, {d: >5.2}M loc/s) and used {} memory\n", .{ std.fmt.fmtDuration(elapsedNanos2), throughput, @as(f64, @floatFromInt(lines)) / @as(f64, @floatFromInt(elapsedNanos2)) * 1000, std.fmt.fmtIntSizeDec(num_tokens2 * 5) });
+            const throughput = @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(elapsedNanos2));
+            try stdout.print("\n" ** @intFromBool(RUN_LEGACY_AST or RUN_NEW_AST) ++ "Legacy Tokenizing took             {: >9} ({d:.2} GB/s, {d: >5.2}B loc/s) and used {} memory\n", .{ std.fmt.fmtDuration(elapsedNanos2), throughput, @as(f64, @floatFromInt(lines)) / @as(f64, @floatFromInt(elapsedNanos2)), std.fmt.fmtIntSizeDec(num_tokens2 * 5) });
             break :blk elapsedNanos2;
         }
     };
@@ -2866,8 +2891,8 @@ pub fn main() !void {
         }
 
         if (RUN_COMPRESS_TOKENIZER and REPORT_SPEED) {
-            const throughput = @as(f64, @floatFromInt(bytes * 1000)) / @as(f64, @floatFromInt(elapsedNanos3));
-            try stdout.print("Tokenizing with compression took   {: >9} ({d:.2} MB/s, {d: >5.2}M loc/s) and used {} memory\n", .{ std.fmt.fmtDuration(elapsedNanos3), throughput, @as(f64, @floatFromInt(lines)) / @as(f64, @floatFromInt(elapsedNanos3)) * 1000, std.fmt.fmtIntSizeDec(num_tokens * 2) });
+            const throughput = @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(elapsedNanos3));
+            try stdout.print("Tokenizing with compression took   {: >9} ({d:.2} GB/s, {d: >5.2}B loc/s) and used {} memory\n", .{ std.fmt.fmtDuration(elapsedNanos3), throughput, @as(f64, @floatFromInt(lines)) / @as(f64, @floatFromInt(elapsedNanos3)), std.fmt.fmtIntSizeDec(num_tokens * 2) });
 
             if (elapsedNanos2 > 0) {
                 try stdout.print("       That's {d:.2}x faster and {d:.2}x less memory than the mainline implementation!\n", .{ @as(f64, @floatFromInt(elapsedNanos2)) / @as(f64, @floatFromInt(elapsedNanos3)), @as(f64, @floatFromInt(num_tokens2 * 5)) / @as(f64, @floatFromInt(num_tokens * 2)) });
@@ -3685,53 +3710,6 @@ fn Utf8Checker(comptime options: struct {
 //--------------------------------------------------------------------------------------------
 // Peephole optimization helpers:
 
-// Forces the compiler to use the `andn` instruction on some targets.
-// Kinda unfortunate but LLVM just doesn't make good decisions regarding op-fusion that much.
-// https://github.com/llvm/llvm-project/issues/108840
-// https://github.com/llvm/llvm-project/issues/103501 (sorta)
-// https://github.com/llvm/llvm-project/issues/85857
-// https://github.com/llvm/llvm-project/issues/71389
-// https://github.com/llvm/llvm-project/issues/112425
-fn andn(src: anytype, mask: @TypeOf(src)) @TypeOf(src) {
-    switch (builtin.cpu.arch) {
-        .x86_64 => if (std.Target.x86.featureSetHas(builtin.cpu.features, .bmi2)) {
-            return asm ("andn %[src], %[mask], %[ret]"
-                : [ret] "=r" (-> @TypeOf(src)),
-                : [src] "r" (src),
-                  [mask] "r" (mask),
-            );
-        },
-
-        .riscv64 => if (std.Target.riscv.featureSetHas(builtin.cpu.features, .zbb) or std.Target.riscv.featureSetHas(builtin.cpu.features, .zbkb)) {
-            return asm ("andn %[ret], %[src], %[mask]"
-                : [ret] "=r" (-> @TypeOf(src)),
-                : [src] "r" (src),
-                  [mask] "r" (mask),
-            );
-        },
-
-        .aarch64, .aarch64_be => {
-            return asm ("bic %[ret], %[src], %[mask]"
-                : [ret] "=r" (-> @TypeOf(src)),
-                : [src] "r" (src),
-                  [mask] "r" (mask),
-            );
-        },
-
-        .powerpc64 => {
-            return asm ("andc %[ret], %[src], %[mask]"
-                : [ret] "=r" (-> @TypeOf(src)),
-                : [src] "r" (src),
-                  [mask] "r" (mask),
-            );
-        },
-
-        else => {},
-    }
-
-    return src & ~mask;
-}
-
 fn intersect_byte_halves(a: anytype, b: anytype) std.meta.Int(.unsigned, @typeInfo(@TypeOf(a, b)).vector.len) {
     assert(std.simd.countTrues(@popCount(a) == @as(@TypeOf(a, b), @splat(1))) == @typeInfo(@TypeOf(a, b)).vector.len);
 
@@ -3739,18 +3717,6 @@ fn intersect_byte_halves(a: anytype, b: anytype) std.meta.Int(.unsigned, @typeIn
         @as(@TypeOf(a, b), @splat(0)) != (a & b)
     else
         a == (a & b));
-}
-
-// Oftentimes, we want to combine two bitstrings via `|`.
-// However, when we know they are disjoint, we can use `+%` instead.
-// This enables optimizations on x86 like using `lea` instead of `or`,
-// which can fuse a left-shift for one of the operands, and can move to a
-// different destination register. Interestingly, the compiler seems afraid of
-// doing `kaddq` in `k`-registers, so we should double-check how using this instead
-// of an `|` changes the emit.
-fn disjoint_or(a: anytype, b: anytype) @TypeOf(a, b) {
-    assert((a & b) == 0);
-    return a +% b;
 }
 
 // Works around https://github.com/llvm/llvm-project/issues/110868
@@ -3900,24 +3866,83 @@ fn clflushopt(ptr: anytype) void {
 //     }
 // }
 
-const DEFAULT_NOT = true;
-
-fn vpnot(a_: anytype) @TypeOf(a_) {
-    if (DEFAULT_NOT) return ~a_;
-    const a: @Vector(8, u64) = @bitCast(a_);
-    return @bitCast(vpternlog(a, a, a, 51));
+fn vpternlog(a: @Vector(8, u64), b: @Vector(8, u64), c: @Vector(8, u64), comptime imm8: u8) @Vector(8, u64) {
+    return struct {
+        extern fn @"llvm.x86.avx512.pternlog.q.512"(@Vector(8, u64), @Vector(8, u64), @Vector(8, u64), i32) @Vector(8, u64);
+    }.@"llvm.x86.avx512.pternlog.q.512"(a, b, c, imm8);
 }
 
-fn vpternlog(vec_1: @Vector(8, u64), vec_2: @Vector(8, u64), vec_3: @Vector(8, u64), comptime i: i32) @Vector(8, u64) {
-    var result = vec_1;
-    asm volatile (
-        \\ vpternlogq %[imm], %[vec_3], %[vec_2], %[vec_1]
-        : [vec_1] "+x" (result),
-        : [vec_2] "x" (vec_2),
-          [vec_3] "x" (vec_3),
-          [imm] "n" (i),
-    );
-    return result;
+/// Takes input vectors `a`, `b`, and `c` and a comptime string expression of how to combine them (using parenthesis and these operators: [&|^~]).
+/// Returns a vpternlog(a, b, c, IMM8) where IMM8 is the appropriate truth table for the given string expression.
+/// E.g. tern(x, y, z, "~a & (b | c)"); // `a`, `b`, and `c` are the parameters we expect in the string no matter what is passed in as arguments.
+fn tern(a: @Vector(8, u64), b: @Vector(8, u64), c: @Vector(8, u64), comptime expr: []const u8) @Vector(8, u64) {
+    comptime var imm8: u8 = 0;
+    comptime {
+        for (0..8) |i| {
+            const end_pos, const ans = compileBitManipHelper(0, 0, expr ++ "\x00", @truncate(i >> 2), @truncate(i >> 1), @truncate(i >> 0));
+            assert(end_pos == expr.len + 1);
+            imm8 |= @as(u8, ans) << i;
+        }
+    }
+    return vpternlog(a, b, c, imm8);
+}
+
+/// A tiny bit-manip expression compiler.
+/// Primarily meant to be used on valid expressions, although some error checking is done
+fn compileBitManipHelper(precendence: u64, pos_: usize, expr: []const u8, a: u1, b: u1, c: u1) struct { usize, u1 } {
+    var pos = pos_;
+    while (expr[pos] == ' ') pos += 1;
+
+    const left_chr = expr[pos];
+    pos, var left = switch (left_chr) {
+        '~' => compileBitManipHelper(4, pos + 1, expr, a, b, c),
+        'a' => .{ pos + 1, a },
+        'b' => .{ pos + 1, b },
+        'c' => .{ pos + 1, c },
+        '(' => compileBitManipHelper(0, pos + 1, expr, a, b, c),
+        else => unreachable,
+    };
+
+    switch (left_chr) {
+        '~' => left = ~left,
+        '(' => {
+            if (expr[pos] != ')') unreachable;
+            pos += 1;
+        },
+        else => {},
+    }
+
+    while (true) {
+        while (expr[pos] == ' ') pos += 1;
+
+        const op = expr[pos];
+        const op_precedence = @as(u64, switch (op) {
+            0 => 0,
+            ')' => 0,
+            '&' => 3,
+            '^' => 2,
+            '|' => 1,
+            else => unreachable,
+        });
+
+        if (precendence >= op_precedence) break;
+
+        pos, const right = switch (op) {
+            '&' => compileBitManipHelper(3, pos + 1, expr, a, b, c),
+            '^' => compileBitManipHelper(2, pos + 1, expr, a, b, c),
+            '|' => compileBitManipHelper(1, pos + 1, expr, a, b, c),
+            else => unreachable,
+        };
+
+        left = switch (op) {
+            '&' => left & right,
+            '^' => left ^ right,
+            '|' => left | right,
+            else => unreachable,
+        };
+    }
+
+    return .{ pos, left };
 }
 
 fn pext(a: anytype, b: anytype) if (@bitSizeOf(@TypeOf(a)) >= @bitSizeOf(@TypeOf(b))) @TypeOf(a) else @TypeOf(b) {
@@ -4019,15 +4044,48 @@ fn pdep(a: anytype, b: anytype) if (@bitSizeOf(@TypeOf(a)) >= @bitSizeOf(@TypeOf
     };
 }
 
-fn bzhi(src: u64, mask: u64) u64 {
+// https://github.com/llvm/llvm-project/issues/132714
+fn bzhi(src: anytype, mask: @TypeOf(src)) @TypeOf(src) {
     if (std.Target.x86.featureSetHas(builtin.cpu.features, .bmi2)) {
         return struct {
-            extern fn @"llvm.x86.bmi.bzhi.64"(u64, u64) u64;
+            extern fn @"llvm.x86.bmi.bzhi.64"(@TypeOf(src), @TypeOf(src)) @TypeOf(src);
         }.@"llvm.x86.bmi.bzhi.64"(src, mask);
     } else {
         const m: u8 = @truncate(mask);
-        return src & ~if (m >= 64) @as(u64, 0) else (~@as(u64, 0) << @intCast(m));
+        return src & ~if (m >= @bitSizeOf(@TypeOf(src))) @as(@TypeOf(src), 0) else (~@as(@TypeOf(src), 0) << @intCast(m));
     }
+}
+
+// https://github.com/llvm/llvm-project/issues/109888
+fn vpsllvq(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
+    const s = struct {
+        extern fn @"llvm.x86.avx2.psllv.q"(@Vector(2, u64), @Vector(2, u64)) @Vector(2, u64);
+        extern fn @"llvm.x86.avx2.psllv.q.256"(@Vector(4, u64), @Vector(4, u64)) @Vector(4, u64);
+        extern fn @"llvm.x86.avx512.psllv.q.512"(@Vector(8, u64), @Vector(8, u64)) @Vector(8, u64);
+    };
+
+    return switch (@TypeOf(a)) {
+        @Vector(2, u64) => s.@"llvm.x86.avx2.psllv.q"(a, b),
+        @Vector(4, u64) => s.@"llvm.x86.avx2.psllv.q.256"(a, b),
+        @Vector(8, u64) => s.@"llvm.x86.avx512.psllv.q.512"(a, b),
+        else => @compileError("Invalid type to vpsllvq"),
+    };
+}
+
+// https://github.com/llvm/llvm-project/issues/109888
+fn vpsrlvq(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
+    const s = struct {
+        extern fn @"llvm.x86.avx2.psrlv.q"(@Vector(2, u64), @Vector(2, u64)) @Vector(2, u64);
+        extern fn @"llvm.x86.avx2.psrlv.q.256"(@Vector(4, u64), @Vector(4, u64)) @Vector(4, u64);
+        extern fn @"llvm.x86.avx512.psrlv.q.512"(@Vector(8, u64), @Vector(8, u64)) @Vector(8, u64);
+    };
+
+    return switch (@TypeOf(a)) {
+        @Vector(2, u64) => s.@"llvm.x86.avx2.psrlv.q"(a, b),
+        @Vector(4, u64) => s.@"llvm.x86.avx2.psrlv.q.256"(a, b),
+        @Vector(8, u64) => s.@"llvm.x86.avx512.psrlv.q.512"(a, b),
+        else => @compileError("Invalid type to vpsrlvq"),
+    };
 }
 
 // Workaround until https://github.com/llvm/llvm-project/issues/79094 is solved.
@@ -4072,7 +4130,10 @@ fn shuffle(table: anytype, indices: anytype) @Vector(@typeInfo(@TypeOf(indices))
 
                 // Break the table into 16-byte chunks
                 inline for (0..@typeInfo(T).vector.len / UNIQUE_INDICES_AT_ONCE) |k| {
-                    result |= vpshufb(std.simd.repeat(VEC_LEN, std.simd.extract(table, k * UNIQUE_INDICES_AT_ONCE, UNIQUE_INDICES_AT_ONCE)), @as(Q, @splat(0x70)) +| (sub_indices -% @as(Q, @splat(16 * k))));
+                    result |= vpshufb(
+                        std.simd.repeat(VEC_LEN, std.simd.extract(table, k * UNIQUE_INDICES_AT_ONCE, UNIQUE_INDICES_AT_ONCE)),
+                        @as(Q, @splat(0x70)) +| (sub_indices -% @as(Q, @splat(16 * k))),
+                    );
                 }
 
                 slot.* = result;
@@ -4164,15 +4225,14 @@ fn splat16(a: anytype) @Vector(16, u8) {
 //        }.@"llvm.x86.avx512.mask.permvar.qi.512"(table, padWithUndefineds(@Vector(64, u8), indices), padWithUndefineds(@Vector(64, u8), fallback), @as(u16, @bitCast(mask))), 0, @typeInfo(@TypeOf(indices)).vector.len);
 //    }
 
-// USE THIS FOR THE BENCHMARK ONLY! THIS WILL BREAK IF THE K-REGISTER DOES NOT MATCH THE HARDCODED ONE!!!
-export fn vpermt2b(vec_1: @Vector(64, u8), indices: @Vector(64, u8), vec_2: @Vector(64, u8), mask: u64) @Vector(64, u8) {
+fn vpermt2b(vec_1: @Vector(64, u8), indices: @Vector(64, u8), vec_2: @Vector(64, u8), mask: u64) @Vector(64, u8) {
     var result = vec_1;
     asm volatile (
-        \\ vpermt2b %[vec_2], %[indices], %[vec_1] {k1} {z}
+        \\ vpermt2b %[vec_2], %[indices], %[vec_1] {%[mask]} {z}
         : [vec_1] "+x" (result),
         : [indices] "x" (indices),
           [vec_2] "x" (vec_2),
-          [mask] "k" (mask),
+          [mask] "^Yk" (mask),
     );
     return result;
 }
@@ -4182,26 +4242,35 @@ fn vperm2_zmask(table: @Vector(128, u8), indices: anytype, mask: u64) @TypeOf(in
     //     return shuffle(table, indices & @as(@TypeOf(indices), @splat(0b0111_1111)));
 
     const table_part_1, const table_part_2 = @as([2]@Vector(64, u8), @bitCast(table));
-    // USE THIS FOR THE BENCHMARK ONLY! THIS WILL BREAK IF THE K-REGISTER DOES NOT MATCH THE HARDCODED ONE!!!
-    // return vpermt2b(table_part_1, indices, table_part_2, mask);
-    return std.simd.extract(
-        struct {
-            extern fn @"llvm.x86.avx512.maskz.vpermt2var.qi.512"(@Vector(64, u8), @Vector(64, u8), @Vector(64, u8), u64) @Vector(64, u8);
-        }.@"llvm.x86.avx512.maskz.vpermt2var.qi.512"(
-            padWithUndefineds(@Vector(64, u8), indices),
-            table_part_1,
-            table_part_2,
-            mask,
-        ),
-        0,
-        @typeInfo(@TypeOf(indices)).vector.len,
-    );
+    return vpermt2b(table_part_1, indices, table_part_2, mask);
+    // return std.simd.extract(
+    //     struct {
+    //         extern fn @"llvm.x86.avx512.maskz.vpermt2var.qi.512"(@Vector(64, u8), @Vector(64, u8), @Vector(64, u8), u64) @Vector(64, u8);
+    //     }.@"llvm.x86.avx512.maskz.vpermt2var.qi.512"(
+    //         padWithUndefineds(@Vector(64, u8), indices),
+    //         table_part_1,
+    //         table_part_2,
+    //         mask,
+    //     ),
+    //     0,
+    //     @typeInfo(@TypeOf(indices)).vector.len,
+    // );
 }
 
 fn vperm2(table: @Vector(128, u8), indices: anytype) @TypeOf(indices) {
     if (@inComptime() or comptime !std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vbmi))
         return shuffle(table, indices & @as(@TypeOf(indices), @splat(0b0111_1111)));
 
+    if (@sizeOf(@TypeOf(indices)) > 64) {
+        const I_LEN = @sizeOf(@TypeOf(indices));
+        const VEC_LEN = 64;
+        var parts: [@divExact(I_LEN, VEC_LEN)]@Vector(VEC_LEN, u8) = undefined;
+        inline for (&parts, 0..) |*slot, i| {
+            const sub_indices = std.simd.extract(indices, i * VEC_LEN, VEC_LEN);
+            slot.* = vperm2(table, sub_indices);
+        }
+        return @bitCast(parts);
+    }
     const table_part_1, const table_part_2 = @as([2]@Vector(64, u8), @bitCast(table));
     return std.simd.extract(struct {
         extern fn @"llvm.x86.avx512.vpermi2var.qi.512"(@Vector(64, u8), @Vector(64, u8), @Vector(64, u8)) @Vector(64, u8);
@@ -4211,6 +4280,17 @@ fn vperm2(table: @Vector(128, u8), indices: anytype) @TypeOf(indices) {
 fn vperm4(table: @Vector(256, u8), indices: anytype) @TypeOf(indices) {
     if (@inComptime() or comptime !std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vbmi))
         return shuffle(table, indices);
+
+    if (@sizeOf(@TypeOf(indices)) > 64) {
+        const I_LEN = @sizeOf(@TypeOf(indices));
+        const VEC_LEN = 64;
+        var parts: [@divExact(I_LEN, VEC_LEN)]@Vector(VEC_LEN, u8) = undefined;
+        inline for (&parts, 0..) |*slot, i| {
+            const sub_indices = std.simd.extract(indices, i * VEC_LEN, VEC_LEN);
+            slot.* = vperm4(table, sub_indices);
+        }
+        return @bitCast(parts);
+    }
 
     const table_part_1, const table_part_2, const table_part_3, const table_part_4 = @as([4]@Vector(64, u8), @bitCast(table));
     const padded_indices = padWithUndefineds(@Vector(64, u8), indices);
@@ -4226,30 +4306,30 @@ fn vperm4(table: @Vector(256, u8), indices: anytype) @TypeOf(indices) {
     ), 0, @typeInfo(@TypeOf(indices)).vector.len);
 }
 
-fn vperm2WithFallback(table: @Vector(128, u8), indices: @Vector(64, u8), comptime fallback: @Vector(64, u8)) @Vector(64, u8) {
-    if (@inComptime() or comptime !std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vbmi)) {
-        if (std.simd.countTrues(fallback == @as(@TypeOf(fallback), @splat(0))) == 64) {
-            return shuffle(table, indices);
-        } else if (std.simd.countTrues(fallback == @as(@TypeOf(fallback), @splat(0xFF))) == 64) {
-            return ~shuffle(~table, indices);
-        } else if (std.simd.countTrues(fallback == @as(@TypeOf(fallback), @splat(fallback[0]))) == 64) {
-            return shuffle(table -% @as(@TypeOf(table), @splat(fallback[0])), indices) +% fallback;
-        } else {
-            return @select(u8, indices < @as(@Vector(64, u8), @splat(0x80)), shuffle(table, indices), fallback);
-        }
-    }
+// fn vperm2WithFallback(table: @Vector(128, u8), indices: @Vector(64, u8), comptime fallback: @Vector(64, u8)) @Vector(64, u8) {
+//     if (@inComptime() or comptime !std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vbmi)) {
+//         if (std.simd.countTrues(fallback == @as(@TypeOf(fallback), @splat(0))) == 64) {
+//             return shuffle(table, indices);
+//         } else if (std.simd.countTrues(fallback == @as(@TypeOf(fallback), @splat(0xFF))) == 64) {
+//             return ~shuffle(~table, indices);
+//         } else if (std.simd.countTrues(fallback == @as(@TypeOf(fallback), @splat(fallback[0]))) == 64) {
+//             return shuffle(table -% @as(@TypeOf(table), @splat(fallback[0])), indices) +% fallback;
+//         } else {
+//             return @select(u8, indices < @as(@Vector(64, u8), @splat(0x80)), shuffle(table, indices), fallback);
+//         }
+//     }
 
-    const table_part_1, const table_part_2 = @as([2]@Vector(64, u8), @bitCast(table));
+//     const table_part_1, const table_part_2 = @as([2]@Vector(64, u8), @bitCast(table));
 
-    return @select(
-        u8,
-        indices < @as(@Vector(64, u8), @splat(0x80)),
-        struct {
-            extern fn @"llvm.x86.avx512.vpermi2var.qi.512"(@Vector(64, u8), @Vector(64, u8), @Vector(64, u8)) @Vector(64, u8);
-        }.@"llvm.x86.avx512.vpermi2var.qi.512"(table_part_1, indices, table_part_2),
-        fallback,
-    );
-}
+//     return @select(
+//         u8,
+//         indices < @as(@Vector(64, u8), @splat(0x80)),
+//         struct {
+//             extern fn @"llvm.x86.avx512.vpermi2var.qi.512"(@Vector(64, u8), @Vector(64, u8), @Vector(64, u8)) @Vector(64, u8);
+//         }.@"llvm.x86.avx512.vpermi2var.qi.512"(table_part_1, indices, table_part_2),
+//         fallback,
+//     );
+// }
 
 // fn vperm2o(table: @Vector(128, u8), indices: anytype) @TypeOf(indices) {
 //     if (@inComptime() or comptime !std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vbmi))
@@ -4446,7 +4526,7 @@ fn expand(expandable: anytype, fallback: @Vector(64, u8), pos_mask: u64) @Vector
         //    }
         //}
     } else {
-        unreachable;
+        @compileError("Unimplemented expand");
     }
 }
 
@@ -4549,7 +4629,7 @@ fn printx(v: anytype) void {
 }
 
 fn printb(v: anytype, str: []const u8) void {
-    if (builtin.mode != .Debug) return;
+    if (builtin.mode != .Debug or 1 == 1) return;
     comptime var shift = 0;
     inline while (shift != @bitSizeOf(@TypeOf(v))) : (shift += 1) {
         switch (@as(u1, @truncate(v >> shift))) {
@@ -4561,7 +4641,7 @@ fn printb(v: anytype, str: []const u8) void {
 }
 
 fn printStr(str: []const u8) void {
-    if (builtin.mode != .Debug) return;
+    if (builtin.mode != .Debug or 1 == 1) return;
     // std.debug.print("\x1b[31;1m", .{});
     // std.debug.print("\x1b[0m", .{});
     var color: u3 = 1;
@@ -4571,6 +4651,10 @@ fn printStr(str: []const u8) void {
 
     while (i < str.len) : (i += 1) {
         switch (str[i]) {
+            '\r' => {
+                std.debug.print("\x1b[30;47;1m{c}\x1b[0m", .{'#'});
+                continue;
+            },
             '\n' => {
                 std.debug.print("\x1b[30;47;1m{c}\x1b[0m", .{'$'});
                 continue;
@@ -4590,7 +4674,7 @@ fn printStr(str: []const u8) void {
                     while (true) {
                         std.debug.print("{c}", .{str[i]});
                         i += 1;
-                        if (i >= str.len or str[i] == '\n') break;
+                        if (i >= str.len or str[i] == '\n' or str[i] == '\r') break;
                     }
                     std.debug.print("\x1b[0m", .{});
                     if (i < str.len) i -= 1;
@@ -4616,79 +4700,9 @@ fn printStr(str: []const u8) void {
                         std.debug.print("\\", .{});
                     i += @intFromBool(escaped);
                     if (i >= str.len) return;
-                    if ((!escaped and str[i] == c) or str[i] == '\n') break;
+                    if ((!escaped and str[i] == c) or str[i] == '\n' or str[i] == '\r') break;
                 }
-                if (str[i] == '\n') {
-                    i -= 1;
-                    continue;
-                }
-                std.debug.print("{c}", .{str[i]});
-                continue;
-            },
-            else => {},
-        }
-        std.debug.print("\x1b[30;47;1m{c}\x1b[0m", .{str[i]});
-    }
-}
-
-fn printStrForce(str: []const u8) void {
-    // std.debug.print("\x1b[31;1m", .{});
-    // std.debug.print("\x1b[0m", .{});
-    var color: u3 = 1;
-
-    var i: usize = 0;
-    defer std.debug.print("\n", .{});
-
-    while (i < str.len) : (i += 1) {
-        switch (str[i]) {
-            '\n' => {
-                std.debug.print("\x1b[30;47;1m{c}\x1b[0m", .{'$'});
-                continue;
-            },
-            0 => {
-                std.debug.print("\x1b[30;47;1m{c}\x1b[0m", .{'~'});
-                continue;
-            },
-            '\\', '/' => |c| {
-                if (i + 1 < str.len and str[i + 1] == c) {
-                    color += @intFromBool(i != 0);
-                    if (color == 3) color = 4;
-                    if (color == 6) color = 1;
-                    // apply new color
-                    std.debug.print("\x1b[3{o};1m", .{color});
-
-                    while (true) {
-                        std.debug.print("{c}", .{str[i]});
-                        i += 1;
-                        if (i >= str.len or str[i] == '\n') break;
-                    }
-                    std.debug.print("\x1b[0m", .{});
-                    if (i < str.len) i -= 1;
-                    continue;
-                }
-            },
-
-            '\'', '"' => |c| {
-                color += @intFromBool(i != 0);
-                if (color == 2) color = 3;
-                if (color == 3) color = 4;
-                if (color == 6) color = 1;
-                // apply new color
-                std.debug.print("\x1b[37;4{o};1m", .{color});
-                defer std.debug.print("\x1b[0m", .{});
-
-                while (true) {
-                    std.debug.print("{c}", .{str[i]});
-                    i += 1;
-                    if (i >= str.len) return;
-                    const escaped = str[i] == '\\';
-                    if (escaped)
-                        std.debug.print("\\", .{});
-                    i += @intFromBool(escaped);
-                    if (i >= str.len) return;
-                    if ((!escaped and str[i] == c) or str[i] == '\n') break;
-                }
-                if (str[i] == '\n') {
+                if (str[i] == '\n' or str[i] == '\r') {
                     i -= 1;
                     continue;
                 }
